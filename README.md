@@ -99,6 +99,10 @@ Suggested change:
 
 When the diff is clean: `No issues found. Code looks clean and ready to merge.`
 
+## Operational runbook for agents and humans
+
+See [`docs/llm-code-review-runbook.md`](./docs/llm-code-review-runbook.md) for the iteration-partner workflow, accept/decline heuristics, known gotchas, and per-round tracking template. The runbook is written so a fresh coding agent (Claude, Codex, etc.) or a fresh human can pick up the workflow without context.
+
 ## Why this exists
 
 The GitHub Gemini Code Assist bot is excellent at finding real concurrency, security, and correctness bugs — but it lives behind a GitHub webhook that calls a Google job queue, and the wall-time latency makes iterative cycles painful when you want a review every few commits. Running the same prompts locally via OpenRouter or the Gemini API cuts the loop from minutes to seconds and works offline from GitHub.
