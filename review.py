@@ -3,14 +3,14 @@
 
 This fork keeps the upstream `skills/code-review-commons/SKILL.md` and
 `commands/code-review.toml` prompts intact (Apache-2.0, unmodified) and adds a
-thin Python runner that sends them to a Gemini model via one of two providers
-selectable at the command line:
+thin Python runner that sends them to a Gemini-or-other-model via one of two
+providers selectable at the command line:
 
   --provider openrouter (default)
       POSTs to OpenRouter's OpenAI-compatible chat-completions endpoint
       (https://openrouter.ai/api/v1/chat/completions). Requires
-      `OPENROUTER_API_KEY`. Good if you already have an OpenRouter account or
-      want one bill across multiple providers.
+      `OPENROUTER_API_KEY`. Good if you want to mix models from different
+      vendors (Gemini, Claude, GPT, DeepSeek) without separate API keys.
 
   --provider gemini
       POSTs to Google AI Studio's `generateContent` endpoint directly
@@ -18,19 +18,23 @@ selectable at the command line:
       `GEMINI_API_KEY`. Slightly lower latency (one less hop) and uses the
       same key the GitHub bot uses on the backend.
 
-Both paths send the same system + user prompts (loaded verbatim from the
-upstream skill / command files) and the same `gemini-2.5-pro` model by
-default, so the review output is materially equivalent. The behavior matches
-the GitHub `/gemini review` bot, just without the GitHub webhook -> Google
-job-queue round-trip that adds 5-15 minutes of wall time.
+Both paths default to ``gemini-2.5-pro``. `--model <slug>` overrides; the
+``--provider openrouter`` path also accepts named aliases (see
+``MODEL_ALIASES`` below) so you can write ``--model claude`` instead of
+``--model anthropic/claude-sonnet-4.5``.
 
-Usage:
+Diff modes (default) review a git diff:
+
     uv run review.py                          # diff current branch vs origin/HEAD merge-base
     uv run review.py --base main              # diff vs an explicit base ref
     uv run review.py --pr 6                   # review a GitHub PR (uses `gh pr diff`)
     uv run review.py --staged                 # staged changes only
-    uv run review.py --provider gemini        # use Gemini API directly
-    uv run review.py --model gemini-2.5-flash # faster, somewhat lower quality
+
+Whole-codebase mode reviews tracked files (filtered):
+
+    uv run review.py --codebase
+    uv run review.py --codebase --include 'backend/**/*.py'
+    uv run review.py --codebase --exclude '**/test_*'
 
 The .env loaded from this script's directory (not CWD) -- copy `.env.example`
 to `.env` once at the runner location and invoke from any project folder.
@@ -41,6 +45,7 @@ needs.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import os
 import subprocess
 import sys
@@ -67,7 +72,43 @@ GEMINI_URL_TEMPLATE = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 )
 HTTP_TIMEOUT = 300.0  # Gemini 2.5 Pro on a ~5K-line diff lands ~30-60s; pad
-                     # generously for very large diffs.
+                     # generously for very large diffs and whole-codebase
+                     # bundles.
+
+# Named aliases for OpenRouter model slugs. The OpenRouter URL form
+# ``vendor/model`` is awkward to type; an alias collapses it to a short
+# name (``claude``, ``gpt``, ``deepseek``...) for ergonomics. Aliases are
+# resolved before the call is made; the resolved slug is what shows up
+# in stderr "Reviewing ... with ..." and what OpenRouter actually
+# dispatches to.
+#
+# Aliases apply only to ``--provider openrouter``. The Gemini API direct
+# path takes bare Gemini model names (no vendor prefix) so a slug like
+# ``anthropic/claude-sonnet-4.5`` is a category error for that provider;
+# we error out with a clear message instead of silently sending an
+# invalid model name to Google's API.
+#
+# Keep this table small and curated. Adding every model on OpenRouter is
+# not the goal -- users who want exotic models can pass the raw slug via
+# ``--model``. The aliases here are the models that earned their place
+# as a "second-opinion reviewer" in practice.
+MODEL_ALIASES: dict[str, str] = {
+    # Gemini family (OpenRouter route to the same models the
+    # ``--provider gemini`` direct path serves).
+    "pro": "google/gemini-2.5-pro",
+    "gemini-pro": "google/gemini-2.5-pro",
+    "flash": "google/gemini-2.5-flash",
+    "gemini-flash": "google/gemini-2.5-flash",
+    # Anthropic / Claude family.
+    "claude": "anthropic/claude-sonnet-4.5",
+    "claude-sonnet": "anthropic/claude-sonnet-4.5",
+    "claude-opus": "anthropic/claude-opus-4.5",
+    # OpenAI / GPT family.
+    "gpt": "openai/gpt-5",
+    "gpt-mini": "openai/gpt-5-mini",
+    # DeepSeek -- cheap, surprisingly strong at code review.
+    "deepseek": "deepseek/deepseek-chat-v3.1",
+}
 
 # Upstream `code-review.toml` instructs the model to *call* git itself via a
 # tool. We have no tool layer; instead we extract the diff up front and
@@ -80,13 +121,76 @@ TOOL_CALL_INSTRUCTION = (
     "tool to retrieve the changes."
 )
 
+# Substitution sentinel for the codebase-review command template. The
+# fork-added ``commands/codebase-review.toml`` puts this literal token
+# where the codebase bundle goes; if it's missing (e.g. a future rewrite
+# of the command template) the bundle is appended unconditionally so the
+# model still has the content.
+CODEBASE_PLACEHOLDER = "<CODEBASE_BUNDLE_PLACEHOLDER>"
 
-def load_skill() -> str:
-    """Return the full `code-review-commons` SKILL.md content (with YAML
-    frontmatter). The model treats the markdown as a system prompt; including
-    the frontmatter is harmless and preserves the exact upstream behavior.
+# Whole-codebase mode constants.
+#
+# ``MAX_BUNDLE_CHARS`` is the hard pre-flight cap on the concatenated
+# codebase bundle. 700K chars is ~175K tokens at the standard 4-chars-
+# per-token estimate, which is conservative against both Gemini 2.5 Pro
+# (1M-token context) and Claude Sonnet 4.5 (200K-token context). Cap
+# means the runner errors out before paying for a request that would
+# fail mid-flight on the smaller-context model.
+MAX_BUNDLE_CHARS = 700_000
+
+# Individual-file size cap: skip files larger than this when bundling.
+# Most files this large are data fixtures, vendored blobs, or generated
+# artifacts that ``git ls-files`` happens to track but that don't
+# benefit from a code review. Skipped paths are logged on stderr so the
+# user can ``--include`` them back if a real source file got caught.
+MAX_INDIVIDUAL_FILE_BYTES = 100_000
+
+# Defensive built-in exclusions applied after the user's ``--include``
+# and ``--exclude`` filters. ``git ls-files`` already respects
+# ``.gitignore``, so vendored dirs (``node_modules``, ``.venv``, etc.)
+# are usually already absent. These patterns catch the residue:
+# lock files, minified output, common binary / asset extensions. Match
+# is case-sensitive (file extensions in practice are lowercase).
+BUILTIN_CODEBASE_EXCLUDES: tuple[str, ...] = (
+    # Lock files for various package managers.
+    "*.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "uv.lock",
+    "Cargo.lock",
+    "poetry.lock",
+    "Pipfile.lock",
+    # Minified / generated bundles.
+    "*.min.js",
+    "*.min.css",
+    # Build outputs occasionally tracked by mistake.
+    "*/dist/*",
+    "*/build/*",
+    # Binary / asset extensions: skip outright (model can't review).
+    "*.png", "*.jpg", "*.jpeg", "*.gif", "*.svg", "*.ico", "*.webp",
+    "*.woff", "*.woff2", "*.ttf", "*.eot",
+    "*.pdf", "*.zip", "*.tar", "*.gz",
+    "*.mp3", "*.mp4", "*.mov", "*.avi",
+)
+
+# Per-file delimiter for whole-codebase bundles. The shape is chosen so
+# the model can pattern-match file boundaries reliably and quote the
+# exact path back in its per-file findings.
+FILE_DELIMITER_TEMPLATE = "======== FILE: {path} ========"
+
+
+def load_skill(name: str = "code-review-commons") -> str:
+    """Return the SKILL.md content for the named skill directory.
+
+    Defaults to the upstream ``code-review-commons`` skill (the
+    diff-review one). Whole-codebase mode passes ``code-review-codebase``
+    (fork-added) which differs only in the Critical Constraints section:
+    it permits commenting on any line in any file in the bundle, instead
+    of the upstream skill's hardcoded "only lines beginning with +/-"
+    rule that's correct for diff review but forbids all comments on
+    whole-file input.
     """
-    path = ROOT / "skills" / "code-review-commons" / "SKILL.md"
+    path = ROOT / "skills" / name / "SKILL.md"
     return path.read_text(encoding="utf-8")
 
 
@@ -97,12 +201,14 @@ def load_command_prompt(name: str) -> str:
     return data["prompt"]
 
 
-def build_prompts(diff: str) -> tuple[str, str]:
-    """Construct ``(system_prompt, user_prompt)`` from the upstream skill /
-    command files, with the diff substituted into the tool-call placeholder.
-    Same pair is used regardless of provider so review behavior matches.
+def build_diff_prompts(diff: str) -> tuple[str, str]:
+    """Construct ``(system, user)`` prompts for diff-mode review.
+
+    Loads the upstream ``code-review-commons`` skill (system prompt) and
+    the upstream ``code-review`` command (user prompt template), then
+    substitutes the diff into the command's tool-call placeholder.
     """
-    system_prompt = load_skill()
+    system_prompt = load_skill("code-review-commons")
     user_template = load_command_prompt("code-review")
     diff_block = f"**Code Changes**:\n\n```diff\n{diff}\n```"
     user_prompt = user_template.replace(TOOL_CALL_INSTRUCTION, diff_block)
@@ -110,6 +216,36 @@ def build_prompts(diff: str) -> tuple[str, str]:
     # substitution missed, append the diff so the model still has it.
     if diff_block not in user_prompt:
         user_prompt = f"{user_prompt}\n\n{diff_block}"
+    return system_prompt, user_prompt
+
+
+def build_codebase_prompts(bundle: str) -> tuple[str, str]:
+    """Construct ``(system, user)`` prompts for whole-codebase review.
+
+    Uses the fork-added ``code-review-codebase`` skill and
+    ``codebase-review`` command. The skill differs from the upstream
+    ``code-review-commons`` only in the Critical Constraints section:
+    it permits commenting on any line in any file in the bundle (the
+    upstream rule "comment only on +/- lines" forbids all comments on
+    whole-file content, which is correct for diff review but wrong for
+    codebase review).
+
+    TODO: v2 -- architectural-summary mode (proposed flag ``--summary``)
+    would prepend a leading "patterns / structure / smells" section to
+    the per-file findings. Trade-offs (hallucination risk on
+    architectural takes, less actionable output, token-budget
+    contention) documented in ``docs/llm-code-review-runbook.md`` under
+    "Future modes". The current codebase prompt produces per-file
+    findings only.
+    """
+    system_prompt = load_skill("code-review-codebase")
+    user_template = load_command_prompt("codebase-review")
+    bundle_block = f"**Codebase**:\n\n{bundle}\n"
+    if CODEBASE_PLACEHOLDER in user_template:
+        user_prompt = user_template.replace(CODEBASE_PLACEHOLDER, bundle_block)
+    else:
+        # Defensive: same shape as ``build_diff_prompts`` defensive append.
+        user_prompt = f"{user_template}\n\n{bundle_block}"
     return system_prompt, user_prompt
 
 
@@ -170,26 +306,120 @@ def pr_diff(pr_number: int) -> str:
     return result.stdout
 
 
+def _glob_match(path: Path, patterns: tuple[str, ...] | list[str]) -> bool:
+    """Return True if ``path`` matches any of the glob ``patterns``.
+
+    Each pattern is tested against both the full POSIX path
+    (e.g. ``backend/api/views.py``) and the basename (e.g. ``views.py``)
+    so a pattern like ``test_*.py`` catches test files at any depth
+    rather than only at the repo root. fnmatch treats ``*`` as matching
+    everything including ``/``, so ``*.py`` matches all Python files
+    regardless of nesting; this is intentional and documented.
+    """
+    posix = path.as_posix()
+    name = path.name
+    return any(
+        fnmatch.fnmatch(posix, pat) or fnmatch.fnmatch(name, pat)
+        for pat in patterns
+    )
+
+
+def gather_codebase_files(
+    includes: list[str], excludes: list[str]
+) -> list[Path]:
+    """Return the list of files to bundle for whole-codebase review.
+
+    Pipeline (in order):
+      1. ``git ls-files`` -> all tracked files (so ``.gitignore`` already
+         excludes ``node_modules``, ``.venv``, build artifacts, etc.).
+      2. Apply ``--include`` globs if any; otherwise keep all files.
+      3. Apply user-supplied ``--exclude`` globs.
+      4. Apply ``BUILTIN_CODEBASE_EXCLUDES`` (lock files, asset
+         extensions, etc.).
+      5. Drop files larger than ``MAX_INDIVIDUAL_FILE_BYTES``; log to
+         stderr so the user can ``--include`` them back if needed.
+
+    Returns paths relative to the current working directory (which is
+    expected to be the project being reviewed, since we run ``git
+    ls-files`` against CWD).
+    """
+    output = _run_git(["git", "ls-files"])
+    paths = [Path(line) for line in output.splitlines() if line]
+
+    # Step 2: user --include filter.
+    if includes:
+        paths = [p for p in paths if _glob_match(p, includes)]
+
+    # Step 3: user --exclude filter.
+    if excludes:
+        paths = [p for p in paths if not _glob_match(p, excludes)]
+
+    # Step 4: built-in defensive excludes.
+    paths = [p for p in paths if not _glob_match(p, BUILTIN_CODEBASE_EXCLUDES)]
+
+    # Step 5: per-file size cap.
+    kept: list[Path] = []
+    for p in paths:
+        try:
+            size = p.stat().st_size
+        except OSError:
+            # File listed by ``git ls-files`` but missing on disk
+            # (typo, symlink to nowhere, race). Skip silently rather
+            # than crash; the user can re-run if a file was meant to
+            # be present.
+            continue
+        if size > MAX_INDIVIDUAL_FILE_BYTES:
+            sys.stderr.write(
+                f"skip (>{MAX_INDIVIDUAL_FILE_BYTES // 1024} KB): "
+                f"{p.as_posix()} ({size:,} bytes)\n"
+            )
+            continue
+        kept.append(p)
+
+    return kept
+
+
+def bundle_codebase(file_paths: list[Path]) -> str:
+    """Concatenate the given files into a single delimited bundle.
+
+    Encoding errors are replaced silently (``errors="replace"``) so a
+    non-UTF8 byte sequence in a tracked file doesn't crash the runner;
+    the model sees a replacement character but the rest of the file is
+    still reviewable. In practice this only triggers on files that
+    should have been excluded by the asset-extension filter -- a true
+    source file with a stray non-UTF8 byte is rare.
+    """
+    parts: list[str] = []
+    for path in file_paths:
+        content = path.read_text(encoding="utf-8", errors="replace")
+        delimiter = FILE_DELIMITER_TEMPLATE.format(path=path.as_posix())
+        parts.append(f"{delimiter}\n{content}")
+    return "\n\n".join(parts)
+
+
 def call_openrouter(
     *,
-    diff: str,
+    system_prompt: str,
+    user_prompt: str,
     model: str,
     api_key: str,
     referer: str,
     title: str,
 ) -> str:
     """POST to OpenRouter's chat-completions endpoint and return the review
-    markdown. Raises on transport or HTTP errors so the caller surfaces them.
+    markdown. Caller builds the prompts so this function stays mode-agnostic
+    (diff review and codebase review share the same wire path).
     """
-    system_prompt, user_prompt = build_prompts(diff)
     payload = {
         "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        # The upstream prompt is highly structured; we want minimal sampling
-        # noise so suggested-change blocks come back as exact diffs.
+        # The upstream prompts are highly structured; we want minimal
+        # sampling noise so suggested-change blocks come back as exact
+        # diffs and severity tags stay in the canonical {CRITICAL, HIGH,
+        # MEDIUM, LOW} set.
         "temperature": 0.2,
     }
     headers = {
@@ -223,15 +453,15 @@ def call_openrouter(
 
 def call_gemini(
     *,
-    diff: str,
+    system_prompt: str,
+    user_prompt: str,
     model: str,
     api_key: str,
 ) -> str:
     """POST to Google AI Studio's ``generateContent`` endpoint directly.
-    Returns the review markdown. The request shape is camelCase and uses a
-    ``systemInstruction`` field rather than a system-role message.
+    Caller builds the prompts (same as ``call_openrouter``) so the wire
+    path is mode-agnostic.
     """
-    system_prompt, user_prompt = build_prompts(diff)
     payload = {
         "contents": [
             {"role": "user", "parts": [{"text": user_prompt}]},
@@ -274,6 +504,35 @@ def call_gemini(
         sys.exit(1)
 
 
+def _resolve_model(args: argparse.Namespace) -> str:
+    """Resolve the final model slug from CLI flag, env var, alias table,
+    or provider default. Errors out if an alias is used with the wrong
+    provider (the Gemini API direct path takes bare Gemini model names
+    only -- a non-Gemini alias like ``claude`` is a category error there).
+    """
+    if args.model is not None:
+        model = args.model
+    elif args.provider == "openrouter":
+        model = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL_BY_PROVIDER["openrouter"])
+    else:  # gemini
+        model = os.getenv("GEMINI_MODEL", DEFAULT_MODEL_BY_PROVIDER["gemini"])
+
+    if model in MODEL_ALIASES:
+        if args.provider != "openrouter":
+            sys.stderr.write(
+                f"ERROR: model alias `{model}` is only valid with "
+                f"--provider openrouter. The Gemini API direct path takes "
+                f"bare Gemini model names only (e.g. gemini-2.5-pro, "
+                f"gemini-2.5-flash). Either pass --provider openrouter to "
+                f"use this alias, or pass --model gemini-2.5-pro / "
+                f"--model gemini-2.5-flash for the direct path.\n"
+            )
+            sys.exit(2)
+        model = MODEL_ALIASES[model]
+
+    return model
+
+
 def main() -> None:
     # Load env from this script's directory so `.env` is configured once at
     # the runner location rather than in every project we review from.
@@ -282,8 +541,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Standalone code-review runner using the Gemini CLI "
-            "code-review extension prompts. Sends them to a Gemini model "
-            "via OpenRouter or the Gemini API directly."
+            "code-review extension prompts. Sends them to a Gemini-or-"
+            "other model via OpenRouter or the Gemini API directly."
         )
     )
     source = parser.add_mutually_exclusive_group()
@@ -301,6 +560,39 @@ def main() -> None:
         action="store_true",
         help="Review staged changes only.",
     )
+    source.add_argument(
+        "--codebase",
+        action="store_true",
+        help=(
+            "Review the whole tracked codebase via ``git ls-files`` "
+            "instead of a diff. Narrow with --include / --exclude. "
+            "Output shape is per-file findings (severity-tagged) -- "
+            "the architectural-summary shape is a v2 TODO documented "
+            "in the runbook's 'Future modes' section."
+        ),
+    )
+    parser.add_argument(
+        "--include",
+        action="append",
+        default=None,
+        metavar="GLOB",
+        help=(
+            "Glob to include in --codebase mode (e.g. "
+            "``backend/**/*.py``). Can be passed multiple times. "
+            "Ignored outside --codebase."
+        ),
+    )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=None,
+        metavar="GLOB",
+        help=(
+            "Glob to exclude in --codebase mode (e.g. "
+            "``**/test_*.py``). Can be passed multiple times. "
+            "Ignored outside --codebase."
+        ),
+    )
     parser.add_argument(
         "--provider",
         choices=PROVIDERS,
@@ -317,23 +609,17 @@ def main() -> None:
         "--model",
         default=None,
         help=(
-            "Model slug. Defaults to the provider-appropriate "
-            "``gemini-2.5-pro`` variant -- ``google/gemini-2.5-pro`` for "
-            "OpenRouter, ``gemini-2.5-pro`` for the Gemini API. Override "
-            "with $OPENROUTER_MODEL or $GEMINI_MODEL respectively. "
-            "``gemini-2.5-flash`` is ~3x faster with some quality loss."
+            "Model slug or alias. Defaults to the provider-appropriate "
+            "``gemini-2.5-pro`` variant. Override with $OPENROUTER_MODEL "
+            "or $GEMINI_MODEL respectively. Aliases (--provider "
+            "openrouter only): pro, flash, claude, claude-opus, gpt, "
+            "gpt-mini, deepseek. ``gemini-2.5-flash`` / ``flash`` is "
+            "~3x faster with some quality loss."
         ),
     )
     args = parser.parse_args()
 
-    # Resolve the model: explicit ``--model`` wins; otherwise a provider-
-    # specific env var; otherwise the provider default.
-    if args.model is not None:
-        model = args.model
-    elif args.provider == "openrouter":
-        model = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL_BY_PROVIDER["openrouter"])
-    else:  # gemini
-        model = os.getenv("GEMINI_MODEL", DEFAULT_MODEL_BY_PROVIDER["gemini"])
+    model = _resolve_model(args)
 
     # Resolve and validate the API key for the chosen provider before
     # touching git / GitHub so the user fails fast on configuration errors.
@@ -357,20 +643,62 @@ def main() -> None:
             )
             sys.exit(2)
 
-    if args.pr:
-        diff = pr_diff(args.pr)
+    # Build the payload for the chosen mode. ``--include`` / ``--exclude``
+    # are codebase-mode-only -- warn if they show up alongside a diff
+    # mode rather than silently dropping them.
+    if args.codebase:
+        files = gather_codebase_files(args.include or [], args.exclude or [])
+        if not files:
+            sys.stderr.write(
+                "No files matched after --include / --exclude / built-in "
+                "filters. Nothing to review.\n"
+            )
+            sys.exit(0)
+        bundle = bundle_codebase(files)
+        if len(bundle) > MAX_BUNDLE_CHARS:
+            # Show the 10 largest files so the user can target
+            # ``--exclude`` flags effectively rather than guessing.
+            sized = sorted(
+                ((p, p.stat().st_size) for p in files),
+                key=lambda x: x[1],
+                reverse=True,
+            )
+            sys.stderr.write(
+                f"ERROR: codebase bundle is {len(bundle):,} chars "
+                f"(limit {MAX_BUNDLE_CHARS:,}). Narrow with --include "
+                "or --exclude. Largest files in current selection:\n"
+            )
+            for path, size in sized[:10]:
+                sys.stderr.write(
+                    f"  {size:>10,} bytes  {path.as_posix()}\n"
+                )
+            sys.exit(1)
+        sys.stderr.write(
+            f"Reviewing {len(files)} file(s) ({len(bundle):,} chars) "
+            f"with `{model}` via {args.provider}...\n"
+        )
+        system_prompt, user_prompt = build_codebase_prompts(bundle)
     else:
-        diff = git_diff_local(args.base, args.staged)
+        if args.include or args.exclude:
+            sys.stderr.write(
+                "WARN: --include / --exclude are ignored outside "
+                "--codebase mode.\n"
+            )
+        if args.pr:
+            diff = pr_diff(args.pr)
+        else:
+            diff = git_diff_local(args.base, args.staged)
+        if not diff.strip():
+            sys.stderr.write("No diff found. Nothing to review.\n")
+            sys.exit(0)
+        sys.stderr.write(
+            f"Reviewing {len(diff):,}-char diff with `{model}` via "
+            f"{args.provider}...\n"
+        )
+        system_prompt, user_prompt = build_diff_prompts(diff)
 
-    if not diff.strip():
-        sys.stderr.write("No diff found. Nothing to review.\n")
-        sys.exit(0)
-
-    sys.stderr.write(
-        f"Reviewing {len(diff):,}-char diff with `{model}` via "
-        f"{args.provider}...\n"
-    )
-
+    # Wire-format dispatch. Both providers take the same (system, user)
+    # prompt pair; only the request shape differs.
     if args.provider == "openrouter":
         referer = os.getenv(
             "OPENROUTER_HTTP_REFERER",
@@ -378,14 +706,20 @@ def main() -> None:
         )
         title = os.getenv("OPENROUTER_X_TITLE", "OpenRouter Code Review")
         output = call_openrouter(
-            diff=diff,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
             model=model,
             api_key=api_key,
             referer=referer,
             title=title,
         )
     else:  # gemini
-        output = call_gemini(diff=diff, model=model, api_key=api_key)
+        output = call_gemini(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            model=model,
+            api_key=api_key,
+        )
     print(output)
 
 

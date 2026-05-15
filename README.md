@@ -18,13 +18,16 @@ The rest of this README is the general-audience documentation (humans, contribut
 
 | File | New / modified | Purpose |
 |---|---|---|
-| `review.py` | **new** | Standalone runner. Loads the upstream skill + command prompts unchanged and POSTs them to either OpenRouter or the Gemini API. |
+| `review.py` | **new** | Standalone runner. Loads upstream skill + command prompts for diff review, adds fork-specific skill + command for whole-codebase review, POSTs to OpenRouter or the Gemini API. Includes a curated alias table so `--model claude` expands to the full OpenRouter slug. |
+| `skills/code-review-codebase/SKILL.md` | **new** | Fork-specific whole-codebase review skill. Same persona / severity rubric as the upstream `code-review-commons` skill, but Critical Constraints adapted to permit comments on any line of any file in the bundle (the upstream "comment only on `+`/`-` lines" rule forbids commenting on whole-file content). |
+| `commands/codebase-review.toml` | **new** | Fork-specific command for `--codebase` mode. Defines the bundle delimiter and per-file-findings output shape. |
 | `pyproject.toml` | **new** | `uv`-managed deps (`httpx`, `python-dotenv`). |
 | `.env.example` | **new** | Documents `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, and optional model / provider overrides. |
 | `.gitignore` | **new** | Protects `.env` and the `uv` virtualenv from leaking. |
+| `docs/llm-code-review-runbook.md` | **new** | Operational runbook for using the tool as an LLM iteration partner. |
 | `README.md` | **modified** | This file — documents the fork's runner alongside the upstream CLI mode. |
-| `skills/code-review-commons/SKILL.md` | unchanged | Upstream system prompt (loaded verbatim). |
-| `commands/code-review.toml` | unchanged | Upstream user-prompt template (loaded verbatim). |
+| `skills/code-review-commons/SKILL.md` | unchanged | Upstream system prompt (loaded verbatim for diff review). |
+| `commands/code-review.toml` | unchanged | Upstream diff-review user-prompt template (loaded verbatim). |
 | `commands/pr-code-review.toml` | unchanged | Upstream PR-review command (not used by the runner). |
 | `gemini-extension.json`, `GEMINI.md`, `LICENSE` | unchanged | Upstream metadata. |
 
@@ -78,16 +81,56 @@ uv run review.py --provider gemini      # direct Gemini API
 
 Set a default per-environment via `$CODE_REVIEW_PROVIDER=gemini` in your `.env` so you don't have to pass `--provider` every invocation.
 
+### Model aliases
+
+The `--model` flag accepts any OpenRouter slug, but a small curated alias table collapses the most common reviewers to a short name. Aliases work **only** under `--provider openrouter`; the Gemini API direct path takes bare Gemini model names. Passing an alias with `--provider gemini` errors out with a clear message.
+
+| Alias | Resolves to | Notes |
+|---|---|---|
+| `pro` / `gemini-pro` | `google/gemini-2.5-pro` | Current default. |
+| `flash` / `gemini-flash` | `google/gemini-2.5-flash` | ~3× faster than pro, some quality loss. |
+| `claude` / `claude-sonnet` | `anthropic/claude-sonnet-4.5` | Great as a second-opinion reviewer alongside a Gemini round. |
+| `claude-opus` | `anthropic/claude-opus-4.5` | Larger model; slower and pricier. |
+| `gpt` | `openai/gpt-5` | Useful for an independent third opinion. |
+| `gpt-mini` | `openai/gpt-5-mini` | Cheaper / faster GPT. |
+| `deepseek` | `deepseek/deepseek-chat-v3.1` | Cheap, surprisingly strong on code review. |
+
+Raw slugs still pass through unchanged, so anything OpenRouter serves — including newer models that haven't earned an alias yet — works via `--model <vendor>/<model>`.
+
 ## Modes
 
-| Flag | What it diffs |
+| Flag | What it does |
 |---|---|
-| *(none)* | Current branch vs `origin/HEAD` merge-base — matches the upstream `gemini-cli` `/code-review` shape |
-| `--base main` | Current branch vs an explicit base ref (**includes uncommitted changes**, so iterative-review loops work without committing each pass) |
-| `--pr <N>` | Pulls a GitHub PR diff via `gh pr diff` (requires `gh auth login`) |
-| `--staged` | Staged changes only — good for pre-commit reviews |
+| *(none)* | Diff: current branch vs `origin/HEAD` merge-base — matches the upstream `gemini-cli` `/code-review` shape. |
+| `--base main` | Diff: current branch vs an explicit base ref (**includes uncommitted changes**, so iterative-review loops work without committing each pass). |
+| `--pr <N>` | Diff: pulls a GitHub PR diff via `gh pr diff` (requires `gh auth login`). |
+| `--staged` | Diff: staged changes only — good for pre-commit reviews. |
+| `--codebase` | Whole codebase: bundles tracked files (via `git ls-files`) and reviews them all. Narrow with `--include` / `--exclude` glob flags. |
 
-`--model <slug>` overrides the default model. Use `google/gemini-2.5-flash` (OpenRouter) or `gemini-2.5-flash` (Gemini API) for ~3× faster reviews with some quality loss.
+`--model <slug>` overrides the default model. Use `google/gemini-2.5-flash` / `flash` (OpenRouter) or `gemini-2.5-flash` (Gemini API) for ~3× faster reviews with some quality loss.
+
+### Whole-codebase mode (`--codebase`)
+
+For "audit this repo I just inherited" or "find bugs in code none of us touched in this PR," the diff modes don't help. `--codebase` bundles every tracked file (filtered) into a single payload and reviews them as a whole.
+
+```bash
+uv run review.py --codebase                              # everything tracked, minus built-in noise filters
+uv run review.py --codebase --include 'backend/**/*.py'  # narrow to a directory + extension
+uv run review.py --codebase --exclude '**/test_*'        # widen then narrow
+uv run review.py --codebase --model claude               # use Claude as the codebase reviewer
+```
+
+File selection pipeline:
+
+1. `git ls-files` → all tracked files (so `.gitignore` already filters `node_modules`, `.venv`, build artifacts).
+2. Apply user `--include` globs if any.
+3. Apply user `--exclude` globs.
+4. Apply built-in defensive excludes: lock files, minified output, common binary extensions (`*.png`, `*.svg`, `*.woff`, etc.), `*/dist/*`, `*/build/*`.
+5. Drop individual files larger than 100 KB (logged on stderr — they're usually data fixtures or vendored blobs).
+
+A bundle cap (700 KB ≈ 175 K tokens) is enforced pre-flight; if the bundle is too large the runner exits with the 10 largest files in the current selection so you can target `--exclude` flags effectively rather than paying for a request that would fail mid-flight on the smaller-context models.
+
+Output is the same severity-tagged per-file findings shape as diff mode. The **architectural-summary output shape** (high-level "patterns / structure / smells" section preceding the per-file findings) is an explicit TODO; the trade-offs (hallucination risk on architectural takes, less actionable output, token-budget contention) are documented in the runbook under "Future modes."
 
 ## Output format
 

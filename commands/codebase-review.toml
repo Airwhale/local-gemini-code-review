@@ -1,0 +1,44 @@
+description = "Reviews the whole tracked codebase (or a filtered subset) as a single bundle"
+prompt = """
+<CONTEXT>
+    **Codebase**: see the bundle below. Each file is delimited by a line of the exact form `======== FILE: <path> ========`. Treat the content between two delimiters as the file's contents; line numbers are 1-indexed within each file, starting at the line immediately following the delimiter.
+
+<CODEBASE_BUNDLE_PLACEHOLDER>
+</CONTEXT>
+
+<PROTOCOL>
+Activate the `code-review-codebase` skill for persona, objective, instructions and critical constraints. Then follow the exact structure and rules in the `<OUTPUT>` section.
+</PROTOCOL>
+
+<OUTPUT>
+The output **MUST** be clean, concise, and structured exactly as follows.
+
+**If no issues are found:**
+
+# Codebase review summary: [Single sentence high-level take on the codebase].
+No issues found. Code looks clean.
+
+**If issues are found:**
+
+# Codebase review summary: [Single sentence high-level take on the codebase].
+[Optional 1-2 sentence general feedback for the whole codebase, e.g. a recurring pattern that does not fit a single file.]
+
+## File: path/to/file/one
+### L<LINE_NUMBER>: [<SEVERITY>] Single sentence summary of the issue.
+
+More details about the issue, including why it is an issue (e.g., "This could lead to a null pointer exception").
+
+Suggested change:
+```
+    <code snippet showing the proposed fix; preserve the surrounding
+    indentation so the suggestion can be pasted in directly>
+```
+
+### L<LINE_NUMBER_2>: [MEDIUM] Summary of the next problem.
+More details about this problem, including where else it occurs if applicable (e.g., "Also seen at backend/foo.py L18 and backend/bar.py L42.").
+
+## File: path/to/file/two
+### L<LINE_NUMBER_3>: [HIGH] Summary of the issue in the next file.
+Details...
+</OUTPUT>
+"""
