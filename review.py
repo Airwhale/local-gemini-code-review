@@ -75,6 +75,22 @@ HTTP_TIMEOUT = 300.0  # Gemini 2.5 Pro on a ~5K-line diff lands ~30-60s; pad
                      # generously for very large diffs and whole-codebase
                      # bundles.
 
+# Sampling temperature for the model. Raised from 0.2 to 0.5 after running
+# several review cycles at 0.2 and observing 1-2 findings per round on
+# diffs that plausibly contained more. Higher temperature broadens the
+# model's exploration so more findings surface per call, at the cost of
+# a moderately higher hallucination rate -- the decline-comment contract
+# in the runbook handles those cleanly. Override per call with
+# ``--temperature`` or per environment with ``$CODE_REVIEW_TEMPERATURE``.
+DEFAULT_TEMPERATURE = 0.5
+
+# Maximum output tokens the model may emit. Raised from the implicit
+# provider default (~8K for Gemini 2.5 Pro) to 16K so a thorough review
+# isn't truncated mid-finding. This is a *ceiling*, not a target -- you
+# pay only for tokens actually emitted, not for unused headroom.
+# Override with ``--max-tokens`` or ``$CODE_REVIEW_MAX_TOKENS``.
+DEFAULT_MAX_TOKENS = 16000
+
 # Named aliases for OpenRouter model slugs. The OpenRouter URL form
 # ``vendor/model`` is awkward to type; an alias collapses it to a short
 # name (``claude``, ``gpt``, ``deepseek``...) for ergonomics. Aliases are
@@ -449,6 +465,8 @@ def call_openrouter(
     api_key: str,
     referer: str,
     title: str,
+    temperature: float,
+    max_tokens: int,
 ) -> str:
     """POST to OpenRouter's chat-completions endpoint and return the review
     markdown. Caller builds the prompts so this function stays mode-agnostic
@@ -460,11 +478,13 @@ def call_openrouter(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        # The upstream prompts are highly structured; we want minimal
-        # sampling noise so suggested-change blocks come back as exact
-        # diffs and severity tags stay in the canonical {CRITICAL, HIGH,
-        # MEDIUM, LOW} set.
-        "temperature": 0.2,
+        # Temperature broadens exploration so more findings surface per
+        # call; the upstream prompt's "Critical Constraints" section
+        # still gates *quality*. ``max_tokens`` is a ceiling so a
+        # thorough review isn't truncated mid-finding -- the user pays
+        # only for tokens actually emitted, not the unused headroom.
+        "temperature": temperature,
+        "max_tokens": max_tokens,
     }
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -501,6 +521,8 @@ def call_gemini(
     user_prompt: str,
     model: str,
     api_key: str,
+    temperature: float,
+    max_tokens: int,
 ) -> str:
     """POST to Google AI Studio's ``generateContent`` endpoint directly.
     Caller builds the prompts (same as ``call_openrouter``) so the wire
@@ -512,7 +534,12 @@ def call_gemini(
         ],
         "systemInstruction": {"parts": [{"text": system_prompt}]},
         "generationConfig": {
-            "temperature": 0.2,
+            # camelCase keys per the v1beta generateContent spec.
+            # ``maxOutputTokens`` is the ceiling on generated tokens;
+            # ``temperature`` matches the OpenRouter side so review
+            # behavior is consistent across providers.
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens,
         },
     }
     headers = {
@@ -687,9 +714,65 @@ def main() -> None:
             "~3x faster with some quality loss."
         ),
     )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            f"Sampling temperature. Default {DEFAULT_TEMPERATURE} -- "
+            "raised from the previous 0.2 default to surface more "
+            "findings per round at the cost of a higher hallucination "
+            "rate (the decline-comment contract handles those). Range "
+            "typically 0.0-1.0. Override with $CODE_REVIEW_TEMPERATURE."
+        ),
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        metavar="N",
+        dest="max_tokens",
+        help=(
+            f"Maximum output tokens the model may emit. Default "
+            f"{DEFAULT_MAX_TOKENS} -- raised from the implicit ~8K "
+            "provider default so a thorough review isn't truncated "
+            "mid-finding. This is a ceiling, not a target: you pay only "
+            "for tokens actually emitted. Override with "
+            "$CODE_REVIEW_MAX_TOKENS."
+        ),
+    )
     args = parser.parse_args()
 
     model = _resolve_model(args)
+
+    # Resolve temperature: explicit CLI flag wins, then env, then default.
+    if args.temperature is not None:
+        temperature = args.temperature
+    else:
+        env_temp = os.getenv("CODE_REVIEW_TEMPERATURE")
+        try:
+            temperature = float(env_temp) if env_temp is not None else DEFAULT_TEMPERATURE
+        except ValueError:
+            sys.stderr.write(
+                f"ERROR: $CODE_REVIEW_TEMPERATURE={env_temp!r} is not a "
+                "valid float. Unset it or pass --temperature explicitly.\n"
+            )
+            sys.exit(2)
+
+    # Resolve max_tokens with the same precedence.
+    if args.max_tokens is not None:
+        max_tokens = args.max_tokens
+    else:
+        env_max = os.getenv("CODE_REVIEW_MAX_TOKENS")
+        try:
+            max_tokens = int(env_max) if env_max is not None else DEFAULT_MAX_TOKENS
+        except ValueError:
+            sys.stderr.write(
+                f"ERROR: $CODE_REVIEW_MAX_TOKENS={env_max!r} is not a "
+                "valid integer. Unset it or pass --max-tokens explicitly.\n"
+            )
+            sys.exit(2)
 
     # Resolve and validate the API key for the chosen provider before
     # touching git / GitHub so the user fails fast on configuration errors.
@@ -747,7 +830,8 @@ def main() -> None:
             sys.exit(1)
         sys.stderr.write(
             f"Reviewing {len(files)} file(s) ({len(bundle):,} chars) "
-            f"with `{model}` via {args.provider}...\n"
+            f"with `{model}` via {args.provider} "
+            f"(T={temperature}, max_tokens={max_tokens})...\n"
         )
         system_prompt, user_prompt = build_codebase_prompts(bundle)
     else:
@@ -765,7 +849,7 @@ def main() -> None:
             sys.exit(0)
         sys.stderr.write(
             f"Reviewing {len(diff):,}-char diff with `{model}` via "
-            f"{args.provider}...\n"
+            f"{args.provider} (T={temperature}, max_tokens={max_tokens})...\n"
         )
         system_prompt, user_prompt = build_diff_prompts(diff)
 
@@ -784,6 +868,8 @@ def main() -> None:
             api_key=api_key,
             referer=referer,
             title=title,
+            temperature=temperature,
+            max_tokens=max_tokens,
         )
     else:  # gemini
         output = call_gemini(
@@ -791,6 +877,8 @@ def main() -> None:
             user_prompt=user_prompt,
             model=model,
             api_key=api_key,
+            temperature=temperature,
+            max_tokens=max_tokens,
         )
     print(output)
 

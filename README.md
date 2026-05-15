@@ -112,6 +112,13 @@ Raw slugs still pass through unchanged, so anything OpenRouter serves — includ
 
 `--model <slug>` overrides the default model. Use `google/gemini-2.5-flash` / `flash` (OpenRouter) or `gemini-2.5-flash` (Gemini API) for ~3× faster reviews with some quality loss.
 
+Two more runtime knobs:
+
+- `--temperature <float>` (default `0.5`, env `CODE_REVIEW_TEMPERATURE`): sampling randomness. Higher = more findings per call, more hallucinations. Lower = tighter, fewer findings.
+- `--max-tokens <int>` (default `16000`, env `CODE_REVIEW_MAX_TOKENS`): ceiling on output. Not a target — you pay only for what's emitted. Default avoids mid-finding truncation on thorough reviews.
+
+The defaults shifted from `0.2` / `~8K` after empirical iteration: `0.2` produced 1–2 findings per round on diffs that plausibly contained more, requiring 5–7 rounds to converge. `0.5` typically produces 3–5 findings per round and converges in 3–5 rounds.
+
 ### Whole-codebase mode (`--codebase`)
 
 For "audit this repo I just inherited" or "find bugs in code none of us touched in this PR," the diff modes don't help. `--codebase` bundles every tracked file (filtered) into a single payload and reviews them as a whole.

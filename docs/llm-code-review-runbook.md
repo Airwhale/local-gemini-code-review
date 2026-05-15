@@ -77,6 +77,17 @@ The runner reads `.env` from its own directory — configure once, invoke from a
 
 Aliases work only under `--provider openrouter`. Passing an alias with `--provider gemini` is a category error (the Gemini API direct path takes bare Gemini model names only) and the runner exits with a clear message. Raw slugs always pass through unchanged, so newer models that haven't earned an alias yet still work via `--model <vendor>/<model>`.
 
+### Tuning sampling: `--temperature` and `--max-tokens`
+
+Two runtime knobs control how much the model says and how exploratory it is:
+
+| Flag | Default | What it controls | When to change |
+|---|---|---|---|
+| `--temperature <float>` | `0.5` (env: `CODE_REVIEW_TEMPERATURE`) | Sampling randomness. Higher = more exploration, more findings per call, more hallucinations. Lower = tighter, more conservative, fewer findings. | Drop to `0.2` for security-critical PRs where decline-comment overhead is expensive. Raise to `0.6–0.7` for first-pass audits where you want maximum coverage and can afford to filter noise. |
+| `--max-tokens <int>` | `16000` (env: `CODE_REVIEW_MAX_TOKENS`) | Ceiling on output token count. Not a target — you pay only for what the model actually emits. Default ensures a thorough review isn't truncated mid-finding. | Rarely needs changing. Drop to `4000` if you genuinely want short, focused output (e.g. CI-step where only critical findings matter). Raise if you see truncated `Suggested change:` blocks in very large reviews. |
+
+The defaults were chosen after iterating on real PRs: `temperature=0.2` produced 1–2 findings per round on diffs that plausibly contained more, requiring 5–7 rounds to converge. `temperature=0.5` typically produces 3–5 findings per round and converges in 3–5 rounds, at the cost of one or two additional hallucinations per cycle (declines handle them).
+
 ### Whole-codebase mode (`--codebase`)
 
 For situations that diff review can't help with — auditing a repo you just inherited, finding bugs in code none of your PRs have touched — `--codebase` bundles every tracked file (filtered) and reviews them as a single payload.
