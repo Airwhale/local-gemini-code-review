@@ -276,7 +276,11 @@ MODEL_ALIASES: dict[str, str] = {
     "claude": "anthropic/claude-sonnet-4.5",
     "claude-sonnet": "anthropic/claude-sonnet-4.5",
     "claude-opus": "anthropic/claude-opus-4.5",
-    # OpenAI / GPT family.
+    # OpenAI / GPT family. These slugs are current OpenRouter catalog
+    # entries; an older reviewer with a pre-2025 training cutoff may
+    # flag them as nonexistent because GPT-5 / GPT-5-mini postdate that
+    # cutoff. Verify against the live catalog before "fixing" them back
+    # to gpt-4o.
     "gpt": "openai/gpt-5",
     "gpt-mini": "openai/gpt-5-mini",
     # DeepSeek -- cheap, surprisingly strong at code review.
@@ -551,6 +555,20 @@ def _glob_match(path: Path, patterns: tuple[str, ...] | list[str]) -> bool:
     rather than only at the repo root. fnmatch treats ``*`` as matching
     everything including ``/``, so ``*.py`` matches all Python files
     regardless of nesting; this is intentional and documented.
+
+    Verified: ``fnmatch.fnmatch("foo/bar.py", "*.py") == True``. Python
+    docs (fnmatch module): "Note that the filename separator (os.sep on
+    Unix) is not special to this module." This is the OPPOSITE of
+    ``glob`` semantics where ``*`` stops at ``/``; do not assume glob
+    behavior when reading or modifying this function.
+
+    The ``tuple[str, ...] | list[str]`` signature is intentionally
+    explicit rather than ``Sequence[str]`` -- a ``str`` is itself a
+    ``Sequence[str]`` (it iterates as single-character strings), so a
+    looser annotation would silently accept a caller bug like
+    ``_glob_match(p, "*.py")`` and iterate over individual characters
+    instead of treating the string as one pattern. The verbose union
+    blocks that footgun at type-check time.
     """
     posix = path.as_posix()
     name = path.name
@@ -1083,7 +1101,7 @@ def main() -> None:
     parser.add_argument(
         "--include",
         action="append",
-        default=None,
+        default=[],
         metavar="GLOB",
         help=(
             "Glob to include in --codebase mode (e.g. "
@@ -1094,7 +1112,7 @@ def main() -> None:
     parser.add_argument(
         "--exclude",
         action="append",
-        default=None,
+        default=[],
         metavar="GLOB",
         help=(
             "Glob to exclude in --codebase mode (e.g. "
@@ -1186,6 +1204,14 @@ def main() -> None:
 
     model = _resolve_model(args)
 
+    # The two blocks below deliberately duplicate the (CLI -> env ->
+    # default + validate) resolution pattern instead of extracting a
+    # generic helper. Two call sites is too few to justify a 6-param
+    # abstraction (cli_val, env_var_name, default, converter, type_name,
+    # flag_name), and keeping the env-var names inline makes them
+    # grep-discoverable ("where does CODE_REVIEW_TEMPERATURE get
+    # resolved?" returns a single hit). Revisit if a third tunable
+    # arrives.
     # Resolve temperature: explicit CLI flag wins, then env, then default.
     if args.temperature is not None:
         temperature = args.temperature
@@ -1248,7 +1274,7 @@ def main() -> None:
     # are codebase-mode-only -- warn if they show up alongside a diff
     # mode rather than silently dropping them.
     if args.codebase:
-        files = gather_codebase_files(args.include or [], args.exclude or [])
+        files = gather_codebase_files(args.include, args.exclude)
         if not files:
             sys.stderr.write(
                 "No files matched after --include / --exclude / built-in "
@@ -1259,6 +1285,13 @@ def main() -> None:
         if len(bundle) > MAX_BUNDLE_CHARS:
             # Show the 10 largest files so the user can target
             # ``--exclude`` flags effectively rather than guessing.
+            # We re-stat in this branch rather than threading the
+            # sizes through ``gather_codebase_files``'s return type:
+            # this is a cold error path (only fires when the bundle
+            # exceeds the cap), so the redundant syscalls don't matter,
+            # and the alternative -- returning ``list[tuple[Path, int]]``
+            # from a function that 99% of callers only need ``list[Path]``
+            # from -- is a worse signature for a non-hot-path saving.
             sized = sorted(
                 ((p, p.stat().st_size) for p in files),
                 key=lambda x: x[1],
