@@ -111,18 +111,27 @@ Output is the same severity-tagged per-file findings format as diff mode — sam
 
 ```
 1. Edit the target repo (fix a bug, build a feature, etc.).
-2. Run:  uv run --project <runner> <runner>/review.py --base origin/main
-3. Read the structured-markdown output. Findings are tagged
+2. (If reviewing untracked files in codebase mode: `git add -N <paths>`
+   first so `git ls-files` sees them. No staged content; just makes
+   them visible to the bundler.)
+3. Run:  uv run --project <runner> <runner>/review.py --base origin/main
+4. Read the structured-markdown output. Findings are tagged
    CRITICAL > HIGH > MEDIUM > LOW.
-4. For each finding, decide: accept or decline.
-5. Apply accepted fixes inline. Do NOT commit yet.
-6. Re-run step 2.
-7. Repeat until output is:
-      "No issues found. Code looks clean and ready to merge."
-8. Run tests + build. Commit. Push.
+5. For each finding, decide: accept or decline.
+6. Apply accepted fixes inline. Do NOT commit yet.
+7. Re-run step 3.
+8. Repeat until ONE of:
+   - Output is "No issues found. Code looks clean..."
+   - A round produces only hallucinated findings (decline-only round)
+   - You have hit 4 rounds and remaining findings are stylistic noise
+9. Run tests + build. Commit. Push.
 ```
 
 **Do not commit between rounds.** `--base origin/main` uses a two-dot diff (`git diff -U5 <base>`), which includes working-tree edits. Re-running picks up in-progress fixes immediately. Committing every round produces noisy history; the reviewer is happy reviewing uncommitted edits.
+
+**The 4-round cap is a pragmatic ceiling, not a hard rule.** Empirically, real bugs surface in rounds 1–3 and round 4 is usually either clean or "all hallucinations." If round 4 is still producing substantive findings, the diff is too large — split it.
+
+**Codebase mode requires tracked files.** The runner uses `git ls-files` for safety (so it doesn't accidentally review `.venv/`, build artefacts, etc.). For new code that hasn't been committed yet, `git add -N <paths>` marks files as intent-to-add — they appear in `git ls-files` but their content stays unstaged. This is the cleanest way to get a review on work-in-progress without committing prematurely.
 
 ---
 
@@ -140,6 +149,8 @@ Output is the same severity-tagged per-file findings format as diff mode — sam
 - Findings that contradict load-bearing design intent already encoded. *Shape:* a pair of API endpoints that look redundant but are deliberately split for a planned future migration. The reviewer doesn't know your roadmap unless your code comments tell it.
 - Findings that would untighten a deliberately-tight test. *Shape:* a hardcoded expected count the reviewer wants computed dynamically from the fixture — that turns the test into a tautology (*what the code reads == what the code reports*) and removes the regression-catch.
 - Stylistic preferences that don't change correctness when the existing form has a defensible rationale. *Shape:* a cache `maxsize` chosen with deliberate headroom for test fixtures rather than the obvious-singleton value.
+- **Hedged findings ("if X is true, this is HIGH/CRITICAL").** The reviewer hedges when it lacks evidence to fully evaluate a hypothesis. In practice these resolve as false positives more often than as real bugs. *Shape:* "If `approved_body_hash` doesn't exclude `route_approval`, this is CRITICAL" — verify the premise (`approved_body_hash` does exclude it via an explicit `APPROVED_BODY_HASH_EXCLUDES` constant) before acting. Treat the hedge as a flag to spot-check the premise, not as an instruction.
+- **Self-refuting findings.** When a finding's own "better fix" matches the existing code, the reviewer hallucinated a bug it then walked back. *Shape:* "Wrong type at L772 — a better fix would be to pass the list of vectors directly" when the actual line (which may not even be L772) already does exactly that. Decline without action; no code comment needed because the next round won't re-flag the same hallucination consistently.
 
 ---
 
@@ -182,16 +193,18 @@ See the README's "Safety context" section for the default phrasing.
 
 1. **Free-tier 429 on Gemini direct.** `--provider gemini --model gemini-2.5-pro` requires a paid Google AI Studio plan; the free tier returns HTTP 429 immediately (`RATE_LIMIT`, exit 11). Either use `--provider openrouter` (preferred) or `--model gemini-2.5-flash`.
 
-2. **Two-dot vs three-dot diff.** `--base <ref>` uses two-dot (`git diff -U5 <ref>`) so working-tree changes show up. Three-dot (`<ref>...HEAD`) would show only committed changes and the reviewer would keep re-flagging the same issues. The two-dot semantics is intentional for the iteration workflow.
+2. **Codebase mode line numbers used to drift.** Before commit `b124501`, the bundle had no per-line anchors and the model estimated line positions from visual context, drifting 5–150 lines depending on file size. As of `b124501` every content line is pre-numbered (`cat -n` style) and the model transcribes the prefix instead of counting. If you ever see drift again on a current build, that's a regression worth investigating — the prompt or bundle format may have been changed in a way that broke the contract.
 
-3. **Diff size shapes round count.** Larger diffs surface more findings per round and take more rounds to converge. Rough observed shapes:
+3. **Two-dot vs three-dot diff.** `--base <ref>` uses two-dot (`git diff -U5 <ref>`) so working-tree changes show up. Three-dot (`<ref>...HEAD`) would show only committed changes and the reviewer would keep re-flagging the same issues. The two-dot semantics is intentional for the iteration workflow.
+
+4. **Diff size shapes round count.** Larger diffs surface more findings per round and take more rounds to converge. Rough observed shapes:
    - Small PR (~25K-char diff, single feature): 3–4 rounds
    - Medium PR (~50K chars): 4–6 rounds
    - Large PR (~300K chars): 8–12 rounds
 
-4. **`tee` to a file.** When output is large, pipe to `tee /tmp/review.md` so you can re-read findings without re-invoking the tool. Saves context budget on subsequent steps.
+5. **`tee` to a file.** When output is large, pipe to `tee /tmp/review.md` so you can re-read findings without re-invoking the tool. Saves context budget on subsequent steps.
 
-5. **Codebase-mode bundle cap.** `--codebase` enforces a 700 K-char (~175 K-token) pre-flight cap on the concatenated bundle. If you hit it, the runner exits with `CONTEXT_OVERFLOW` (exit 12) and lists the 10 largest files in the current selection — use those to target `--exclude` flags. Common offenders: vendored fixture JSON, committed schema dumps, test data files.
+6. **Codebase-mode bundle cap.** `--codebase` enforces a 700 K-char (~175 K-token) pre-flight cap on the concatenated bundle. If you hit it, the runner exits with `CONTEXT_OVERFLOW` (exit 12) and lists the 10 largest files in the current selection — use those to target `--exclude` flags. Common offenders: vendored fixture JSON, committed schema dumps, test data files.
 
 ---
 

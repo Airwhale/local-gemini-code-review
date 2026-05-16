@@ -10,7 +10,49 @@ This tool is **LLM-friendly by design**. It's built to be invoked by AI coding a
 
 > **If you're an LLM agent reading this repository, your canonical entry point is [`docs/llm-code-review-runbook.md`](./docs/llm-code-review-runbook.md).**
 >
-> That file is the operational manual — exact invocation patterns, accept / decline heuristics, the decline-comment contract that makes the iteration loop converge instead of churning on the same finding every pass, the known gotchas, and the per-round tracking template. It is written to be self-contained: you can pick it up cold and start producing clean review cycles without any other context.
+> That file is the operational manual. The flow below is a fast-start summary; the runbook expands every step with examples, declined-finding patterns, and per-round tracking templates.
+
+### Canonical iteration flow
+
+This is the loop that's been validated in real review cycles. Follow it verbatim until you've internalised why each step exists.
+
+1. **Pick a scope.** Diff mode for in-progress work (`--base origin/main` for the current branch, `--pr <N>` for a PR, `--staged` for pre-commit). Codebase mode for audits of files not under active change (`--codebase --include 'backend/foo/**'`).
+2. **If files are untracked**, `git ls-files`-based codebase mode won't see them. Run `git add -N <paths>` first (intent-to-add, no staged content). The tool will then bundle them. Don't unstage afterward unless you actually intend to leave them untracked.
+3. **Run the review.** A clean codebase output ends in `No issues found. Code looks clean.`; a clean diff ends in `No issues found. Code looks clean and ready to merge.`
+4. **For each finding, decide accept or decline.**
+   * **Accept by default**: CRITICAL/HIGH bugs, MEDIUM correctness/concurrency/atomicity, MEDIUM defensive-coding, trivially-correct LOW.
+   * **Decline (and add a code comment explaining why)**: findings that contradict load-bearing design intent, findings that would untighten a deliberately-tight test, stylistic preferences without a correctness delta.
+   * **Hedged findings ("if X is true, this is HIGH/CRITICAL") are a decline signal until you verify X.** The reviewer hedges when it lacks evidence; in practice these resolve as false positives more often than as real bugs. Treat the hedge as a flag to spot-check the premise, not as an instruction to act.
+5. **Apply accepted fixes inline. Do NOT commit between rounds.** `--base <ref>` uses a two-dot diff, so working-tree edits show up in the next run.
+6. **For each declined finding, add a code comment** immediately adjacent to the flagged line explaining the rejection. Without it, the next round re-flags the same finding. This is the central operational rule that makes the loop converge.
+7. **Re-run.** Repeat steps 3–6.
+8. **Stop conditions** (in priority order):
+   * Output is clean ("No issues found...") → done.
+   * A round produces only hallucinated findings (wrong line numbers, contradictory suggestions, or claims that don't match the code) → done; the model has run out of substantive material.
+   * You've hit 4 rounds → done; remaining findings are usually noise or out of scope.
+9. **Run tests + build.** Commit. Push.
+
+### What "hallucination" looks like in practice
+
+The model occasionally fabricates a finding it then partially refutes — e.g., *"This call passes the wrong type at L772. A better fix would be to pass the list of vectors directly"* — when the existing code at the actual (non-L772) line already does exactly the "better fix." When you see a finding's own suggested fix match the existing code, decline without action.
+
+Pre-fix to v1.1, line numbers in codebase mode drifted 5–150 lines depending on file size. As of [b124501](https://github.com/Airwhale/local-gemini-code-review/commit/b124501) the bundle pre-numbers every line (`cat -n` style) and the model transcribes the prefix instead of counting; codebase-mode line numbers are now exact. If you see drift again, that's a regression — file an issue.
+
+### Per-round ledger
+
+Keep one row per finding so the final commit message or PR comment can summarise the cycle:
+
+```
+| Round | File | Line | Severity | Finding                          | Action              |
+|-------|------|------|----------|----------------------------------|---------------------|
+| 1     | a.py | 808  | LOW      | Custom markdown parser fragile   | Declined w/ comment |
+| 1     | b.py | 111  | MEDIUM   | Missing type hint on `result`    | Applied             |
+| 2     | a.py | 313  | MEDIUM   | Silent LLMClient fallback        | Applied             |
+| 3     | -    | -    | -        | Vector sum duplication           | Declined w/ comment |
+| 4     | -    | -    | -        | Hallucination (line mismatch)    | No action           |
+```
+
+This is the artifact a human reviewer reads to understand what changed and why. The runbook's "Per-round tracking" section has the long form.
 
 The rest of this README is the general-audience documentation (humans, contributors, anyone evaluating the fork). The runbook is the agent-targeted documentation, and it is the file to read first if your job is to use the tool, not understand its provenance.
 
