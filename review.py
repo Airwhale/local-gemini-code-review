@@ -1279,11 +1279,11 @@ def _resolve_model(args: argparse.Namespace) -> str:
     # user almost certainly meant to switch providers. Surface that with
     # a typed ConfigError naming the right --provider, so an LLM caller
     # parsing stderr can self-correct instead of hammering the wrong
-    # endpoint.
+    # endpoint. The compound condition (other_provider != args.provider
+    # AND model in other_aliases) is equivalent to the previous
+    # ``continue``-based skip, kept compact at the reviewer's suggestion.
     for other_provider, other_aliases in MODEL_ALIASES_BY_PROVIDER.items():
-        if other_provider == args.provider:
-            continue
-        if model in other_aliases:
+        if other_provider != args.provider and model in other_aliases:
             raise ConfigError(
                 f"Model alias `{model}` is only valid with "
                 f"--provider {other_provider} (currently --provider "
