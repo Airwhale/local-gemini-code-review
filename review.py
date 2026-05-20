@@ -1120,8 +1120,21 @@ def call_ollama(
     }
     url = host.rstrip("/") + OLLAMA_CHAT_PATH
 
+    # Split the timeout into a short connect window and a long read window.
+    # A single ``timeout=1800`` applies to all phases of the request,
+    # including the TCP connect -- which means an unreachable server would
+    # have us wait 30 minutes for the connection to time out before we
+    # raise ``ConnectError``. The fix is to keep the long timeout for
+    # the *read* phase (where CPU-local inference legitimately takes
+    # minutes) but cap the *connect* phase at 10 seconds so "server
+    # not running" surfaces as a fast ConfigError instead of a 30-minute
+    # hang. Write / pool fall back to the ``timeout`` default (the long
+    # one) since those phases don't have the same "unreachable server"
+    # failure mode.
+    timeout_config = httpx.Timeout(timeout, connect=10.0)
+
     try:
-        with httpx.Client(timeout=timeout) as client:
+        with httpx.Client(timeout=timeout_config) as client:
             response = client.post(url, headers=headers, json=payload)
     except httpx.ConnectError as exc:
         # Server unreachable. Most likely Ollama isn't running, or
@@ -1339,7 +1352,8 @@ def main() -> None:
         description=(
             "Standalone code-review runner using the Gemini CLI "
             "code-review extension prompts. Sends them to a Gemini-or-"
-            "other model via OpenRouter or the Gemini API directly."
+            "other model via OpenRouter, the Gemini API directly, or "
+            "a local Ollama server (offline / no API key)."
         )
     )
     source = parser.add_mutually_exclusive_group()
@@ -1399,6 +1413,9 @@ def main() -> None:
             "OpenRouter's chat-completions endpoint and needs "
             "``OPENROUTER_API_KEY``. ``gemini`` calls Google AI Studio's "
             "generateContent endpoint directly and needs ``GEMINI_API_KEY``. "
+            "``ollama`` posts to a local Ollama server's OpenAI-compatible "
+            "endpoint (no API key; configure with ``--ollama-host`` / "
+            "$OLLAMA_HOST / $OLLAMA_MODEL / $OLLAMA_TIMEOUT). "
             "Override with $CODE_REVIEW_PROVIDER."
         ),
     )
