@@ -3,7 +3,7 @@
 
 This fork keeps the upstream `skills/code-review-commons/SKILL.md` and
 `commands/code-review.toml` prompts intact (Apache-2.0, unmodified) and adds a
-thin Python runner that sends them to a Gemini-or-other-model via one of two
+thin Python runner that sends them to a Gemini-or-other-model via one of three
 providers selectable at the command line:
 
   --provider openrouter (default)
@@ -18,10 +18,22 @@ providers selectable at the command line:
       `GEMINI_API_KEY`. Slightly lower latency (one less hop) and uses the
       same key the GitHub bot uses on the backend.
 
-Both paths default to ``gemini-2.5-pro``. `--model <slug>` overrides; the
-``--provider openrouter`` path also accepts named aliases (see
-``MODEL_ALIASES`` below) so you can write ``--model claude`` instead of
-``--model anthropic/claude-sonnet-4.5``.
+  --provider ollama
+      POSTs to a local Ollama server's OpenAI-compatible endpoint
+      (http://localhost:11434/v1/chat/completions by default). No API key
+      required -- the server runs on your machine (or in WSL). Override the
+      URL with `--ollama-host` or `$OLLAMA_HOST` if Ollama listens elsewhere
+      (different port, different machine, WSL with non-default networking).
+      Best for offline / private / cost-free review; trade-off is quality
+      and speed depending on local model size and CPU/GPU.
+
+Provider defaults: openrouter -> ``google/gemini-2.5-pro``, gemini ->
+``gemini-2.5-pro``, ollama -> ``qwen3-coder:30b`` (the MoE coder model
+with ~3.3B active params, the quality/speed sweet spot on CPU). The
+``--model <slug>`` flag overrides per call; ``--provider openrouter``
+and ``--provider ollama`` also accept named aliases (see
+``MODEL_ALIASES_BY_PROVIDER`` below) so you can write ``--model claude``
+or ``--model local`` instead of the full slug.
 
 Diff modes (default) review a git diff:
 
@@ -39,7 +51,8 @@ Whole-codebase mode reviews tracked files (filtered):
 The .env loaded from this script's directory (not CWD) -- copy `.env.example`
 to `.env` once at the runner location and invoke from any project folder.
 Set whichever of `OPENROUTER_API_KEY` / `GEMINI_API_KEY` your chosen provider
-needs.
+needs (Ollama doesn't need an API key -- just set `OLLAMA_HOST` if your
+server isn't at the default `http://localhost:11434`).
 """
 
 from __future__ import annotations
@@ -216,11 +229,19 @@ DEFAULT_CONTEXT = (
 
 # Provider configuration. The default model slug differs by provider because
 # OpenRouter prefixes vendor names (``google/...``) while the Gemini API
-# accepts the bare model name. Override per-call with ``--model``.
-PROVIDERS = ("openrouter", "gemini")
+# accepts the bare model name. Ollama uses its own tag format
+# (``qwen3-coder:30b``) and runs against a local server (no vendor prefix,
+# no API key). Override per-call with ``--model``.
+PROVIDERS = ("openrouter", "gemini", "ollama")
 DEFAULT_MODEL_BY_PROVIDER: dict[str, str] = {
     "openrouter": "google/gemini-2.5-pro",
     "gemini": "gemini-2.5-pro",
+    # Ollama default. ``qwen3-coder:30b`` is the MoE coder model with
+    # ~3.3B active params -- best quality/speed balance on CPU. If the
+    # user hasn't pulled it, ``call_ollama`` raises a typed ConfigError
+    # pointing them to ``ollama pull qwen3-coder:30b``. Override per env
+    # with $OLLAMA_MODEL or per call with --model.
+    "ollama": "qwen3-coder:30b",
 }
 DEFAULT_PROVIDER = "openrouter"
 
@@ -228,18 +249,41 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 GEMINI_URL_TEMPLATE = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 )
+# Ollama exposes both its native API (``/api/chat``) and an OpenAI-compatible
+# endpoint (``/v1/chat/completions``). We use the latter because the request/
+# response shape mirrors OpenRouter, which lets us reuse the same
+# finish-reason classification and error-handling patterns.
+DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+OLLAMA_CHAT_PATH = "/v1/chat/completions"
 HTTP_TIMEOUT = 300.0  # Gemini 2.5 Pro on a ~5K-line diff lands ~30-60s; pad
                      # generously for very large diffs and whole-codebase
                      # bundles.
+# Local CPU inference on a 30B MoE coder model takes ~10-25 tok/sec on
+# modern hardware, so a thorough review (1500-3000 output tokens) can run
+# 1-5 minutes; cold-start model load adds another 10-60s on the first
+# call after server start. ``HTTP_TIMEOUT`` (300s = 5 min) is too tight
+# for that worst case, so Ollama gets its own ceiling. Override with
+# $OLLAMA_TIMEOUT if you're on slower hardware or running larger models.
+DEFAULT_OLLAMA_TIMEOUT = 1800.0  # 30 minutes
 
-# Sampling temperature for the model. Raised from 0.2 to 0.5 after running
-# several review cycles at 0.2 and observing 1-2 findings per round on
-# diffs that plausibly contained more. Higher temperature broadens the
-# model's exploration so more findings surface per call, at the cost of
-# a moderately higher hallucination rate -- the decline-comment contract
-# in the runbook handles those cleanly. Override per call with
-# ``--temperature`` or per environment with ``$CODE_REVIEW_TEMPERATURE``.
-DEFAULT_TEMPERATURE = 0.5
+# Sampling temperature for the model. History of this constant:
+#
+#   0.2  (original): too conservative -- 1-2 findings per round on diffs
+#        that plausibly contained more; 5-7 rounds to converge.
+#   0.5  (raised after observing the above): more findings per round
+#        (3-5 typical), but on a later cross-model comparison
+#        ``google/gemini-2.5-pro`` produced a HIGH-severity finding
+#        that referenced a CLI flag (``--timeout``) and quoted "help
+#        text" that don't exist in the codebase -- a clean
+#        hallucination that would have crashed the runner if its
+#        suggested fix had been applied verbatim.
+#   0.3  (current): split the difference. Tighter than 0.5 to cut the
+#        hallucination rate; looser than 0.2 to keep the "surface more
+#        findings" benefit. Empirical re-tuning is encouraged if you
+#        observe drift either way; override per call with
+#        ``--temperature`` or per environment with
+#        ``$CODE_REVIEW_TEMPERATURE``.
+DEFAULT_TEMPERATURE = 0.3
 
 # Maximum output tokens the model may emit. Raised from the implicit
 # provider default (~8K for Gemini 2.5 Pro) to 16K so a thorough review
@@ -248,44 +292,75 @@ DEFAULT_TEMPERATURE = 0.5
 # Override with ``--max-tokens`` or ``$CODE_REVIEW_MAX_TOKENS``.
 DEFAULT_MAX_TOKENS = 16000
 
-# Named aliases for OpenRouter model slugs. The OpenRouter URL form
-# ``vendor/model`` is awkward to type; an alias collapses it to a short
-# name (``claude``, ``gpt``, ``deepseek``...) for ergonomics. Aliases are
-# resolved before the call is made; the resolved slug is what shows up
-# in stderr "Reviewing ... with ..." and what OpenRouter actually
-# dispatches to.
+# Named aliases for model slugs, scoped per provider. Each provider has
+# its own slug format (OpenRouter: ``vendor/model``, Gemini API: bare
+# ``gemini-...`` names, Ollama: ``family:tag``), and an alias is only
+# valid for its declared provider. Aliases are resolved before the call
+# is made; the resolved slug is what shows up in stderr "Reviewing ...
+# with ..." and what the provider actually dispatches to.
 #
-# Aliases apply only to ``--provider openrouter``. The Gemini API direct
-# path takes bare Gemini model names (no vendor prefix) so a slug like
-# ``anthropic/claude-sonnet-4.5`` is a category error for that provider;
-# we error out with a clear message instead of silently sending an
-# invalid model name to Google's API.
+# When a user passes ``--model <alias>`` with the wrong provider, the
+# runner raises a typed ConfigError pointing them at the correct
+# ``--provider`` instead of silently sending an invalid model name to
+# the upstream API.
 #
-# Keep this table small and curated. Adding every model on OpenRouter is
-# not the goal -- users who want exotic models can pass the raw slug via
-# ``--model``. The aliases here are the models that earned their place
-# as a "second-opinion reviewer" in practice.
-MODEL_ALIASES: dict[str, str] = {
-    # Gemini family (OpenRouter route to the same models the
-    # ``--provider gemini`` direct path serves).
-    "pro": "google/gemini-2.5-pro",
-    "gemini-pro": "google/gemini-2.5-pro",
-    "flash": "google/gemini-2.5-flash",
-    "gemini-flash": "google/gemini-2.5-flash",
-    # Anthropic / Claude family.
-    "claude": "anthropic/claude-sonnet-4.5",
-    "claude-sonnet": "anthropic/claude-sonnet-4.5",
-    "claude-opus": "anthropic/claude-opus-4.5",
-    # OpenAI / GPT family. These slugs are current OpenRouter catalog
-    # entries; an older reviewer with a pre-2025 training cutoff may
-    # flag them as nonexistent because GPT-5 / GPT-5-mini postdate that
-    # cutoff. Verify against the live catalog before "fixing" them back
-    # to gpt-4o.
-    "gpt": "openai/gpt-5",
-    "gpt-mini": "openai/gpt-5-mini",
-    # DeepSeek -- cheap, surprisingly strong at code review.
-    "deepseek": "deepseek/deepseek-chat-v3.1",
+# Keep these tables small and curated. The aliases here are the models
+# that earned their place as a "second-opinion reviewer" in practice;
+# users who want exotic models can pass the raw slug via ``--model``.
+MODEL_ALIASES_BY_PROVIDER: dict[str, dict[str, str]] = {
+    "openrouter": {
+        # Gemini family (OpenRouter route to the same models the
+        # ``--provider gemini`` direct path serves).
+        "pro": "google/gemini-2.5-pro",
+        "gemini-pro": "google/gemini-2.5-pro",
+        "flash": "google/gemini-2.5-flash",
+        "gemini-flash": "google/gemini-2.5-flash",
+        # Anthropic / Claude family.
+        "claude": "anthropic/claude-sonnet-4.5",
+        "claude-sonnet": "anthropic/claude-sonnet-4.5",
+        "claude-opus": "anthropic/claude-opus-4.5",
+        # OpenAI / GPT family. These slugs are current OpenRouter catalog
+        # entries; an older reviewer with a pre-2025 training cutoff may
+        # flag them as nonexistent because GPT-5 / GPT-5-mini postdate that
+        # cutoff. Verify against the live catalog before "fixing" them back
+        # to gpt-4o.
+        "gpt": "openai/gpt-5",
+        "gpt-mini": "openai/gpt-5-mini",
+        # DeepSeek -- cheap, surprisingly strong at code review.
+        "deepseek": "deepseek/deepseek-chat-v3.1",
+    },
+    "ollama": {
+        # Local model tiers, both qwen3-coder. ``local`` is the
+        # recommended default (30B MoE with ~3.3B active params, the
+        # quality/speed sweet spot on CPU because active param count
+        # drives inference speed, not total params). ``local-pro`` is
+        # the larger MoE (80B/3B active) for users who want higher
+        # quality and can spare the disk (~40 GB) for marginal speed
+        # cost. Users who haven't pulled a given tag get a typed
+        # ConfigError from ``call_ollama`` pointing them at the right
+        # ``ollama pull`` command.
+        #
+        # No ``local-fast`` alias: qwen3-coder doesn't ship a small
+        # dense variant on Ollama, and the qwen2.5-coder family is a
+        # generation behind on code review quality. Users who need a
+        # smaller model should pass the explicit ``--model`` slug
+        # (e.g. ``--model qwen2.5-coder:7b``) rather than rely on a
+        # "fast" alias that papers over the generation gap.
+        "local": "qwen3-coder:30b",
+        "local-pro": "qwen3-coder-next",
+    },
+    # ``gemini`` (direct-API) has no aliases -- it takes bare Gemini
+    # model names only. Passing an alias with --provider gemini raises
+    # a ConfigError so the user gets a clear message rather than a
+    # cryptic 404 from Google's API.
 }
+
+# Backwards-compatible flat alias map. Some external tooling or tests
+# may have imported the old top-level ``MODEL_ALIASES`` dict that
+# contained only the OpenRouter aliases. The new authoritative table
+# is ``MODEL_ALIASES_BY_PROVIDER``; this name is preserved as a
+# read-only view over the OpenRouter slice for compatibility.
+MODEL_ALIASES: dict[str, str] = MODEL_ALIASES_BY_PROVIDER["openrouter"]
 
 # Upstream `code-review.toml` instructs the model to *call* git itself via a
 # tool. We have no tool layer; instead we extract the diff up front and
@@ -992,6 +1067,152 @@ def call_gemini(
     )
 
 
+def call_ollama(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    model: str,
+    host: str,
+    temperature: float,
+    max_tokens: int,
+    timeout: float,
+) -> str:
+    """POST to a local Ollama server via its OpenAI-compatible chat-completions
+    endpoint. No API key required (local). Caller builds the prompts (same as
+    ``call_openrouter`` and ``call_gemini``) so the wire path is mode-agnostic.
+    Raises typed ``ReviewError`` subclasses; see README "Error model".
+
+    Differences from cloud providers:
+
+    - **No auth header.** Local server, no token-bearer logic.
+    - **First request after server start is slow** (~10-60s) because Ollama
+      lazy-loads the model into RAM. Subsequent requests within the
+      keep-alive window are fast. ``timeout`` is generously larger than
+      ``HTTP_TIMEOUT`` for cloud providers to absorb this cold start.
+    - **Connection refused** is a distinct failure mode (server not
+      running) versus a 4xx/5xx (server up, problem with the request).
+      We surface it as a ``ConfigError`` so the user gets actionable
+      guidance instead of a generic transport error.
+    - **404 means the model isn't pulled**, not "endpoint not found."
+      The body usually contains the model name; we surface it as a
+      ConfigError pointing at the right ``ollama pull`` command.
+    - **No content filter / safety mode.** Ollama doesn't refuse output
+      on safety grounds, so the empty-content classifier checks only
+      length / max-tokens / generic hiccup -- no SafetyRefusal branch.
+    """
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        # Temperature and max_tokens use the same keys as OpenRouter
+        # (Ollama's OpenAI-compat endpoint mirrors that shape).
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        # Force non-streaming so we get the whole response in one JSON
+        # blob -- simpler to parse and matches how we handle the cloud
+        # providers.
+        "stream": False,
+    }
+    headers = {
+        "Content-Type": "application/json",
+    }
+    url = host.rstrip("/") + OLLAMA_CHAT_PATH
+
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            response = client.post(url, headers=headers, json=payload)
+    except httpx.ConnectError as exc:
+        # Server unreachable. Most likely Ollama isn't running, or
+        # OLLAMA_HOST points at the wrong place. ConfigError so the
+        # caller (human or LLM agent) doesn't retry pointlessly -- they
+        # need to fix config first.
+        raise ConfigError(
+            f"Cannot reach Ollama at {host}. Is the server running? "
+            f"Start it with `ollama serve` (or `wsl -d Ubuntu -- ollama serve` "
+            f"if Ollama lives in WSL). Override the URL with --ollama-host "
+            f"or $OLLAMA_HOST if it's on a non-default port/machine.",
+            detail=str(exc),
+            model=model,
+            provider="ollama",
+        ) from exc
+    except httpx.RequestError as exc:
+        # Other network-layer failure (timeout reading response, DNS for
+        # a non-localhost host, etc.). TransportError so the auto-retry
+        # in ``_retry_on_recoverable`` gives it one more try before
+        # raising.
+        raise TransportError(
+            f"Ollama request to {host} failed: {exc}",
+            model=model,
+            provider="ollama",
+        ) from exc
+
+    # 404 from Ollama means the model isn't pulled. The response body
+    # typically includes the model name and a "try pulling first"
+    # message. Surface as a ConfigError with the exact pull command so
+    # the user can fix it in one step.
+    if response.status_code == 404:
+        raise ConfigError(
+            f"Model `{model}` not available on Ollama server at {host}. "
+            f"Run `ollama pull {model}` (or `wsl -d Ubuntu -- ollama pull "
+            f"{model}` if Ollama is in WSL), then retry.",
+            detail=response.text[:500],
+            model=model,
+            provider="ollama",
+        )
+
+    if response.status_code >= 400:
+        raise _classify_http_error(
+            response.status_code, response.text, model=model, provider="ollama"
+        )
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise ProviderHiccup(
+            f"Ollama returned non-JSON response: {exc}",
+            detail=response.text[:1000],
+            model=model,
+            provider="ollama",
+        ) from exc
+
+    choices = data.get("choices") or []
+    if not choices:
+        raise ProviderHiccup(
+            "Ollama response had no choices",
+            detail=str(data)[:1000],
+            model=model,
+            provider="ollama",
+        )
+    choice = choices[0]
+    finish_reason = (choice.get("finish_reason") or "").lower()
+    message = choice.get("message") or {}
+    content = message.get("content")
+
+    if content:
+        return content
+
+    # Null / empty content. Ollama doesn't have content-filter / safety
+    # refusals, so the only diagnosable empty-content cause is hitting
+    # the max-token ceiling. Anything else falls through to a generic
+    # ProviderHiccup which the caller can retry once.
+    if finish_reason in {"length", "max_tokens"}:
+        raise ContextOverflow(
+            f"Hit max_tokens ({max_tokens}) before producing content "
+            f"(finish_reason={finish_reason!r})",
+            detail=str(data)[:1000],
+            model=model,
+            provider="ollama",
+        )
+    raise ProviderHiccup(
+        f"Ollama returned empty content with finish_reason={finish_reason!r}",
+        detail=str(data)[:1000],
+        model=model,
+        provider="ollama",
+    )
+
+
 def _retry_on_recoverable(call: Callable[[], T], *, label: str) -> T:
     """Run ``call``; on ``ProviderHiccup`` or ``TransportError`` retry once.
 
@@ -1017,28 +1238,46 @@ def _retry_on_recoverable(call: Callable[[], T], *, label: str) -> T:
 
 def _resolve_model(args: argparse.Namespace) -> str:
     """Resolve the final model slug from CLI flag, env var, alias table,
-    or provider default. Raises ``ConfigError`` if an alias is used with the
-    wrong provider (the Gemini API direct path takes bare Gemini model names
-    only -- a non-Gemini alias like ``claude`` is a category error there).
+    or provider default.
+
+    Aliases are scoped per provider (see ``MODEL_ALIASES_BY_PROVIDER``):
+    OpenRouter aliases like ``claude`` resolve only with --provider
+    openrouter; Ollama aliases like ``local`` resolve only with
+    --provider ollama. Using an alias from the wrong table raises a
+    typed ``ConfigError`` pointing the caller at the correct
+    ``--provider`` instead of silently sending an invalid slug to the
+    upstream API.
     """
     if args.model is not None:
         model = args.model
     elif args.provider == "openrouter":
         model = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL_BY_PROVIDER["openrouter"])
-    else:  # gemini
+    elif args.provider == "gemini":
         model = os.getenv("GEMINI_MODEL", DEFAULT_MODEL_BY_PROVIDER["gemini"])
+    else:  # ollama
+        model = os.getenv("OLLAMA_MODEL", DEFAULT_MODEL_BY_PROVIDER["ollama"])
 
-    if model in MODEL_ALIASES:
-        if args.provider != "openrouter":
+    # Resolve via this provider's alias table.
+    provider_aliases = MODEL_ALIASES_BY_PROVIDER.get(args.provider, {})
+    if model in provider_aliases:
+        return provider_aliases[model]
+
+    # If the model name matches an alias for a DIFFERENT provider, the
+    # user almost certainly meant to switch providers. Surface that with
+    # a typed ConfigError naming the right --provider, so an LLM caller
+    # parsing stderr can self-correct instead of hammering the wrong
+    # endpoint.
+    for other_provider, other_aliases in MODEL_ALIASES_BY_PROVIDER.items():
+        if other_provider == args.provider:
+            continue
+        if model in other_aliases:
             raise ConfigError(
-                f"Model alias `{model}` is only valid with --provider openrouter. "
-                f"The Gemini API direct path takes bare Gemini model names only "
-                f"(e.g. gemini-2.5-pro, gemini-2.5-flash). Either pass "
-                f"--provider openrouter to use this alias, or pass "
-                f"--model gemini-2.5-pro / --model gemini-2.5-flash for the "
-                f"direct path."
+                f"Model alias `{model}` is only valid with "
+                f"--provider {other_provider} (currently --provider "
+                f"{args.provider}). Either switch with "
+                f"--provider {other_provider}, or pass an actual model "
+                f"name supported by --provider {args.provider}."
             )
-        model = MODEL_ALIASES[model]
 
     return model
 
@@ -1168,11 +1407,25 @@ def main() -> None:
         default=None,
         help=(
             "Model slug or alias. Defaults to the provider-appropriate "
-            "``gemini-2.5-pro`` variant. Override with $OPENROUTER_MODEL "
-            "or $GEMINI_MODEL respectively. Aliases (--provider "
-            "openrouter only): pro, flash, claude, claude-opus, gpt, "
-            "gpt-mini, deepseek. ``gemini-2.5-flash`` / ``flash`` is "
-            "~3x faster with some quality loss."
+            "value (``google/gemini-2.5-pro`` for openrouter, "
+            "``gemini-2.5-pro`` for gemini, ``qwen3-coder:30b`` for "
+            "ollama). Override with $OPENROUTER_MODEL / $GEMINI_MODEL / "
+            "$OLLAMA_MODEL respectively. Aliases: pro/flash/claude/"
+            "claude-opus/gpt/gpt-mini/deepseek (openrouter); "
+            "local/local-pro (ollama). ``gemini-2.5-flash`` / "
+            "``flash`` is ~3x faster with some quality loss."
+        ),
+    )
+    parser.add_argument(
+        "--ollama-host",
+        default=None,
+        metavar="URL",
+        help=(
+            "Ollama server URL when --provider ollama. Defaults to "
+            f"{DEFAULT_OLLAMA_HOST} or $OLLAMA_HOST. Useful if Ollama "
+            "is on a non-default port, on another machine, or running "
+            "inside WSL with non-default networking. Ignored for other "
+            "providers."
         ),
     )
     parser.add_argument(
@@ -1182,10 +1435,12 @@ def main() -> None:
         metavar="FLOAT",
         help=(
             f"Sampling temperature. Default {DEFAULT_TEMPERATURE} -- "
-            "raised from the previous 0.2 default to surface more "
-            "findings per round at the cost of a higher hallucination "
-            "rate (the decline-comment contract handles those). Range "
-            "typically 0.0-1.0. Override with $CODE_REVIEW_TEMPERATURE."
+            "tuned between the original 0.2 (too conservative, "
+            "missed real findings) and a brief 0.5 default (caught "
+            "more but produced hallucinated findings on cross-model "
+            "review). Range typically 0.0-1.0; higher widens "
+            "exploration at higher hallucination risk. Override with "
+            "$CODE_REVIEW_TEMPERATURE."
         ),
     )
     parser.add_argument(
@@ -1297,24 +1552,59 @@ def main() -> None:
     else:
         context = os.getenv("CODE_REVIEW_CONTEXT") or DEFAULT_CONTEXT
 
-    # Resolve and validate the API key for the chosen provider before
-    # touching git / GitHub so the user fails fast on configuration errors.
+    # Resolve and validate provider-specific config before touching git /
+    # GitHub so the user fails fast on configuration errors. Cloud
+    # providers need an API key; Ollama is local so it needs a server
+    # URL and (optionally) a longer timeout instead.
+    api_key: str | None = None
+    ollama_host: str | None = None
+    ollama_timeout: float | None = None
+
     if args.provider == "openrouter":
         api_key = os.getenv("OPENROUTER_API_KEY")
         if not api_key:
             raise ConfigError(
                 "OPENROUTER_API_KEY not set. Copy .env.example to "
                 f".env at {ROOT} and fill in your key, or rerun with "
-                "--provider gemini if you only have a Gemini API key."
+                "--provider gemini (Google AI Studio key) or "
+                "--provider ollama (local server, no key needed)."
             )
-    else:  # gemini
+    elif args.provider == "gemini":
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise ConfigError(
                 "GEMINI_API_KEY not set. Copy .env.example to .env "
                 f"at {ROOT} and fill in your Google AI Studio key, or "
-                "rerun with --provider openrouter if you only have an "
-                "OpenRouter key."
+                "rerun with --provider openrouter (OpenRouter key) or "
+                "--provider ollama (local server, no key needed)."
+            )
+    else:  # ollama
+        # No API key for local provider. Resolve host + timeout from
+        # CLI / env / default. Validation of the host URL is implicit
+        # in the call -- a bad URL produces a typed ConnectError-derived
+        # ConfigError from ``call_ollama`` with a clear message.
+        ollama_host = (
+            args.ollama_host
+            or os.getenv("OLLAMA_HOST")
+            or DEFAULT_OLLAMA_HOST
+        )
+        env_timeout = os.getenv("OLLAMA_TIMEOUT")
+        try:
+            ollama_timeout = (
+                float(env_timeout) if env_timeout is not None
+                else DEFAULT_OLLAMA_TIMEOUT
+            )
+        except ValueError as exc:
+            raise ConfigError(
+                f"$OLLAMA_TIMEOUT={env_timeout!r} is not a valid float "
+                "(seconds). Unset it to use the default "
+                f"({DEFAULT_OLLAMA_TIMEOUT}s) or set it to a positive "
+                "number of seconds."
+            ) from exc
+        if ollama_timeout <= 0:
+            raise ConfigError(
+                f"$OLLAMA_TIMEOUT={ollama_timeout} must be positive "
+                "(seconds)."
             )
 
     # Build the payload for the chosen mode. ``--include`` / ``--exclude``
@@ -1387,12 +1677,16 @@ def main() -> None:
         )
         system_prompt, user_prompt = build_diff_prompts(diff, context)
 
-    # Wire-format dispatch. Both providers take the same (system, user)
-    # prompt pair; only the request shape differs. ``_retry_on_recoverable``
-    # wraps the call so a single provider hiccup or 5xx is absorbed
-    # automatically; other typed errors (safety, rate limit, context
-    # overflow, config) surface immediately for the caller to handle.
+    # Wire-format dispatch. All three providers take the same (system,
+    # user) prompt pair; only the request shape differs.
+    # ``_retry_on_recoverable`` wraps each call so a single provider
+    # hiccup or 5xx is absorbed automatically; other typed errors
+    # (safety, rate limit, context overflow, config) surface immediately
+    # for the caller to handle.
     if args.provider == "openrouter":
+        # mypy: api_key is non-None here -- the config-check block above
+        # raises if OPENROUTER_API_KEY is missing.
+        assert api_key is not None
         referer = os.getenv(
             "OPENROUTER_HTTP_REFERER",
             "https://github.com/Airwhale/local-gemini-code-review",
@@ -1411,7 +1705,8 @@ def main() -> None:
             ),
             label="openrouter",
         )
-    else:  # gemini
+    elif args.provider == "gemini":
+        assert api_key is not None
         output = _retry_on_recoverable(
             lambda: call_gemini(
                 system_prompt=system_prompt,
@@ -1422,6 +1717,25 @@ def main() -> None:
                 max_tokens=max_tokens,
             ),
             label="gemini",
+        )
+    else:  # ollama
+        # ollama_host and ollama_timeout are non-None here -- the
+        # config-check block above sets defaults if they weren't
+        # provided. The assertions document that for readers and
+        # narrow the type for the lambda closure.
+        assert ollama_host is not None
+        assert ollama_timeout is not None
+        output = _retry_on_recoverable(
+            lambda: call_ollama(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model=model,
+                host=ollama_host,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=ollama_timeout,
+            ),
+            label="ollama",
         )
     print(output)
 

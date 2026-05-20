@@ -60,11 +60,11 @@ The rest of this README is the general-audience documentation (humans, contribut
 
 | File | New / modified | Purpose |
 |---|---|---|
-| `review.py` | **new** | Standalone runner. Loads upstream skill + command prompts for diff review, adds fork-specific skill + command for whole-codebase review, POSTs to OpenRouter or the Gemini API. Includes a curated alias table so `--model claude` expands to the full OpenRouter slug. |
+| `review.py` | **new** | Standalone runner. Loads upstream skill + command prompts for diff review, adds fork-specific skill + command for whole-codebase review, POSTs to OpenRouter, the Gemini API, or a local Ollama server. Includes per-provider alias tables so `--model claude` expands to the full OpenRouter slug and `--model local` resolves to a recommended Ollama model. |
 | `skills/code-review-codebase/SKILL.md` | **new** | Fork-specific whole-codebase review skill. Same persona / severity rubric as the upstream `code-review-commons` skill, but Critical Constraints adapted to permit comments on any line of any file in the bundle (the upstream "comment only on `+`/`-` lines" rule forbids commenting on whole-file content). |
 | `commands/codebase-review.toml` | **new** | Fork-specific command for `--codebase` mode. Defines the bundle delimiter and per-file-findings output shape. |
 | `pyproject.toml` | **new** | `uv`-managed deps (`httpx`, `python-dotenv`). |
-| `.env.example` | **new** | Documents `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, and optional model / provider overrides. |
+| `.env.example` | **new** | Documents `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, optional model / provider overrides, and the Ollama-local config (`OLLAMA_HOST`, `OLLAMA_MODEL`, `OLLAMA_TIMEOUT`). |
 | `.gitignore` | **new** | Protects `.env` and the `uv` virtualenv from leaking. |
 | `docs/llm-code-review-runbook.md` | **new** | Operational runbook for using the tool as an LLM iteration partner. |
 | `README.md` | **modified** | This file — documents the fork's runner alongside the upstream CLI mode. |
@@ -87,7 +87,8 @@ git checkout main && git merge upstream/main   # picks up upstream prompt change
 git clone https://github.com/Airwhale/local-gemini-code-review
 cd local-gemini-code-review
 cp .env.example .env
-# edit .env: set OPENROUTER_API_KEY=... or GEMINI_API_KEY=... (or both)
+# edit .env: set OPENROUTER_API_KEY=... or GEMINI_API_KEY=... (or both),
+# or skip both keys entirely if you only want the local Ollama path.
 
 # From the runner directory, against the CWD:
 cd /path/to/local-gemini-code-review
@@ -95,6 +96,7 @@ uv run review.py --base origin/main         # iterative review of current branch
 uv run review.py --pr 6                     # review a specific PR
 uv run review.py --codebase                 # whole tracked codebase (filtered)
 uv run review.py --base origin/main --model claude   # use Claude instead of Gemini
+uv run review.py --base origin/main --provider ollama  # local, no API key
 
 # Or invoke from any project directory by pointing at the runner:
 cd /path/to/my-project
@@ -105,18 +107,20 @@ uv run --project /path/to/local-gemini-code-review /path/to/local-gemini-code-re
 
 ## Provider selection
 
-The runner supports two transport paths to the same `gemini-2.5-pro` model:
+The runner supports three transport paths — two cloud, one local:
 
 ```bash
 uv run review.py                        # default: openrouter
 uv run review.py --provider openrouter  # explicit
 uv run review.py --provider gemini      # direct Gemini API
+uv run review.py --provider ollama      # local Ollama server (no API key)
 ```
 
 | Provider | Endpoint | Required env var | Default model | Notes |
 |---|---|---|---|---|
 | `openrouter` (default) | `openrouter.ai/api/v1/chat/completions` | `OPENROUTER_API_KEY` | `google/gemini-2.5-pro` | OpenAI-compatible chat-completions wire format. One bill for many providers. |
 | `gemini` | `generativelanguage.googleapis.com/v1beta/models/...` | `GEMINI_API_KEY` | `gemini-2.5-pro` | Google AI Studio's `generateContent` endpoint. Slightly lower latency (one less hop). |
+| `ollama` | `{OLLAMA_HOST}/v1/chat/completions` (default `http://localhost:11434`) | none — local server | `qwen3-coder:30b` | Local LLM via [Ollama](https://ollama.com). OpenAI-compatible endpoint. No API key, no token costs, code never leaves the machine. CPU inference is slower than cloud (1–5 min/review typical). |
 
 **Known gotcha for the Gemini API path:** the free tier has zero per-day quota for `gemini-2.5-pro` as of the time of writing. You'll see HTTP 429 immediately. Workarounds:
 
@@ -126,9 +130,43 @@ uv run review.py --provider gemini      # direct Gemini API
 
 Set a default per-environment via `$CODE_REVIEW_PROVIDER=gemini` in your `.env` so you don't have to pass `--provider` every invocation.
 
+### When to use the Ollama (local) provider
+
+Empirically, local and cloud have **different failure modes**, not strictly better/worse:
+
+- **Cloud** (`openrouter`, `gemini`): faster, more structured output, but hallucinations can slip past at the default temperature. Observed during integration testing: `google/gemini-2.5-pro` produced a confidently-worded HIGH-severity finding that referenced a CLI flag and "help text" that did not exist in the codebase. The suggested fix would have crashed the runner. Verify each finding against actual code before accepting.
+- **Local** (`ollama`): slower (CPU-bound on consumer hardware), sparser output, but won't typically invent findings that contradict the diff. On the same diff that produced the cloud hallucination above, the local model returned a clean "no issues" — possibly missing real nits, but not making up new ones.
+
+Practical workflow: cloud first for the structured triage pass; local as a sanity check or for offline / sensitive / cost-free work. The integration testing run that prompted this section is documented in the runbook.
+
+### Setting up the Ollama provider
+
+1. Install [Ollama](https://ollama.com/download). Runs as a service on `http://localhost:11434`. On Windows, if Smart App Control / Application Control blocks the native installer, install in WSL2 instead — the runner reaches the WSL server via localhost mirroring without any extra config.
+2. Pull at least one model. The default expected by the runner is **`qwen3-coder:30b`** (30B Mixture-of-Experts coder with ~3.3B active parameters — the quality/speed sweet spot on CPU because active-params drive inference speed, not total-params):
+
+    ```bash
+    ollama pull qwen3-coder:30b
+    ```
+
+   Alternative: `qwen3-coder-next` (80B/3B MoE, higher quality, ~40 GB download).
+
+3. (Optional) Override defaults via `.env`:
+   - `OLLAMA_HOST=http://localhost:11434` — server URL. Override if Ollama is on a non-default port, another machine, or a WSL distro without localhost mirroring.
+   - `OLLAMA_MODEL=qwen3-coder:30b` — default model when `--provider ollama` is selected.
+   - `OLLAMA_TIMEOUT=1800` — HTTP timeout in seconds. Default 30 minutes accommodates CPU cold-starts (10–60 s model load) plus thorough reviews; lower it if you'd rather fail fast.
+4. Run:
+
+    ```bash
+    uv run review.py --provider ollama --base origin/main
+    ```
+
+The runner's error messages are tailored for Ollama-specific failure modes — "server unreachable" suggests `ollama serve` and `--ollama-host`; "model not pulled" gives you the exact `ollama pull <model>` command to run.
+
 ### Model aliases
 
-The `--model` flag accepts any OpenRouter slug, but a small curated alias table collapses the most common reviewers to a short name. Aliases work **only** under `--provider openrouter`; the Gemini API direct path takes bare Gemini model names. Passing an alias with `--provider gemini` errors out with a clear message.
+The `--model` flag accepts any provider-native slug, plus a curated set of short aliases scoped per provider. An alias is only valid for its declared provider; using one with the wrong `--provider` raises a typed `CONFIG` error pointing at the correct one rather than silently sending an invalid model name upstream.
+
+**OpenRouter aliases** (use with `--provider openrouter`, the default):
 
 | Alias | Resolves to | Notes |
 |---|---|---|
@@ -140,7 +178,16 @@ The `--model` flag accepts any OpenRouter slug, but a small curated alias table 
 | `gpt-mini` | `openai/gpt-5-mini` | Cheaper / faster GPT. |
 | `deepseek` | `deepseek/deepseek-chat-v3.1` | Cheap, surprisingly strong on code review. |
 
-Raw slugs still pass through unchanged, so anything OpenRouter serves — including newer models that haven't earned an alias yet — works via `--model <vendor>/<model>`.
+**Ollama aliases** (use with `--provider ollama`):
+
+| Alias | Resolves to | Notes |
+|---|---|---|
+| `local` | `qwen3-coder:30b` | Current Ollama default. 30B MoE with ~3.3B active params — the recommended quality/speed balance on CPU. |
+| `local-pro` | `qwen3-coder-next` | 80B/3B MoE. Higher quality at the cost of ~40 GB download + slightly slower active path. |
+
+**The `gemini` (direct-API) provider has no aliases** — it takes bare Gemini model names only (e.g. `gemini-2.5-pro`, `gemini-2.5-flash`). Passing an OpenRouter alias like `claude` with `--provider gemini` errors out clearly.
+
+Raw provider-native slugs still pass through unchanged, so anything OpenRouter serves or anything you have pulled into Ollama — including newer models that haven't earned an alias yet — works via `--model <slug>`.
 
 ## Modes
 
@@ -156,10 +203,10 @@ Raw slugs still pass through unchanged, so anything OpenRouter serves — includ
 
 Two more runtime knobs:
 
-- `--temperature <float>` (default `0.5`, env `CODE_REVIEW_TEMPERATURE`): sampling randomness. Higher = more findings per call, more hallucinations. Lower = tighter, fewer findings.
+- `--temperature <float>` (default `0.3`, env `CODE_REVIEW_TEMPERATURE`): sampling randomness. Higher = more findings per call, more hallucinations. Lower = tighter, fewer findings.
 - `--max-tokens <int>` (default `16000`, env `CODE_REVIEW_MAX_TOKENS`): ceiling on output. Not a target — you pay only for what's emitted. Default avoids mid-finding truncation on thorough reviews.
 
-The defaults shifted from `0.2` / `~8K` after empirical iteration: `0.2` produced 1–2 findings per round on diffs that plausibly contained more, requiring 5–7 rounds to converge. `0.5` typically produces 3–5 findings per round and converges in 3–5 rounds.
+The temperature default has been retuned twice. **0.2** (original) was too conservative: 1–2 findings per round on diffs that plausibly contained more, 5–7 rounds to converge. **0.5** surfaced more findings per round (3–5 typical) but produced a clear hallucination during cross-model integration testing — `google/gemini-2.5-pro` returned a confidently-worded HIGH-severity finding that referenced a CLI flag and "help text" that did not exist in the code; the suggested fix would have crashed the runner. **0.3** (current) is the compromise: tight enough to cut hallucination, loose enough to keep "more findings than 0.2." Override per call with `--temperature` if your project benefits from a different setting; empirical re-tuning is encouraged.
 
 ### Whole-codebase mode (`--codebase`)
 
