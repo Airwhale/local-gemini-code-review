@@ -142,7 +142,7 @@ Two runtime knobs control how much the model says and how exploratory it is:
 The temperature default has been retuned twice based on empirical observation:
 
 - **`0.2`** (original): too conservative — 1–2 findings per round on diffs that plausibly contained more, requiring 5–7 rounds to converge.
-- **`0.5`** (raised in response to the above): more findings per round (3–5 typical), but during cross-model integration testing `google/gemini-2.5-pro` produced a HIGH-severity finding that referenced a CLI flag (`--timeout`) and quoted "help text" that did not exist in the codebase. The proposed fix would have crashed the runner with `AttributeError: 'Namespace' object has no attribute 'timeout'`. Confident, well-formatted, and a hallucination.
+- **`0.5`** (raised in response to the above): Prone to hallucinations. more findings per round (3–5 typical), but during cross-model integration testing `google/gemini-2.5-pro` produced a HIGH-severity finding that referenced a CLI flag (`--timeout`) and quoted "help text" that did not exist in the codebase. The proposed fix would have crashed the runner with `AttributeError: 'Namespace' object has no attribute 'timeout'`. Confident, well-formatted, and a hallucination.
 - **`0.3`** (current): tight enough to cut the hallucination rate, loose enough to keep "more findings than 0.2." If your project shows different behavior, retune; the constant in `review.py` documents the history so the next maintainer can see the evidence.
 
 ### Whole-codebase mode (`--codebase`)
