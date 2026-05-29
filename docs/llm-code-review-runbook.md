@@ -70,18 +70,13 @@ The runner reads `.env` from its own directory — configure once, invoke from a
 
 ### Local vs cloud — pick deliberately
 
-Empirically, the two paths fail in **opposite directions**. Cloud models hallucinate at higher temperatures; local models under-report. Concrete evidence from integration testing on a 31 K-char diff:
 
-- **`google/gemini-2.5-pro` via OpenRouter at `temperature=0.5`** returned a HIGH-severity finding that referenced a CLI flag (`--timeout`) and "help text" that did **not** exist in the codebase. The suggested fix would have crashed the runner with `AttributeError`. Confident, structured, plausible — and entirely fabricated.
-- **`qwen3-coder:30b` via local Ollama on the same diff** returned a clean "no issues found." Likely missed legitimate nits (type narrowing, dead code, etc.) but did not invent any.
-
-The temperature default was lowered from `0.5` to `0.3` (current) partly in response to that hallucination. Even at `0.3`, treat every finding as a hypothesis to verify, not an instruction.
 
 **Use cloud when:** you want fast, structured triage; iterating against a small diff; converging in fewer rounds matters more than zero false positives.
 
 **Use Ollama (local) when:** you're offline; the code is sensitive enough you don't want it leaving the machine; you want a free sanity check; the cloud providers are rate-limited / down; you want a second-opinion pass after a cloud review (different blind spots catch different things).
 
-**For high-stakes PRs**, run *both* and reconcile.
+**For high-stakes PRs**, run *both* and reconcile.  You should also probably consider using other models on Openrouter:  Kimi, Sonnet, and ChatGPT are all good options and will likely all pick up different bugs.
 
 ### Setting up Ollama (when `--provider ollama` is right)
 
