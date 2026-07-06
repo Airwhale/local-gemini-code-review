@@ -384,6 +384,15 @@ OLLAMA_PS_TIMEOUT = 5.0  # /api/ps probe is local and fast; never let a
 # filled (and overflowed) it.
 OLLAMA_POST_VERIFY_MARGIN = 0.98
 
+# Fraction of the Ollama window that --chunk budgets for prompt content.
+# The ~4-chars/token estimate runs DENSER on real tokenizers for
+# code-heavy text: budgeting chunks to 100% of the window sized a chunk
+# to an estimated 19.9K tokens that actually tokenized to >=20,000 on a
+# 20K window -- the prompt filled it and post-verify (correctly)
+# discarded the output. The margin absorbs tokenizer variance and
+# leaves generation room (Ollama's output shares num_ctx).
+OLLAMA_WINDOW_FILL = 0.85
+
 # Sampling temperature for the model. History of this constant:
 #
 #   0.2  (original): too conservative -- 1-2 findings per round on diffs
@@ -763,6 +772,71 @@ def pr_diff(pr_number: int) -> str:
     return result.stdout
 
 
+def pr_changed_files(pr_number: int) -> list[Path]:
+    """List a PR's changed file paths via ``gh pr diff --name-only``."""
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "diff", str(pr_number), "--name-only"],
+            capture_output=True,
+            text=True,
+            check=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError as exc:
+        raise ConfigError(
+            "`gh` not found on PATH. Install GitHub CLI to use --pr.",
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        raise ConfigError(
+            f"`gh pr diff {pr_number} --name-only` failed (exit {exc.returncode})",
+            detail=exc.stderr.strip(),
+        ) from exc
+    return [Path(line) for line in result.stdout.splitlines() if line]
+
+
+def changed_file_paths(args: argparse.Namespace) -> list[Path]:
+    """The files touched by the active diff mode (for ``--full-files``).
+
+    Mirrors ``git_diff_local`` / ``pr_diff`` argument-for-argument so the
+    reference set always matches the diff the model reviews.
+    """
+    if args.pr:
+        return pr_changed_files(args.pr)
+    if args.staged:
+        output = _run_git(["git", "diff", "--cached", "--name-only"])
+    elif args.base:
+        output = _run_git(["git", "diff", "--name-only", args.base])
+    else:
+        output = _run_git(
+            ["git", "diff", "--name-only", "--merge-base", "origin/HEAD"]
+        )
+    return [Path(line) for line in output.splitlines() if line]
+
+
+def build_reference_section(paths: list[Path]) -> str:
+    """Bundle the full current content of changed files as review context.
+
+    Fork-owned runtime block appended after the upstream prompt. The
+    header states the content is context only and comments must still
+    reference ``+``/``-`` diff lines, preserving the upstream commons
+    skill's location rule. Reuses the codebase-mode delimiters and line
+    numbering so file boundaries and line references stay reliable.
+    """
+    if not paths:
+        return ""
+    return (
+        "\n\n<REFERENCE_FILES>\n"
+        "The following is the full current content of the files changed "
+        "by the diff, provided as context so you can judge the changes "
+        "against their surroundings. It is REFERENCE ONLY: the review "
+        "target remains the diff above, and review comments must still "
+        "reference only lines beginning with `+` or `-` in the diff.\n\n"
+        f"{bundle_codebase(paths)}\n"
+        "</REFERENCE_FILES>"
+    )
+
+
 def _glob_match(path: Path, patterns: tuple[str, ...] | list[str]) -> bool:
     """Return True if ``path`` matches any of the glob ``patterns``.
 
@@ -825,19 +899,25 @@ def gather_codebase_files(
     if excludes:
         paths = [p for p in paths if not _glob_match(p, excludes)]
 
-    # Step 4: built-in defensive excludes.
+    # Steps 4-5: built-in excludes + size cap (shared with --full-files).
+    return _filter_reviewable(paths)
+
+
+def _filter_reviewable(paths: list[Path]) -> list[Path]:
+    """Apply the built-in defensive excludes and the per-file size cap.
+
+    Shared by codebase mode and ``--full-files`` reference gathering.
+    Files missing on disk are skipped silently -- in codebase mode
+    that's a stat race; in --full-files it's the normal case for files
+    the diff *deletes*.
+    """
     paths = [p for p in paths if not _glob_match(p, BUILTIN_CODEBASE_EXCLUDES)]
 
-    # Step 5: per-file size cap.
     kept: list[Path] = []
     for p in paths:
         try:
             size = p.stat().st_size
         except OSError:
-            # File listed by ``git ls-files`` but missing on disk
-            # (typo, symlink to nowhere, race). Skip silently rather
-            # than crash; the user can re-run if a file was meant to
-            # be present.
             continue
         if size > MAX_INDIVIDUAL_FILE_BYTES:
             sys.stderr.write(
@@ -906,6 +986,86 @@ def bundle_codebase(file_paths: list[Path]) -> str:
     return "\n\n".join(parts)
 
 
+# Anchor for splitting a unified diff at file boundaries. ``git diff``
+# emits exactly one such line per file, at column 0; content lines are
+# always prefixed (+/-/space/@@ etc.), so a literal "diff --git" inside
+# a file cannot false-match at line start... except inside the body of
+# a diff-of-a-diff, which is why split losslessness (rejoined == input)
+# is property-tested rather than assumed.
+_DIFF_FILE_ANCHOR = re.compile(r"^diff --git ", re.M)
+
+
+def split_diff_by_file(diff: str) -> list[str]:
+    """Split a unified diff into per-file parts, losslessly.
+
+    ``"".join(parts) == diff`` always holds: any preamble before the
+    first ``diff --git`` line stays attached to the first part.
+    """
+    starts = [m.start() for m in _DIFF_FILE_ANCHOR.finditer(diff)]
+    if not starts:
+        return [diff] if diff else []
+    parts: list[str] = []
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(diff)
+        parts.append(diff[start:end])
+    if starts[0] > 0:
+        parts[0] = diff[: starts[0]] + parts[0]
+    return parts
+
+
+def _pack_contiguous(sizes: list[int], budget: int) -> list[list[int]]:
+    """Order-preserving next-fit packing of item indices into chunks.
+
+    Contiguous (never reorders) so codebase chunks follow ``git
+    ls-files`` order and diff chunks follow diff order -- neighboring
+    files stay together, which is the best cheap approximation of
+    keeping related code in one chunk. Callers must pre-validate that
+    no single item exceeds the budget.
+    """
+    chunks: list[list[int]] = []
+    current: list[int] = []
+    current_size = 0
+    for idx, size in enumerate(sizes):
+        if current and current_size + size > budget:
+            chunks.append(current)
+            current, current_size = [], 0
+        current.append(idx)
+        current_size += size
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def partition_codebase(files: list[Path], budget: int) -> list[list[Path]]:
+    """Partition codebase files into chunks whose bundled size fits ``budget``."""
+    sized = [(p, len(bundle_codebase([p]))) for p in files]
+    for p, size in sized:
+        if size > budget:
+            raise ContextOverflow(
+                f"Single file {p.as_posix()} bundles to {size:,} chars, "
+                f"over the {budget:,}-char chunk budget -- chunking cannot "
+                "help. Exclude it (--exclude) or raise the budget "
+                "($OLLAMA_NUM_CTX for ollama)."
+            )
+    index_chunks = _pack_contiguous([s for _, s in sized], budget)
+    return [[sized[i][0] for i in chunk] for chunk in index_chunks]
+
+
+def partition_diffs(parts: list[str], budget: int) -> list[str]:
+    """Pack per-file diff parts into chunk-sized diff strings."""
+    for part in parts:
+        if len(part) > budget:
+            first_line = part.splitlines()[0] if part else "(empty)"
+            raise ContextOverflow(
+                f"A single file's diff ({first_line!r}) is {len(part):,} "
+                f"chars, over the {budget:,}-char chunk budget -- chunking "
+                "cannot help. Use a smaller --base or exclude the file "
+                "from the change."
+            )
+    index_chunks = _pack_contiguous([len(p) for p in parts], budget)
+    return ["".join(parts[i] for i in chunk) for chunk in index_chunks]
+
+
 def _parse_retry_after(value: str) -> float | None:
     """Parse a Retry-After header to seconds-from-now.
 
@@ -921,7 +1081,11 @@ def _parse_retry_after(value: str) -> float | None:
         return float(value)
     try:
         dt = parsedate_to_datetime(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError, IndexError):
+        # The email parser raises more than ValueError on pathological
+        # inputs (OverflowError on absurd years, IndexError on some
+        # malformed structures); any parse failure must stay a
+        # RATE_LIMIT with no hint, never escape as UNKNOWN.
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -1124,6 +1288,16 @@ def call_openrouter(
             model=model,
             provider="openrouter",
         ) from exc
+    if not isinstance(data, dict):
+        # A misbehaving proxy can return a JSON array/string; without
+        # this, .get() raises AttributeError and exits UNKNOWN instead
+        # of the retryable PROVIDER_HICCUP it really is.
+        raise ProviderHiccup(
+            "OpenRouter returned non-object JSON",
+            detail=response.text[:1000],
+            model=model,
+            provider="openrouter",
+        )
 
     choices = data.get("choices") or []
     if not choices:
@@ -1248,6 +1422,13 @@ def call_gemini(
             model=model,
             provider="gemini",
         ) from exc
+    if not isinstance(data, dict):
+        raise ProviderHiccup(
+            "Gemini API returned non-object JSON",
+            detail=response.text[:1000],
+            model=model,
+            provider="gemini",
+        )
 
     # Gemini can refuse at the prompt level (before generation) by
     # returning ``promptFeedback.blockReason`` with no candidates.
@@ -1640,6 +1821,13 @@ def call_ollama(
             model=model,
             provider="ollama",
         ) from exc
+    if not isinstance(data, dict):
+        raise ProviderHiccup(
+            "Ollama returned non-object JSON",
+            detail=response.text[:1000],
+            model=model,
+            provider="ollama",
+        )
 
     # Native /api/chat shape: top-level message/done_reason plus
     # prompt_eval_count / eval_count usage fields.
@@ -1819,7 +2007,12 @@ _FENCE_RE = re.compile(r"^\s{0,3}(`{3,})(\S*)\s*$")
 # models to reference `+`/`-` lines, and some transcribe the marker).
 _LINE_TOKEN_RE = re.compile(r"\bL\s*[+-]?(\d+)", re.I)
 _BARE_LINE_RE = re.compile(r"^(\d+)\s*:")
-_SEVERITY_RE = re.compile(r"\[?\s*(CRITICAL|HIGH|MEDIUM|LOW)\s*\]?", re.I)
+# Lookarounds forbid letters on either side so severity words embedded in
+# ordinary prose ("Below", "higher", "lowercase") never match; the token
+# must stand alone (brackets optional -- some models drop them).
+_SEVERITY_RE = re.compile(
+    r"\[?\s*(?<![A-Za-z])(CRITICAL|HIGH|MEDIUM|LOW)(?![A-Za-z])\s*\]?", re.I
+)
 # Lead-in tolerates markdown emphasis: **Suggested change:** etc.
 _SUGGESTION_LEADIN_RE = re.compile(
     r"^[*_]{0,2}Suggested (?:change|fix)[*_]{0,2}:?[*_]{0,2}\s*$", re.I
@@ -1925,7 +2118,11 @@ def _parse_finding_heading(
     elif line is None:
         problems.append(f"no line number in heading {heading!r}")
 
-    severity_match = _SEVERITY_RE.search(heading)
+    # Search from the end of the line token: the template puts severity
+    # after ``L<N>:``, and scanning only the remainder keeps a stray
+    # standalone severity word later in a TITLE from being consumed when
+    # the real tag was absent.
+    severity_match = _SEVERITY_RE.search(heading, consumed_end)
     if severity_match:
         severity = severity_match.group(1).upper()
         consumed_end = max(consumed_end, severity_match.end())
@@ -2298,6 +2495,86 @@ def build_json_envelope(
     return envelope
 
 
+def build_chunked_envelope(
+    *,
+    mode: str,
+    provider: str,
+    model: str,
+    temperature: float,
+    chunk_data: list[tuple[str, ParsedReview, CallResult, str]],
+) -> dict:
+    """Assemble the ``--format json`` document for a ``--chunk`` run.
+
+    ``chunk_data`` is ``(label, parsed, result, raw)`` per chunk in
+    execution order. Findings are concatenated (chunks are disjoint
+    content, so no dedup is needed) with a ``chunk`` index added; raw
+    output embeds per-chunk only when that chunk's parse failed.
+    """
+    findings_out = []
+    per_chunk = []
+    prompt_total: int | None = None
+    completion_total: int | None = None
+    for idx, (label, parsed, result, raw) in enumerate(chunk_data, start=1):
+        for finding in parsed.findings:
+            entry = dataclasses.asdict(finding)
+            entry["fingerprint"] = finding_fingerprint(finding)
+            entry["chunk"] = idx
+            findings_out.append(entry)
+        chunk_entry = {
+            "chunk": idx,
+            "label": label,
+            "parse_ok": parsed.parse_ok,
+            "clean": parsed.clean,
+            "summary": parsed.summary,
+            "findings_count": len(parsed.findings),
+            "usage": (
+                {
+                    "prompt_tokens": result.prompt_tokens,
+                    "completion_tokens": result.completion_tokens,
+                }
+                if result.prompt_tokens is not None
+                or result.completion_tokens is not None
+                else None
+            ),
+            "truncated": result.truncated,
+        }
+        if not parsed.parse_ok:
+            chunk_entry["raw"] = raw
+        per_chunk.append(chunk_entry)
+        if result.prompt_tokens is not None:
+            prompt_total = (prompt_total or 0) + result.prompt_tokens
+        if result.completion_tokens is not None:
+            completion_total = (completion_total or 0) + result.completion_tokens
+
+    return {
+        "schema_version": 1,
+        "mode": mode,
+        "provider": provider,
+        "model": model,
+        "temperature": temperature,
+        "chunks": len(chunk_data),
+        "summary": None,
+        "clean": all(parsed.clean for _, parsed, _r, _raw in chunk_data),
+        "findings": findings_out,
+        "usage": (
+            {
+                "prompt_tokens": prompt_total,
+                "completion_tokens": completion_total,
+            }
+            if prompt_total is not None or completion_total is not None
+            else None
+        ),
+        "truncated": any(r.truncated for _, _p, r, _raw in chunk_data),
+        "parse_ok": all(parsed.parse_ok for _, parsed, _r, _raw in chunk_data),
+        "problems": [
+            f"chunk {idx}: {problem}"
+            for idx, (_label, parsed, _r, _raw) in enumerate(chunk_data, start=1)
+            for problem in parsed.problems
+        ],
+        "per_chunk": per_chunk,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Multi-model panel (--models)
 # ---------------------------------------------------------------------------
@@ -2349,6 +2626,13 @@ def panel_findings_match(a: Finding, b: Finding) -> bool:
     """
     if findings_match(a, b):
         return True
+    # Location tier: BOTH lines must be known. A line-less finding
+    # matching "any line in the same file" would let one vague finding
+    # absorb an unrelated specific one and manufacture consensus. (The
+    # baseline matcher keeps the looser rule deliberately -- there the
+    # cost of a miss is a mislabeled status, not false confidence.)
+    if a.line is None or b.line is None:
+        return False
     return a.severity == b.severity and _location_match(
         a.file, a.line, b.file, b.line
     )
@@ -2698,6 +2982,55 @@ class ReviewRequest:
     mode: str  # "diff" | "codebase"
     payload_chars: int  # diff length or bundle length (pre-prompt-wrapping)
     files: list[Path] | None = None  # codebase mode only
+    chunk_label: str | None = None  # --chunk mode: e.g. "3 file(s), 41,209 chars"
+
+
+def _chunk_budget(settings: Settings) -> tuple[int, str | None]:
+    """Per-chunk payload budget in chars, plus an optional WARN note.
+
+    Cloud providers budget against the standard bundle cap. Ollama
+    budgets against the ENFORCED window (env-set or /api/ps-detected,
+    probed once here before partitioning) minus the fixed prompt
+    overhead, so chunks don't trip the pre-flight guard. When the window
+    is unknown even after the probe, sizing assumes the smallest stock
+    tier -- safety over efficiency: a 32K machine wastes calls, but
+    never silently truncates -- with a WARN recommending $OLLAMA_NUM_CTX.
+    """
+    if settings.provider != "ollama":
+        return MAX_BUNDLE_CHARS, None
+    assert settings.ollama_host is not None
+    num_ctx, enforced, _source = _resolve_ollama_window(
+        settings.ollama_host, settings.model, settings.ollama_num_ctx_env
+    )
+    note = None
+    if not enforced:
+        note = (
+            "chunk sizing assumes the smallest stock Ollama window "
+            f"({DEFAULT_OLLAMA_NUM_CTX:,} tokens) because the actual window "
+            "is unknown; set $OLLAMA_NUM_CTX to size chunks to your real "
+            "window and cut the call count"
+        )
+    # Overhead: the prompts minus the payload (skill + command template +
+    # context wrapper + severity appendix). Measured, not estimated.
+    empty_system, empty_user = build_diff_prompts("", settings.context)
+    overhead = (
+        len(empty_system)
+        + len(empty_user)
+        + len(_min_severity_instruction(settings.min_severity))
+    )
+    budget = min(
+        MAX_BUNDLE_CHARS,
+        int(num_ctx * OLLAMA_CHARS_PER_TOKEN * OLLAMA_WINDOW_FILL) - overhead,
+    )
+    if budget <= 0:
+        raise ContextOverflow(
+            f"The review prompt overhead alone (~{overhead:,} chars) fills "
+            f"the {num_ctx:,}-token Ollama window; chunking cannot help. "
+            "Raise $OLLAMA_NUM_CTX (RAM permitting).",
+            provider="ollama",
+            model=settings.model,
+        )
+    return budget, note
 
 
 def _print_error(err: ReviewError) -> None:
@@ -2759,6 +3092,15 @@ def _resolve_settings(args: argparse.Namespace) -> Settings:
     M6 replaces this with a 4-layer ``_layered`` resolver when the
     project-config file arrives.
     """
+    # argparse ``choices`` validates only user-typed flags, not defaults
+    # sourced from the environment -- an invalid $CODE_REVIEW_PROVIDER
+    # would otherwise sail through and fall into the ollama else-branch.
+    if args.provider not in PROVIDERS:
+        raise ConfigError(
+            f"provider {args.provider!r} is not valid (check "
+            "$CODE_REVIEW_PROVIDER). Use one of: " + ", ".join(PROVIDERS) + "."
+        )
+
     # Panel model list: resolved pre-flight so alias errors exit 2
     # before any network call. Exclusive with --model (manual check,
     # same pattern as --context / --no-context).
@@ -3041,16 +3383,149 @@ def _build_request(args: argparse.Namespace, settings: Settings) -> ReviewReques
         if not diff.strip():
             sys.stderr.write("No diff found. Nothing to review.\n")
             sys.exit(0)
+        reference = ""
+        if args.full_files:
+            if args.pr:
+                sys.stderr.write(
+                    "WARN: --full-files with --pr reads file content from "
+                    "the LOCAL working tree; it matches the PR only if "
+                    "that branch is checked out.\n"
+                )
+            ref_paths = _filter_reviewable(changed_file_paths(args))
+            reference = build_reference_section(ref_paths)
+            if len(diff) + len(reference) > MAX_BUNDLE_CHARS:
+                def _safe_size(p: Path) -> tuple[Path, int] | None:
+                    try:
+                        return (p, p.stat().st_size)
+                    except OSError:
+                        return None
+                sized = sorted(
+                    (pair for p in ref_paths if (pair := _safe_size(p))),
+                    key=lambda x: x[1],
+                    reverse=True,
+                )
+                largest = "\n".join(
+                    f"  {_format_size(size):>10}  {path.as_posix()}"
+                    for path, size in sized[:10]
+                )
+                raise ContextOverflow(
+                    f"Diff ({len(diff):,} chars) plus --full-files "
+                    f"reference content ({len(reference):,} chars) exceeds "
+                    f"the {MAX_BUNDLE_CHARS:,}-char cap. Drop --full-files "
+                    "or narrow the change.",
+                    detail="Largest reference files:\n" + largest,
+                    model=settings.model,
+                    provider=settings.provider,
+                )
         system_prompt, user_prompt = build_diff_prompts(diff, settings.context)
         request = ReviewRequest(
             system_prompt=system_prompt,
-            user_prompt=user_prompt,
+            user_prompt=user_prompt + reference,
             mode="diff",
-            payload_chars=len(diff),
+            payload_chars=len(diff) + len(reference),
         )
 
     request.user_prompt += _min_severity_instruction(settings.min_severity)
     return request
+
+
+def _build_requests(args: argparse.Namespace, settings: Settings) -> list[ReviewRequest]:
+    """Build one request normally, or several when ``--chunk`` splits an
+    oversized payload.
+
+    Chunk boundaries never cross file boundaries (codebase chunks pack
+    whole files in ``git ls-files`` order; diff chunks pack whole
+    per-file diffs in diff order) -- the documented tradeoff is that the
+    model cannot see importer/importee relationships across chunks.
+    ``--chunk`` on a payload that already fits is a no-op single chunk.
+    """
+    if not args.chunk:
+        return [_build_request(args, settings)]
+
+    budget, note = _chunk_budget(settings)
+    if note is not None:
+        sys.stderr.write(f"WARN: {note}\n")
+    severity_appendix = _min_severity_instruction(settings.min_severity)
+
+    if args.codebase:
+        files = gather_codebase_files(args.include, args.exclude)
+        if not files:
+            sys.stderr.write(
+                "No files matched after --include / --exclude / built-in "
+                "filters. Nothing to review.\n"
+            )
+            sys.exit(0)
+        partitions = partition_codebase(files, budget)
+        requests = []
+        for part in partitions:
+            bundle = bundle_codebase(part)
+            system_prompt, user_prompt = build_codebase_prompts(
+                bundle, settings.context
+            )
+            requests.append(
+                ReviewRequest(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt + severity_appendix,
+                    mode="codebase",
+                    payload_chars=len(bundle),
+                    files=part,
+                    chunk_label=f"{len(part)} file(s), {len(bundle):,} chars",
+                )
+            )
+        return requests
+
+    if args.pr:
+        diff = pr_diff(args.pr)
+    else:
+        diff = git_diff_local(args.base, args.staged)
+    if not diff.strip():
+        sys.stderr.write("No diff found. Nothing to review.\n")
+        sys.exit(0)
+    chunks = partition_diffs(split_diff_by_file(diff), budget)
+    requests = []
+    for chunk in chunks:
+        system_prompt, user_prompt = build_diff_prompts(chunk, settings.context)
+        requests.append(
+            ReviewRequest(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt + severity_appendix,
+                mode="diff",
+                payload_chars=len(chunk),
+                chunk_label=f"{len(chunk):,} chars",
+            )
+        )
+    return requests
+
+
+def _validate_flag_combos(args: argparse.Namespace) -> None:
+    """Reject unsupported flag pairs in one greppable place.
+
+    Each pair is a deliberate scope decision, not an oversight; see the
+    messages (and the README) for the workarounds.
+    """
+    if args.chunk and args.models:
+        raise ConfigError(
+            "--chunk and --models are not supported together (a panel of "
+            "chunked runs multiplies calls and loses cross-chunk merge "
+            "semantics). Chunk with a single model, or panel an unchunked "
+            "payload."
+        )
+    if args.chunk and args.full_files:
+        raise ConfigError(
+            "--chunk and --full-files are not supported together yet: "
+            "reference content would have to be re-partitioned per chunk. "
+            "Pick one."
+        )
+    if args.chunk and args.baseline:
+        raise ConfigError(
+            "--baseline is not supported with --chunk yet; baseline an "
+            "unchunked run, or diff the chunked JSON rounds externally."
+        )
+    if args.full_files and args.codebase:
+        raise ConfigError(
+            "--full-files applies to diff modes only; --codebase already "
+            "sends full file content."
+        )
 
 
 def _dry_run_report(
@@ -3235,6 +3710,88 @@ def _run_panel(
     return results_by_model, failures
 
 
+def _run_chunked(
+    args: argparse.Namespace, settings: Settings, requests: list[ReviewRequest]
+) -> None:
+    """Execute a multi-chunk run sequentially, fail-fast.
+
+    Chunks are disjoint content: a failed chunk means unreviewed files
+    (no redundancy, unlike a panel member), so the first surviving typed
+    error aborts the run with that error's exit code -- exit 0 iff every
+    chunk succeeded. Markdown streams per chunk (long local runs show
+    progress); JSON buffers into one envelope.
+    """
+    n = len(requests)
+    sys.stderr.write(f"[chunk] payload split into {n} chunks\n")
+
+    if args.dry_run:
+        lines = [
+            "DRY RUN -- no model call made, no tokens spent.",
+            f"provider:          {settings.provider}",
+            f"model:             {settings.model}",
+            f"mode:              {requests[0].mode} (chunked)",
+            f"chunks:            {n}",
+        ]
+        for idx, request in enumerate(requests, start=1):
+            lines.append(f"  chunk {idx}/{n}: {request.chunk_label}")
+        print("\n".join(lines))
+        return
+
+    chunk_data: list[tuple[str, ParsedReview, CallResult, str]] = []
+    streamed_parts: list[str] = []
+    for idx, request in enumerate(requests, start=1):
+        sys.stderr.write(
+            f"[chunk {idx}/{n}] reviewing {request.chunk_label} with "
+            f"`{settings.model}` via {settings.provider}...\n"
+        )
+        try:
+            result = _execute_call(
+                settings, request.system_prompt, request.user_prompt, settings.model
+            )
+        except ReviewError:
+            done = (
+                f"chunks 1-{idx - 1} completed" if idx > 1 else "no chunks completed"
+            )
+            sys.stderr.write(
+                f"WARN: [chunk] {done}; chunk {idx} failed -- review is "
+                "incomplete.\n"
+            )
+            raise
+        usage_line = _format_usage_line(result, settings.provider, settings.model)
+        if usage_line is not None:
+            sys.stderr.write(f"[chunk {idx}/{n}] {usage_line}\n")
+        label = request.chunk_label or f"chunk {idx}"
+        parsed = parse_review_markdown_safe(result.content)
+        chunk_data.append((label, parsed, result, result.content))
+        if settings.format == "markdown":
+            part = (
+                f"\n---\n# Review chunk {idx}/{n} ({label})\n\n"
+                f"{result.content.rstrip()}\n"
+                if idx > 1
+                else f"# Review chunk {idx}/{n} ({label})\n\n{result.content.rstrip()}\n"
+            )
+            print(part, flush=True)
+            streamed_parts.append(part)
+
+    if settings.format == "json":
+        stdout_text = json.dumps(
+            build_chunked_envelope(
+                mode=requests[0].mode,
+                provider=settings.provider,
+                model=settings.model,
+                temperature=settings.temperature,
+                chunk_data=chunk_data,
+            ),
+            indent=2,
+            ensure_ascii=False,
+        )
+        print(stdout_text)
+    else:
+        stdout_text = "".join(streamed_parts)
+    if settings.output is not None:
+        _write_output_file(stdout_text, settings.output)
+
+
 def main() -> None:
     _ensure_utf8_stdout()
     # Load env from this script's directory so `.env` is configured once at
@@ -3324,6 +3881,30 @@ def main() -> None:
             "claude-opus/gpt/gpt-mini/deepseek (openrouter); "
             "local/local-pro (ollama). ``gemini-2.5-flash`` / "
             "``flash`` is ~3x faster with some quality loss."
+        ),
+    )
+    parser.add_argument(
+        "--full-files",
+        action="store_true",
+        dest="full_files",
+        help=(
+            "Diff modes only: also send the full current content of "
+            "every changed file as reference context, so the model can "
+            "judge changes against code outside the +/-5-line hunk "
+            "windows. The review target stays the diff. Budgeted "
+            "against the same 700K-char cap as --codebase."
+        ),
+    )
+    parser.add_argument(
+        "--chunk",
+        action="store_true",
+        help=(
+            "Opt-in: when the payload exceeds the budget (700K chars, "
+            "or the Ollama context window), split it at file boundaries "
+            "into sequential chunk reviews instead of erroring. "
+            "Tradeoff: the model cannot see cross-file relationships "
+            "across chunk boundaries. Exit 0 only if every chunk "
+            "succeeds."
         ),
     )
     parser.add_argument(
@@ -3490,6 +4071,7 @@ def main() -> None:
         raise ConfigError(
             "--no-context and --context are mutually exclusive. Pick one."
         )
+    _validate_flag_combos(args)
 
     settings = _resolve_settings(args)
     # Validate the baseline BEFORE the model call so a bad file never
@@ -3497,25 +4079,53 @@ def main() -> None:
     baseline_doc = (
         load_baseline(settings.baseline) if settings.baseline is not None else None
     )
-    request = _build_request(args, settings)
+    requests = _build_requests(args, settings)
+
+    if len(requests) > 1:
+        _run_chunked(args, settings, requests)
+        return
+    request = requests[0]
 
     if args.dry_run:
         ollama_window: str | None = None
         if settings.provider == "ollama":
             assert settings.ollama_host is not None
-            num_ctx, enforced, source = _resolve_ollama_window(
-                settings.ollama_host, settings.model, settings.ollama_num_ctx_env
-            )
-            # Run the same guard a live run would, so --dry-run exits 12
-            # exactly when a live run would (warn-only when the window
-            # is unknown).
-            _ollama_prompt_guard(
-                len(request.system_prompt) + len(request.user_prompt),
-                num_ctx,
-                model=settings.model,
-                enforced=enforced,
-            )
-            ollama_window = f"{num_ctx:,} tokens ({source})"
+            prompt_chars = len(request.system_prompt) + len(request.user_prompt)
+            if settings.models is not None:
+                # Panel parity: live panels treat a guard trip as a
+                # per-model failure (WARN + skip), never exit 12, so the
+                # dry-run annotates each model's window instead of
+                # raising. Every model gets its own probe.
+                notes = []
+                for panel_model in settings.models:
+                    num_ctx, enforced, source = _resolve_ollama_window(
+                        settings.ollama_host, panel_model,
+                        settings.ollama_num_ctx_env,
+                    )
+                    would_fail = (
+                        enforced
+                        and prompt_chars // OLLAMA_CHARS_PER_TOKEN >= num_ctx
+                    )
+                    suffix = " -- WOULD FAIL pre-flight" if would_fail else ""
+                    notes.append(
+                        f"{panel_model}: {num_ctx:,} tokens ({source}){suffix}"
+                    )
+                ollama_window = "; ".join(notes)
+            else:
+                num_ctx, enforced, source = _resolve_ollama_window(
+                    settings.ollama_host, settings.model,
+                    settings.ollama_num_ctx_env,
+                )
+                # Run the same guard a live run would, so --dry-run exits
+                # 12 exactly when a live run would (warn-only when the
+                # window is unknown).
+                _ollama_prompt_guard(
+                    prompt_chars,
+                    num_ctx,
+                    model=settings.model,
+                    enforced=enforced,
+                )
+                ollama_window = f"{num_ctx:,} tokens ({source})"
         print(_dry_run_report(settings, request, ollama_window=ollama_window))
         return
 

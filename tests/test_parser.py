@@ -140,6 +140,28 @@ class TestHeadingTolerance:
         assert parsed.findings[0].severity == "UNKNOWN"
         assert parsed.parse_ok  # line present -> still readable
 
+    def test_severity_words_inside_prose_do_not_match(self):
+        # codex finding: "Below" contains "low" and used to parse as
+        # severity LOW with a corrupted title.
+        text = "## File: a.py\n### L5: Below threshold is ignored.\nBody.\n"
+        finding = parse_review_markdown(text).findings[0]
+        assert finding.severity == "UNKNOWN"
+        assert finding.title == "Below threshold is ignored."
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "Higher-order function misuse.",
+            "Use lowercase constants throughout.",
+            "The following code is problematic.",  # contains 'low' twice
+        ],
+    )
+    def test_embedded_severity_words_leave_title_intact(self, title: str):
+        text = f"## File: a.py\n### L5: [MEDIUM] {title}\nBody.\n"
+        finding = parse_review_markdown(text).findings[0]
+        assert finding.severity == "MEDIUM"
+        assert finding.title == title
+
     def test_orphan_finding_before_any_file(self):
         text = "# Change summary: x.\n### L5: [LOW] Orphaned.\nBody.\n"
         parsed = parse_review_markdown(text)
