@@ -67,6 +67,7 @@ import tomllib
 import traceback
 from pathlib import Path
 from typing import Callable, TypeVar
+from urllib.parse import urlparse
 
 import httpx
 from dotenv import load_dotenv
@@ -1188,6 +1189,15 @@ def _normalize_ollama_host(host: str) -> str:
         )
     if "://" not in host:
         host = f"http://{host}"
+    # A scheme without a hostname (``http://``, ``http://:11434``) would
+    # otherwise surface later as an untyped URL error from httpx instead
+    # of a CONFIG error the caller can act on.
+    if urlparse(host).hostname is None:
+        raise ConfigError(
+            f"Ollama host {host!r} has no hostname. Set --ollama-host or "
+            "$OLLAMA_HOST to a URL like http://localhost:11434 (or "
+            "host:port -- the scheme is optional)."
+        )
     return host.rstrip("/")
 
 

@@ -27,7 +27,7 @@ Optional environment variables:
 - `OPENROUTER_MODEL` / `GEMINI_MODEL` / `OLLAMA_MODEL` — override the per-provider default model
 - `OLLAMA_HOST` — Ollama server URL (default `http://localhost:11434`). Override for non-default ports, remote Ollama, or WSL distros without localhost mirroring.
 - `OLLAMA_TIMEOUT` — HTTP timeout for Ollama calls in seconds (default `1800`, i.e. 30 minutes — accommodates CPU cold-starts and thorough reviews).
-- `OLLAMA_NUM_CTX` — the context window (tokens) the Ollama server loads models with. Usually unset: the runner reads the real window from a loaded model via `/api/ps` and hard-enforces it (`CONTEXT_OVERFLOW`, exit 12, because Ollama silently truncates oversized prompts instead of erroring). When the window can't be determined it assumes the smallest stock VRAM tier (4096) and only warns. Set explicitly to make the guard hard everywhere.
+- `OLLAMA_NUM_CTX` — the context window (tokens) the Ollama server loads models with. Usually unset: the runner reads the real window from a loaded model via `/api/ps` and hard-enforces it (`CONTEXT_OVERFLOW`, exit 12, because Ollama silently truncates oversized prompts instead of erroring). When the window can't be determined it assumes the smallest stock VRAM tier (4096) and only warns. Set explicitly to override detection and make the guard hard even before the model is first loaded.
 
 ---
 

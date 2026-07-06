@@ -156,6 +156,17 @@ class TestNormalizeOllamaHost:
             _normalize_ollama_host(host)
         assert "OLLAMA_HOST" in str(exc_info.value)
 
+    @pytest.mark.parametrize("host", ["http://", "http://:11434"])
+    def test_hostname_less_url_raises_config_error(self, host: str):
+        # A scheme with no hostname would fail later as an untyped httpx
+        # URL error instead of a CONFIG error.
+        with pytest.raises(ConfigError) as exc_info:
+            _normalize_ollama_host(host)
+        assert "hostname" in str(exc_info.value)
+
+    def test_ipv6_host_accepted(self):
+        assert _normalize_ollama_host("http://[::1]:11434") == "http://[::1]:11434"
+
 
 # ---------------------------------------------------------------------------
 # _ollama_prompt_guard
@@ -186,6 +197,7 @@ class TestOllamaPromptGuard:
         err = capsys.readouterr().err
         assert err.startswith("WARN:")
         assert "OLLAMA_NUM_CTX" in err
+        assert "model `m`" in err
 
     def test_unenforced_small_prompt_stays_silent(
         self, capsys: pytest.CaptureFixture
