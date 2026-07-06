@@ -26,11 +26,19 @@ from code_review.cli import (
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch: pytest.MonkeyPatch):
     for var in (
-        "CODE_REVIEW_PROMPT_DIR", "CODE_REVIEW_ENV", "CODE_REVIEW_PROVIDER",
-        "CODE_REVIEW_TEMPERATURE", "CODE_REVIEW_MAX_TOKENS",
-        "CODE_REVIEW_RETRIES", "CODE_REVIEW_MIN_SEVERITY",
-        "CODE_REVIEW_FORMAT", "CODE_REVIEW_CONTEXT",
-        "OPENROUTER_MODEL", "OLLAMA_NUM_CTX", "OLLAMA_TIMEOUT", "OLLAMA_HOST",
+        "CODE_REVIEW_PROMPT_DIR",
+        "CODE_REVIEW_ENV",
+        "CODE_REVIEW_PROVIDER",
+        "CODE_REVIEW_TEMPERATURE",
+        "CODE_REVIEW_MAX_TOKENS",
+        "CODE_REVIEW_RETRIES",
+        "CODE_REVIEW_MIN_SEVERITY",
+        "CODE_REVIEW_FORMAT",
+        "CODE_REVIEW_CONTEXT",
+        "OPENROUTER_MODEL",
+        "OLLAMA_NUM_CTX",
+        "OLLAMA_TIMEOUT",
+        "OLLAMA_HOST",
     ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
@@ -94,7 +102,9 @@ class TestLoadEnvFiles:
 
 class TestLoadProjectConfig:
     def test_found_in_parent_directory(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture,
     ):
         (tmp_path / ".code-review.toml").write_text(
@@ -127,7 +137,9 @@ class TestLoadProjectConfig:
         assert _load_project_config() == {}
 
     def test_unknown_keys_dropped_with_warn(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture,
     ):
         (tmp_path / ".git").mkdir()
@@ -148,16 +160,12 @@ class TestLoadProjectConfig:
         with pytest.raises(ConfigError):
             _load_project_config()
 
-    def test_bom_tolerated(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_bom_tolerated(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         # Windows editors (Notepad, PowerShell Set-Content) write a BOM;
         # tomllib rejects it unless we read with utf-8-sig. Found live:
         # the installed-tool smoke test failed on exactly this.
         (tmp_path / ".git").mkdir()
-        (tmp_path / ".code-review.toml").write_bytes(
-            b'\xef\xbb\xbfmodel = "flash"\n'
-        )
+        (tmp_path / ".code-review.toml").write_bytes(b'\xef\xbb\xbfmodel = "flash"\n')
         monkeypatch.chdir(tmp_path)
         assert _load_project_config() == {"model": "flash"}
 
@@ -185,12 +193,26 @@ class TestLayered:
 
 def _args(**overrides) -> argparse.Namespace:
     base = dict(
-        base=None, pr=None, staged=False, codebase=False,
-        include=[], exclude=[],
-        provider=None, model=None, models=None,
-        ollama_host=None, temperature=None, max_tokens=None,
-        retries=None, min_severity=None, context=None, no_context=False,
-        output=None, format=None, baseline=None, dry_run=False,
+        base=None,
+        pr=None,
+        staged=False,
+        codebase=False,
+        include=[],
+        exclude=[],
+        provider=None,
+        model=None,
+        models=None,
+        ollama_host=None,
+        temperature=None,
+        max_tokens=None,
+        retries=None,
+        min_severity=None,
+        context=None,
+        no_context=False,
+        output=None,
+        format=None,
+        baseline=None,
+        dry_run=False,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -215,9 +237,7 @@ class TestSettingsPrecedence:
         assert settings.model == "google/gemini-2.5-flash"  # alias resolved
 
     def test_cli_beats_config(self):
-        settings = _resolve_settings(
-            _args(temperature=0.1), {"temperature": 0.9}
-        )
+        settings = _resolve_settings(_args(temperature=0.1), {"temperature": 0.9})
         assert settings.temperature == 0.1
 
     def test_env_beats_config(self, monkeypatch: pytest.MonkeyPatch):

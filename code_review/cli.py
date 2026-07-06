@@ -338,8 +338,8 @@ GEMINI_URL_TEMPLATE = (
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 OLLAMA_CHAT_PATH = "/api/chat"
 HTTP_TIMEOUT = 300.0  # Gemini 2.5 Pro on a ~5K-line diff lands ~30-60s; pad
-                     # generously for very large diffs and whole-codebase
-                     # bundles.
+# generously for very large diffs and whole-codebase
+# bundles.
 # Local CPU inference on a 30B MoE coder model takes ~10-25 tok/sec on
 # modern hardware, so a thorough review (1500-3000 output tokens) can run
 # 1-5 minutes; cold-start model load adds another 10-60s on the first
@@ -386,7 +386,7 @@ DEFAULT_OLLAMA_TIMEOUT = 1800.0  # 30 minutes
 DEFAULT_OLLAMA_NUM_CTX = 4096
 OLLAMA_CHARS_PER_TOKEN = 4
 OLLAMA_PS_TIMEOUT = 5.0  # /api/ps probe is local and fast; never let a
-                         # hung probe delay the actual review call long.
+# hung probe delay the actual review call long.
 # Post-call truncation check: prompt_eval_count at or above this
 # fraction of the effective window means the prompt almost certainly
 # filled (and overflowed) it.
@@ -559,10 +559,25 @@ BUILTIN_CODEBASE_EXCLUDES: tuple[str, ...] = (
     "*/dist/*",
     "*/build/*",
     # Binary / asset extensions: skip outright (model can't review).
-    "*.png", "*.jpg", "*.jpeg", "*.gif", "*.svg", "*.ico", "*.webp",
-    "*.woff", "*.woff2", "*.ttf", "*.eot",
-    "*.pdf", "*.zip", "*.tar", "*.gz",
-    "*.mp3", "*.mp4", "*.mov", "*.avi",
+    "*.png",
+    "*.jpg",
+    "*.jpeg",
+    "*.gif",
+    "*.svg",
+    "*.ico",
+    "*.webp",
+    "*.woff",
+    "*.woff2",
+    "*.ttf",
+    "*.eot",
+    "*.pdf",
+    "*.zip",
+    "*.tar",
+    "*.gz",
+    "*.mp3",
+    "*.mp4",
+    "*.mov",
+    "*.avi",
 )
 
 # Per-file delimiter for whole-codebase bundles. The shape is chosen so
@@ -588,8 +603,7 @@ def _prompt_root() -> Traversable:
         root = Path(override)
         if not (root / "skills").is_dir():
             raise ConfigError(
-                f"$CODE_REVIEW_PROMPT_DIR={override!r} has no skills/ "
-                "directory."
+                f"$CODE_REVIEW_PROMPT_DIR={override!r} has no skills/ directory."
             )
         return root
     package = resources.files("code_review")
@@ -616,16 +630,14 @@ def load_skill(name: str = "code-review-commons") -> str:
     whole-file input.
     """
     return (
-        _prompt_root()
-        .joinpath("skills", name, "SKILL.md")
-        .read_text(encoding="utf-8")
+        _prompt_root().joinpath("skills", name, "SKILL.md").read_text(encoding="utf-8")
     )
 
 
 def load_command_prompt(name: str) -> str:
     """Load `commands/<name>.toml` and return the `prompt` field verbatim."""
-    text = _prompt_root().joinpath("commands", f"{name}.toml").read_text(
-        encoding="utf-8"
+    text = (
+        _prompt_root().joinpath("commands", f"{name}.toml").read_text(encoding="utf-8")
     )
     return tomllib.loads(text)["prompt"]
 
@@ -664,8 +676,7 @@ def _load_env_files() -> None:
         path = Path(explicit)
         if not path.is_file():
             raise ConfigError(
-                f"$CODE_REVIEW_ENV={explicit!r} does not exist or is not "
-                "a file."
+                f"$CODE_REVIEW_ENV={explicit!r} does not exist or is not a file."
             )
         load_dotenv(path, override=False)
     load_dotenv(_user_config_dir() / ".env", override=False)
@@ -895,9 +906,7 @@ def changed_file_paths(args: argparse.Namespace) -> list[Path]:
     elif args.base:
         output = _run_git(["git", "diff", "--name-only", args.base])
     else:
-        output = _run_git(
-            ["git", "diff", "--name-only", "--merge-base", "origin/HEAD"]
-        )
+        output = _run_git(["git", "diff", "--name-only", "--merge-base", "origin/HEAD"])
     return [Path(line) for line in output.splitlines() if line]
 
 
@@ -951,14 +960,11 @@ def _glob_match(path: Path, patterns: tuple[str, ...] | list[str]) -> bool:
     posix = path.as_posix()
     name = path.name
     return any(
-        fnmatch.fnmatch(posix, pat) or fnmatch.fnmatch(name, pat)
-        for pat in patterns
+        fnmatch.fnmatch(posix, pat) or fnmatch.fnmatch(name, pat) for pat in patterns
     )
 
 
-def gather_codebase_files(
-    includes: list[str], excludes: list[str]
-) -> list[Path]:
+def gather_codebase_files(includes: list[str], excludes: list[str]) -> list[Path]:
     """Return the list of files to bundle for whole-codebase review.
 
     Pipeline (in order):
@@ -1044,8 +1050,7 @@ def _number_lines(content: str) -> str:
         return content
     width = max(6, len(str(len(lines))))
     numbered = "\n".join(
-        f"{index:>{width}d}: {line}"
-        for index, line in enumerate(lines, start=1)
+        f"{index:>{width}d}: {line}" for index, line in enumerate(lines, start=1)
     )
     return numbered + "\n" if had_trailing_newline else numbered
 
@@ -1243,7 +1248,9 @@ def _classify_http_error(
         "input too large",
         "payload size",
     )
-    if status == 413 or any(phrase in body_lower for phrase in CONTEXT_OVERFLOW_PHRASES):
+    if status == 413 or any(
+        phrase in body_lower for phrase in CONTEXT_OVERFLOW_PHRASES
+    ):
         return ContextOverflow(
             f"{provider} returned HTTP {status} with context-length indication",
             detail=body[:1000],
@@ -1989,7 +1996,7 @@ def _call_with_retries(call: Callable[[], T], *, label: str, retries: int = 0) -
             transient_used += 1
             if transient_used > transient_budget:
                 raise
-            delay = min(2.0 ** transient_used, 60.0)
+            delay = min(2.0**transient_used, 60.0)
             sys.stderr.write(
                 f"[retry] {exc.category} on attempt {transient_used} "
                 f"({label}); retrying in {delay:.0f}s...\n"
@@ -2000,9 +2007,7 @@ def _call_with_retries(call: Callable[[], T], *, label: str, retries: int = 0) -
             if ratelimit_used > ratelimit_budget:
                 raise
             delay = (
-                exc.retry_after_seconds
-                if exc.retry_after_seconds is not None
-                else 60.0
+                exc.retry_after_seconds if exc.retry_after_seconds is not None else 60.0
             )
             if delay > MAX_RETRY_SLEEP:
                 sys.stderr.write(
@@ -2052,9 +2057,7 @@ def _resolve_model_name(name: str, provider: str) -> str:
     return name
 
 
-def _resolve_model(
-    args: argparse.Namespace, project_config: dict | None = None
-) -> str:
+def _resolve_model(args: argparse.Namespace, project_config: dict | None = None) -> str:
     """Resolve the single-model slug: CLI flag > per-provider env var >
     project config ``model`` > provider default (see
     ``_resolve_model_name`` for alias rules -- aliases work in every
@@ -2090,9 +2093,7 @@ def _resolve_model(
 # never destroy a paid-for review: the wrapper degrades to
 # ``parse_ok=False`` with the raw markdown embedded in the envelope.
 
-_SUMMARY_RE = re.compile(
-    r"^#\s+(?:Change|Codebase review)\s+summary:\s*(.*)$", re.I
-)
+_SUMMARY_RE = re.compile(r"^#\s+(?:Change|Codebase review)\s+summary:\s*(.*)$", re.I)
 _SUMMARY_FALLBACK_RE = re.compile(r"^#\s+.*?summary\s*:?\s*(.*)$", re.I)
 _FILE_RE = re.compile(r"^##\s+File:\s*(.+?)\s*$", re.I)
 _FINDING_RE = re.compile(r"^###\s+(.*)$")
@@ -2346,7 +2347,11 @@ def parse_review_markdown(text: str) -> ParsedReview:
     for raw_line in text.splitlines():
         if in_fence:
             closing = _FENCE_RE.match(raw_line)
-            if closing and len(closing.group(1)) >= fence_ticks and not closing.group(2):
+            if (
+                closing
+                and len(closing.group(1)) >= fence_ticks
+                and not closing.group(2)
+            ):
                 in_fence = False
             if open_heading is not None:
                 body_lines.append(raw_line)
@@ -2448,9 +2453,7 @@ def load_baseline(path: str) -> dict:
     except OSError as exc:
         raise ConfigError(f"Cannot read --baseline file {path!r}: {exc}") from exc
     except ValueError as exc:
-        raise ConfigError(
-            f"--baseline file {path!r} is not valid JSON: {exc}"
-        ) from exc
+        raise ConfigError(f"--baseline file {path!r} is not valid JSON: {exc}") from exc
     if not isinstance(doc, dict) or doc.get("schema_version") != 1:
         raise ConfigError(
             f"--baseline file {path!r} is not a schema_version=1 review "
@@ -2579,8 +2582,7 @@ def build_json_envelope(
                 "prompt_tokens": result.prompt_tokens,
                 "completion_tokens": result.completion_tokens,
             }
-            if result.prompt_tokens is not None
-            or result.completion_tokens is not None
+            if result.prompt_tokens is not None or result.completion_tokens is not None
             else None
         ),
         "truncated": result.truncated,
@@ -2732,9 +2734,7 @@ def panel_findings_match(a: Finding, b: Finding) -> bool:
     # cost of a miss is a mislabeled status, not false confidence.)
     if a.line is None or b.line is None:
         return False
-    return a.severity == b.severity and _location_match(
-        a.file, a.line, b.file, b.line
-    )
+    return a.severity == b.severity and _location_match(a.file, a.line, b.file, b.line)
 
 
 def merge_panel_findings(
@@ -2784,6 +2784,7 @@ def _panel_exit_error(failures: list[tuple[str, ReviewError]]) -> ReviewError:
     Fixed category precedence (see ``_CATEGORY_PRECEDENCE``); ties break
     by CLI model order because ``min`` is stable.
     """
+
     def rank(item: tuple[str, ReviewError]) -> int:
         category = item[1].category
         return (
@@ -2808,14 +2809,19 @@ def render_panel_markdown(
     line), then every model's raw output verbatim in an appendix --
     nothing the models said is lost to the merge.
     """
-    lines: list[str] = [f"# Panel review ({len(parsed_by_model)}/{n_models} models)", ""]
+    lines: list[str] = [
+        f"# Panel review ({len(parsed_by_model)}/{n_models} models)",
+        "",
+    ]
 
     lines.append("Per-model results:")
     for model, parsed in parsed_by_model.items():
         if parsed.clean:
             note = "clean -- no issues found"
         elif parsed.parse_ok:
-            note = f"{len(parsed.findings)} finding(s): {parsed.summary or '(no summary)'}"
+            note = (
+                f"{len(parsed.findings)} finding(s): {parsed.summary or '(no summary)'}"
+            )
         else:
             note = "output could not be parsed (see appendix)"
         lines.append(f"- `{model}`: {note}")
@@ -2972,7 +2978,7 @@ def _min_severity_instruction(level: str) -> str:
     """
     if level == "LOW":
         return ""
-    kept = SEVERITY_LEVELS[SEVERITY_LEVELS.index(level):]
+    kept = SEVERITY_LEVELS[SEVERITY_LEVELS.index(level) :]
     return (
         "\n\n<SEVERITY_FILTER>\n"
         f"Report only findings of severity {level} or higher "
@@ -3013,9 +3019,7 @@ def _write_output_file(text: str, path: str) -> None:
         with open(path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
     except OSError as exc:
-        raise ConfigError(
-            f"Cannot write --output file {path!r}: {exc}"
-        ) from exc
+        raise ConfigError(f"Cannot write --output file {path!r}: {exc}") from exc
 
 
 def _resolve_ollama_window(
@@ -3047,11 +3051,24 @@ def _resolve_ollama_window(
 # installation), so different projects can pin different models,
 # excludes, or context strings.
 _PROJECT_CONFIG_NAME = ".code-review.toml"
-_PROJECT_CONFIG_KEYS = frozenset({
-    "provider", "model", "models", "temperature", "max_tokens", "retries",
-    "min_severity", "format", "context", "ollama_host", "ollama_num_ctx",
-    "ollama_timeout", "include", "exclude",
-})
+_PROJECT_CONFIG_KEYS = frozenset(
+    {
+        "provider",
+        "model",
+        "models",
+        "temperature",
+        "max_tokens",
+        "retries",
+        "min_severity",
+        "format",
+        "context",
+        "ollama_host",
+        "ollama_num_ctx",
+        "ollama_timeout",
+        "include",
+        "exclude",
+    }
+)
 
 
 def _load_project_config() -> dict:
@@ -3078,22 +3095,16 @@ def _load_project_config() -> dict:
                 # utf-8-sig: Windows editors (Notepad, PowerShell
                 # Set-Content) write a BOM, which tomllib rejects;
                 # -sig strips it and is a no-op otherwise.
-                config = tomllib.loads(
-                    candidate.read_text(encoding="utf-8-sig")
-                )
+                config = tomllib.loads(candidate.read_text(encoding="utf-8-sig"))
             except (OSError, tomllib.TOMLDecodeError) as exc:
-                raise ConfigError(
-                    f"Cannot parse {candidate}: {exc}"
-                ) from exc
+                raise ConfigError(f"Cannot parse {candidate}: {exc}") from exc
             unknown = sorted(set(config) - _PROJECT_CONFIG_KEYS)
             if unknown:
                 sys.stderr.write(
                     f"WARN: {candidate} has unrecognized keys (ignored): "
                     f"{', '.join(unknown)}\n"
                 )
-                config = {
-                    k: v for k, v in config.items() if k in _PROJECT_CONFIG_KEYS
-                }
+                config = {k: v for k, v in config.items() if k in _PROJECT_CONFIG_KEYS}
             sys.stderr.write(f"[config] loaded {candidate}\n")
             return config
         if (directory / ".git").exists() or directory.parent == directory:
@@ -3324,8 +3335,7 @@ def _resolve_settings(
             isinstance(m, str) for m in config_models
         ):
             raise ConfigError(
-                f"{_PROJECT_CONFIG_NAME} key 'models' must be a list of "
-                "strings."
+                f"{_PROJECT_CONFIG_NAME} key 'models' must be a list of strings."
             )
         names = [n.strip() for n in config_models if n.strip()]
     if names is not None:
@@ -3367,8 +3377,7 @@ def _resolve_settings(
         )
     except (TypeError, ValueError) as exc:
         raise ConfigError(
-            f"temperature {temp_raw!r} (from {temp_source}) is not a valid "
-            "float."
+            f"temperature {temp_raw!r} (from {temp_source}) is not a valid float."
         ) from exc
     # Validate range here rather than letting the provider 4xx -- catches
     # the misconfig as a typed CONFIG error (exit 2) the LLM caller can
@@ -3389,8 +3398,7 @@ def _resolve_settings(
         max_tokens = int(max_raw) if max_raw is not None else DEFAULT_MAX_TOKENS  # type: ignore[arg-type]
     except (TypeError, ValueError) as exc:
         raise ConfigError(
-            f"max_tokens {max_raw!r} (from {max_source}) is not a valid "
-            "integer."
+            f"max_tokens {max_raw!r} (from {max_source}) is not a valid integer."
         ) from exc
     if max_tokens <= 0:
         raise ConfigError(
@@ -3405,21 +3413,16 @@ def _resolve_settings(
         retries = int(retries_raw) if retries_raw is not None else 0  # type: ignore[arg-type]
     except (TypeError, ValueError) as exc:
         raise ConfigError(
-            f"retries {retries_raw!r} (from {retries_source}) is not a "
-            "valid integer."
+            f"retries {retries_raw!r} (from {retries_source}) is not a valid integer."
         ) from exc
     if retries < 0:
-        raise ConfigError(
-            f"retries={retries} (from {retries_source}) must be >= 0."
-        )
+        raise ConfigError(f"retries={retries} (from {retries_source}) must be >= 0.")
 
     # Severity floor.
     severity_raw, severity_source = _layered(
         args.min_severity, "CODE_REVIEW_MIN_SEVERITY", "min_severity", config
     )
-    min_severity = (
-        str(severity_raw).upper() if severity_raw is not None else "LOW"
-    )
+    min_severity = str(severity_raw).upper() if severity_raw is not None else "LOW"
     if min_severity not in SEVERITY_LEVELS:
         raise ConfigError(
             f"min_severity {severity_raw!r} (from {severity_source}) is "
@@ -3448,14 +3451,10 @@ def _resolve_settings(
         context = args.context
     else:
         context = (
-            os.getenv("CODE_REVIEW_CONTEXT")
-            or config.get("context")
-            or DEFAULT_CONTEXT
+            os.getenv("CODE_REVIEW_CONTEXT") or config.get("context") or DEFAULT_CONTEXT
         )
         if not isinstance(context, str):
-            raise ConfigError(
-                f"{_PROJECT_CONFIG_NAME} key 'context' must be a string."
-            )
+            raise ConfigError(f"{_PROJECT_CONFIG_NAME} key 'context' must be a string.")
 
     api_key: str | None = None
     referer: str | None = None
@@ -3500,8 +3499,7 @@ def _resolve_settings(
         )
         if host_raw is not None and not isinstance(host_raw, str):
             raise ConfigError(
-                f"ollama_host {host_raw!r} (from {host_source}) must be a "
-                "string."
+                f"ollama_host {host_raw!r} (from {host_source}) must be a string."
             )
         ollama_host = _normalize_ollama_host(host_raw or DEFAULT_OLLAMA_HOST)
         num_ctx_raw, num_ctx_source = _layered(
@@ -3598,6 +3596,7 @@ def _build_request(args: argparse.Namespace, settings: Settings) -> ReviewReques
                     return (p, p.stat().st_size)
                 except OSError:
                     return None
+
             sized_pairs = [pair for p in files if (pair := _safe_stat(p))]
             sized = sorted(sized_pairs, key=lambda x: x[1], reverse=True)
             largest = "\n".join(
@@ -3623,8 +3622,7 @@ def _build_request(args: argparse.Namespace, settings: Settings) -> ReviewReques
     else:
         if args.include or args.exclude:
             sys.stderr.write(
-                "WARN: --include / --exclude are ignored outside "
-                "--codebase mode.\n"
+                "WARN: --include / --exclude are ignored outside --codebase mode.\n"
             )
         diff = _read_diff_source(args)
         if not diff.strip():
@@ -3641,11 +3639,13 @@ def _build_request(args: argparse.Namespace, settings: Settings) -> ReviewReques
             ref_paths = _filter_reviewable(changed_file_paths(args))
             reference = build_reference_section(ref_paths)
             if len(diff) + len(reference) > MAX_BUNDLE_CHARS:
+
                 def _safe_size(p: Path) -> tuple[Path, int] | None:
                     try:
                         return (p, p.stat().st_size)
                     except OSError:
                         return None
+
                 sized = sorted(
                     (pair for p in ref_paths if (pair := _safe_size(p))),
                     key=lambda x: x[1],
@@ -3676,7 +3676,9 @@ def _build_request(args: argparse.Namespace, settings: Settings) -> ReviewReques
     return request
 
 
-def _build_requests(args: argparse.Namespace, settings: Settings) -> list[ReviewRequest]:
+def _build_requests(
+    args: argparse.Namespace, settings: Settings
+) -> list[ReviewRequest]:
     """Build one request normally, or several when ``--chunk`` splits an
     oversized payload.
 
@@ -4016,12 +4018,9 @@ def _run_chunked(
                 settings, request.system_prompt, request.user_prompt, settings.model
             )
         except ReviewError:
-            done = (
-                f"chunks 1-{idx - 1} completed" if idx > 1 else "no chunks completed"
-            )
+            done = f"chunks 1-{idx - 1} completed" if idx > 1 else "no chunks completed"
             sys.stderr.write(
-                f"WARN: [chunk] {done}; chunk {idx} failed -- review is "
-                "incomplete.\n"
+                f"WARN: [chunk] {done}; chunk {idx} failed -- review is incomplete.\n"
             )
             raise
         usage_line = _format_usage_line(result, settings.provider, settings.model)
@@ -4388,12 +4387,12 @@ def main() -> None:
                 notes = []
                 for panel_model in settings.models:
                     num_ctx, enforced, source = _resolve_ollama_window(
-                        settings.ollama_host, panel_model,
+                        settings.ollama_host,
+                        panel_model,
                         settings.ollama_num_ctx_env,
                     )
                     would_fail = (
-                        enforced
-                        and prompt_chars // OLLAMA_CHARS_PER_TOKEN >= num_ctx
+                        enforced and prompt_chars // OLLAMA_CHARS_PER_TOKEN >= num_ctx
                     )
                     suffix = " -- WOULD FAIL pre-flight" if would_fail else ""
                     notes.append(
@@ -4402,7 +4401,8 @@ def main() -> None:
                 ollama_window = "; ".join(notes)
             else:
                 num_ctx, enforced, source = _resolve_ollama_window(
-                    settings.ollama_host, settings.model,
+                    settings.ollama_host,
+                    settings.model,
                     settings.ollama_num_ctx_env,
                 )
                 # Run the same guard a live run would, so --dry-run exits

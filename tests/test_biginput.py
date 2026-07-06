@@ -155,15 +155,17 @@ class TestChangedFilePaths:
         calls = self._capture(monkeypatch)
         args = argparse.Namespace(pr=None, staged=False, base=None)
         changed_file_paths(args)
-        assert calls == [
-            ["git", "diff", "--name-only", "--merge-base", "origin/HEAD"]
-        ]
+        assert calls == [["git", "diff", "--name-only", "--merge-base", "origin/HEAD"]]
 
 
 def _combo_args(**overrides) -> argparse.Namespace:
     base = dict(
-        chunk=False, models=None, full_files=False,
-        baseline=None, codebase=False, diff_file=None,
+        chunk=False,
+        models=None,
+        full_files=False,
+        baseline=None,
+        codebase=False,
+        diff_file=None,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -248,17 +250,27 @@ class TestChunkBudget:
 class TestChunkedEnvelope:
     def test_shape(self):
         parsed_ok = ParsedReview(
-            summary="s", clean=False, parse_ok=True, problems=[],
+            summary="s",
+            clean=False,
+            parse_ok=True,
+            problems=[],
             findings=[
                 review.Finding(
-                    file="a.py", line=1, severity="HIGH",
-                    title="t", body="b", suggestion=None,
+                    file="a.py",
+                    line=1,
+                    severity="HIGH",
+                    title="t",
+                    body="b",
+                    suggestion=None,
                 )
             ],
         )
         parsed_bad = ParsedReview(
-            summary=None, clean=False, parse_ok=False,
-            problems=["garbled"], findings=[],
+            summary=None,
+            clean=False,
+            parse_ok=False,
+            problems=["garbled"],
+            findings=[],
         )
         envelope = build_chunked_envelope(
             mode="codebase",

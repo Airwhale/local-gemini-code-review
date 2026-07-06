@@ -205,15 +205,7 @@ class TestFences:
         assert finding.suggestion == "x = 2"
 
     def test_trailing_diff_fence_without_leadin_is_suggestion(self):
-        text = (
-            "## File: a.py\n"
-            "### L5: [HIGH] T.\n"
-            "Body.\n"
-            "```diff\n"
-            "-old\n"
-            "+new\n"
-            "```\n"
-        )
+        text = "## File: a.py\n### L5: [HIGH] T.\nBody.\n```diff\n-old\n+new\n```\n"
         finding = parse_review_markdown(text).findings[0]
         assert finding.suggestion == "-old\n+new"
 
@@ -296,8 +288,12 @@ class TestDogfoodFixtures:
 class TestFingerprints:
     def _finding(self, **overrides) -> Finding:
         base = dict(
-            file="a.py", line=42, severity="HIGH",
-            title="Retry loop never sleeps.", body="", suggestion=None,
+            file="a.py",
+            line=42,
+            severity="HIGH",
+            title="Retry loop never sleeps.",
+            body="",
+            suggestion=None,
         )
         base.update(overrides)
         return Finding(**base)
@@ -332,8 +328,11 @@ class TestBaseline:
             model="m",
             temperature=0.3,
             parsed=parse_review_markdown_safe(WELL_FORMED).__class__(
-                summary="s", findings=findings, clean=False,
-                parse_ok=True, problems=[],
+                summary="s",
+                findings=findings,
+                clean=False,
+                parse_ok=True,
+                problems=[],
             ),
             result=CallResult("raw"),
             raw_markdown="raw",
@@ -341,8 +340,12 @@ class TestBaseline:
 
     def _finding(self, title: str, line: int | None = 10) -> Finding:
         return Finding(
-            file="a.py", line=line, severity="HIGH",
-            title=title, body="", suggestion=None,
+            file="a.py",
+            line=line,
+            severity="HIGH",
+            title=title,
+            body="",
+            suggestion=None,
         )
 
     def test_new_persisting_resolved(self):
@@ -358,9 +361,7 @@ class TestBaseline:
         # Empirical case from back-to-back flash runs: same file, same
         # line, same issue, completely reworded title. Pass 2 (location)
         # must carry the match that the fingerprint misses.
-        doc = self._doc(
-            [self._finding("Add a comment explaining the default value")]
-        )
+        doc = self._doc([self._finding("Add a comment explaining the default value")])
         current = [self._finding("Add a comment to clarify its purpose", line=12)]
         statuses, resolved = diff_against_baseline(current, doc)
         assert statuses == ["persisting"]
@@ -370,8 +371,12 @@ class TestBaseline:
         old = self._finding("The comment is misleading")
         doc = self._doc([old])
         rerated = Finding(
-            file=old.file, line=old.line, severity="MEDIUM",
-            title="The comment should be clarified", body="", suggestion=None,
+            file=old.file,
+            line=old.line,
+            severity="MEDIUM",
+            title="The comment should be clarified",
+            body="",
+            suggestion=None,
         )
         statuses, _resolved = diff_against_baseline([rerated], doc)
         assert statuses == ["persisting"]
@@ -379,8 +384,12 @@ class TestBaseline:
     def test_different_file_never_persists(self):
         doc = self._doc([self._finding("issue")])
         moved = Finding(
-            file="other.py", line=10, severity="HIGH",
-            title="issue", body="", suggestion=None,
+            file="other.py",
+            line=10,
+            severity="HIGH",
+            title="issue",
+            body="",
+            suggestion=None,
         )
         # Identical title but different file: strong pass fails on the
         # fingerprint (file is hashed), relaxed pass fails on location.
@@ -461,6 +470,8 @@ class TestEnvelope:
             resolved=[],
         )
         assert [f["status"] for f in envelope["findings"]] == [
-            "new", "persisting", "new",
+            "new",
+            "persisting",
+            "new",
         ]
         assert envelope["resolved"] == []

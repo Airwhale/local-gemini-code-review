@@ -34,7 +34,8 @@ FIXTURES_DIR = EVALS_DIR / "fixtures"
 
 def discover_fixtures(only: list[str]) -> list[Path]:
     fixtures = sorted(
-        d for d in FIXTURES_DIR.iterdir()
+        d
+        for d in FIXTURES_DIR.iterdir()
         if (d / "diff.patch").is_file() and (d / "expected.toml").is_file()
     )
     if only:
@@ -49,15 +50,24 @@ def discover_fixtures(only: list[str]) -> list[Path]:
 def run_review(fixture: Path, model: str, temperature: float) -> dict:
     """Invoke the runner on a fixture diff; return the JSON envelope."""
     cmd = [
-        sys.executable, str(REPO_ROOT / "review.py"),
-        "--diff-file", str(fixture / "diff.patch"),
-        "--format", "json",
-        "--model", model,
-        "--temperature", str(temperature),
+        sys.executable,
+        str(REPO_ROOT / "review.py"),
+        "--diff-file",
+        str(fixture / "diff.patch"),
+        "--format",
+        "json",
+        "--model",
+        model,
+        "--temperature",
+        str(temperature),
     ]
     result = subprocess.run(
-        cmd, capture_output=True, text=True, encoding="utf-8",
-        errors="replace", cwd=REPO_ROOT,
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=REPO_ROOT,
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -91,19 +101,30 @@ def score(envelope: dict, expected: dict) -> tuple[int, int, int]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
-        "--model", action="append", default=[], metavar="SLUG",
+        "--model",
+        action="append",
+        default=[],
+        metavar="SLUG",
         help="Model slug/alias; repeatable. Default: flash (cheap).",
     )
     parser.add_argument(
-        "--temperature", action="append", type=float, default=[],
-        metavar="T", help="Temperature; repeatable. Default: 0.3.",
+        "--temperature",
+        action="append",
+        type=float,
+        default=[],
+        metavar="T",
+        help="Temperature; repeatable. Default: 0.3.",
     )
     parser.add_argument(
-        "--fixture", action="append", default=[], metavar="NAME",
+        "--fixture",
+        action="append",
+        default=[],
+        metavar="NAME",
         help="Run only this fixture; repeatable. Default: all.",
     )
     parser.add_argument(
-        "--yes", action="store_true",
+        "--yes",
+        action="store_true",
         help="Skip the cost confirmation prompt.",
     )
     args = parser.parse_args()
@@ -139,25 +160,24 @@ def main() -> None:
                     continue
                 caught, total, noise = score(envelope, expected)
                 rows.append(
-                    (model, temperature, fixture.name,
-                     f"{caught}/{total}", str(noise),
-                     "ok" if envelope.get("parse_ok") else "parse_fail")
+                    (
+                        model,
+                        temperature,
+                        fixture.name,
+                        f"{caught}/{total}",
+                        str(noise),
+                        "ok" if envelope.get("parse_ok") else "parse_fail",
+                    )
                 )
 
     print()
     header = ("model", "T", "fixture", "recall", "noise", "parse")
-    widths = [
-        max(len(str(row[i])) for row in [header, *rows]) for i in range(6)
-    ]
+    widths = [max(len(str(row[i])) for row in [header, *rows]) for i in range(6)]
     for row in [header, *rows]:
         print("  ".join(str(cell).ljust(widths[i]) for i, cell in enumerate(row)))
 
-    caught_total = sum(
-        int(r[3].split("/")[0]) for r in rows if r[3] not in ("ERR",)
-    )
-    bugs_total = sum(
-        int(r[3].split("/")[1]) for r in rows if r[3] not in ("ERR",)
-    )
+    caught_total = sum(int(r[3].split("/")[0]) for r in rows if r[3] not in ("ERR",))
+    bugs_total = sum(int(r[3].split("/")[1]) for r in rows if r[3] not in ("ERR",))
     if bugs_total:
         print(f"\noverall recall: {caught_total}/{bugs_total}")
 
