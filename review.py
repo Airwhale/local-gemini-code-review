@@ -283,13 +283,25 @@ DEFAULT_OLLAMA_TIMEOUT = 1800.0  # 30 minutes
 # itself; instead it refuses pre-flight (typed CONTEXT_OVERFLOW) when
 # the prompt likely exceeds the window.
 #
-# Stock Ollama loads models with a 4096-token context unless the server
-# was started with ``OLLAMA_CONTEXT_LENGTH`` or the model's Modelfile
-# sets ``num_ctx``. If you've raised the server-side window, set
-# ``$OLLAMA_NUM_CTX`` to the same value so the runner's guard matches.
+# Stock Ollama picks the window from available VRAM (per
+# docs.ollama.com/context-length: <24 GiB -> 4K, 24-48 GiB -> 32K,
+# >=48 GiB -> 256K), and ``OLLAMA_CONTEXT_LENGTH`` / the app settings /
+# a Modelfile ``num_ctx`` can override it -- so the runner cannot know
+# the window statically. Resolution order for the guard:
+#
+#   1. ``$OLLAMA_NUM_CTX`` set -> authoritative; guard is a hard error.
+#   2. Model currently loaded -> read its actual ``context_length`` from
+#      ``GET /api/ps`` (see ``_detect_ollama_num_ctx``); hard error.
+#      Covers every round after the first in an iterative review loop.
+#   3. Unknown -> assume the smallest VRAM tier (4096) but only WARN on
+#      a likely overflow, since a bigger machine may have a 32K/256K
+#      window and a hard error would reject a perfectly valid run.
+#
 # Token estimate is the standard ~4 chars/token.
 DEFAULT_OLLAMA_NUM_CTX = 4096
 OLLAMA_CHARS_PER_TOKEN = 4
+OLLAMA_PS_TIMEOUT = 5.0  # /api/ps probe is local and fast; never let a
+                         # hung probe delay the actual review call long.
 
 # Sampling temperature for the model. History of this constant:
 #
@@ -832,9 +844,14 @@ def _classify_http_error(
     """
     body_lower = body.lower()
     if status == 429:
-        wait_hint = (
-            f" (Retry-After: {retry_after}s)" if retry_after else ""
-        )
+        # Retry-After is either delta-seconds ("30") or an HTTP-date
+        # ("Fri, 31 Dec 1999 23:59:59 GMT") -- only append the seconds
+        # unit when the value is numeric.
+        wait_hint = ""
+        if retry_after:
+            retry_after = retry_after.strip()
+            suffix = "s" if retry_after.isdigit() else ""
+            wait_hint = f" (Retry-After: {retry_after}{suffix})"
         return RateLimit(
             f"{provider} returned HTTP 429{wait_hint}",
             detail=body[:1000],
@@ -1158,39 +1175,109 @@ def _normalize_ollama_host(host: str) -> str:
     retryable TRANSPORT error when the real problem is config. Prepending
     ``http://`` when no scheme is present accepts both conventions.
     Trailing slashes are stripped so path-joining with
-    ``OLLAMA_CHAT_PATH`` can't produce ``//``.
+    ``OLLAMA_CHAT_PATH`` can't produce ``//``. An empty / whitespace-only
+    value (e.g. ``--ollama-host ""`` or ``OLLAMA_HOST="  "``) raises a
+    typed ConfigError rather than degrading to the invalid URL ``http:``.
     """
     host = host.strip()
+    if not host:
+        raise ConfigError(
+            "Ollama host is empty. Set --ollama-host or $OLLAMA_HOST to a "
+            "URL like http://localhost:11434, or unset them to use the "
+            f"default ({DEFAULT_OLLAMA_HOST})."
+        )
     if "://" not in host:
         host = f"http://{host}"
     return host.rstrip("/")
 
 
-def _ollama_prompt_guard(prompt_chars: int, num_ctx: int, *, model: str) -> None:
-    """Raise ``ContextOverflow`` when the prompt likely exceeds Ollama's
-    loaded context window.
+def _match_loaded_context(ps_data: dict, model: str) -> int | None:
+    """Extract the loaded ``model``'s ``context_length`` from ``/api/ps`` data.
+
+    Pure so it's unit-testable without a server. Ollama normalizes
+    untagged names to ``:latest`` when loading, so ``qwen3-coder-next``
+    must match a loaded ``qwen3-coder-next:latest``. Returns ``None``
+    when the model isn't in the loaded list or the server predates the
+    ``context_length`` field.
+    """
+    wanted = {model} if ":" in model else {model, f"{model}:latest"}
+    for entry in ps_data.get("models") or []:
+        if not isinstance(entry, dict):
+            continue
+        if {entry.get("name"), entry.get("model")} & wanted:
+            ctx = entry.get("context_length")
+            if isinstance(ctx, int) and ctx > 0:
+                return ctx
+    return None
+
+
+def _detect_ollama_num_ctx(host: str, model: str) -> int | None:
+    """Best-effort read of the model's actual loaded context window.
+
+    ``GET /api/ps`` lists models currently in memory, including the
+    ``context_length`` each was loaded with -- the operative window for
+    our request, since Ollama reuses the loaded instance. Returns
+    ``None`` (never raises) when the model isn't loaded yet, the server
+    is unreachable, or the field is absent (older Ollama): the caller
+    falls back to the advisory default. In the primary iterative-review
+    workflow the model is loaded from round 1's call onward, so every
+    subsequent round gets an exact window instead of an estimate.
+    """
+    try:
+        with httpx.Client(timeout=OLLAMA_PS_TIMEOUT) as client:
+            response = client.get(host.rstrip("/") + "/api/ps")
+        if response.status_code != 200:
+            return None
+        return _match_loaded_context(response.json(), model)
+    except Exception:
+        # Probe must never break the run; the real call surfaces any
+        # genuine connectivity problem as a typed error.
+        return None
+
+
+def _ollama_prompt_guard(
+    prompt_chars: int, num_ctx: int, *, model: str, enforced: bool = True
+) -> None:
+    """Guard against Ollama's silent prompt truncation.
 
     Ollama silently truncates prompts that don't fit ``num_ctx`` and
     generates from the fragment that survived -- no error, exit 0, and a
-    plausible-looking review of a fraction of the code. Refusing
-    pre-flight with a typed error is the only reliable defense, because
-    the OpenAI-compatible endpoint offers no per-request ``num_ctx``
-    control. See ``DEFAULT_OLLAMA_NUM_CTX`` for the default rationale.
+    plausible-looking review of a fraction of the code. The
+    OpenAI-compatible endpoint offers no per-request ``num_ctx`` control,
+    so this pre-flight check is the defense.
+
+    ``enforced=True`` (window known: $OLLAMA_NUM_CTX set, or read from
+    ``/api/ps``) -> likely overflow raises a typed ``ContextOverflow``.
+    ``enforced=False`` (window unknown; ``num_ctx`` is the smallest
+    stock VRAM tier) -> likely overflow only WARNs, because the actual
+    window on a >=24 GiB machine is 32K/256K and a hard error would
+    reject a valid run. See ``DEFAULT_OLLAMA_NUM_CTX`` for the tiers.
     """
     approx_tokens = prompt_chars // OLLAMA_CHARS_PER_TOKEN
-    if approx_tokens >= num_ctx:
+    if approx_tokens < num_ctx:
+        return
+    if enforced:
         raise ContextOverflow(
             f"Prompt is ~{approx_tokens:,} tokens ({prompt_chars:,} chars) "
-            f"but the Ollama context-window guard is {num_ctx:,} tokens. "
+            f"but the Ollama context window is {num_ctx:,} tokens. "
             "Ollama silently truncates oversized prompts, which would "
             "produce a review of only a fragment of the code. Either "
             "narrow the scope (--include / --exclude / smaller --base), "
-            "or raise the server's window (start Ollama with "
-            "OLLAMA_CONTEXT_LENGTH=<tokens>) and set $OLLAMA_NUM_CTX to "
-            "the same value so this guard matches.",
+            "or raise the window: increase the server's context length "
+            "(OLLAMA_CONTEXT_LENGTH=<tokens>, or the Ollama app settings) "
+            "and set $OLLAMA_NUM_CTX to match.",
             model=model,
             provider="ollama",
         )
+    sys.stderr.write(
+        f"WARN: prompt is ~{approx_tokens:,} tokens but the Ollama context "
+        f"window could not be determined (model `{model}` not loaded yet; "
+        "$OLLAMA_NUM_CTX unset). Stock windows are VRAM-dependent "
+        f"(4K/32K/256K); if yours is smaller than the prompt, Ollama will "
+        "silently truncate it and review only a fragment. Set "
+        "$OLLAMA_NUM_CTX to your actual window to make this a hard "
+        "pre-flight check.\n"
+    )
 
 
 def call_ollama(
@@ -1710,6 +1797,7 @@ def main() -> None:
     ollama_host: str | None = None
     ollama_timeout: float | None = None
     ollama_num_ctx: int | None = None
+    ollama_num_ctx_enforced = True
 
     if args.provider == "openrouter":
         api_key = os.getenv("OPENROUTER_API_KEY")
@@ -1739,23 +1827,36 @@ def main() -> None:
             or os.getenv("OLLAMA_HOST")
             or DEFAULT_OLLAMA_HOST
         )
+        # Context-window resolution: explicit env var wins; else read the
+        # loaded model's actual window from /api/ps; else fall back to
+        # the smallest stock VRAM tier as an advisory (warn-only) guard.
+        # See DEFAULT_OLLAMA_NUM_CTX for the rationale.
         env_num_ctx = os.getenv("OLLAMA_NUM_CTX")
-        try:
-            ollama_num_ctx = (
-                int(env_num_ctx) if env_num_ctx is not None
-                else DEFAULT_OLLAMA_NUM_CTX
-            )
-        except ValueError as exc:
-            raise ConfigError(
-                f"$OLLAMA_NUM_CTX={env_num_ctx!r} is not a valid integer "
-                "(tokens). Set it to the context window your Ollama "
-                "server loads models with (OLLAMA_CONTEXT_LENGTH), or "
-                f"unset it to use the default ({DEFAULT_OLLAMA_NUM_CTX})."
-            ) from exc
-        if ollama_num_ctx <= 0:
-            raise ConfigError(
-                f"$OLLAMA_NUM_CTX={ollama_num_ctx} must be positive (tokens)."
-            )
+        if env_num_ctx is not None:
+            try:
+                ollama_num_ctx = int(env_num_ctx)
+            except ValueError as exc:
+                raise ConfigError(
+                    f"$OLLAMA_NUM_CTX={env_num_ctx!r} is not a valid integer "
+                    "(tokens). Set it to the context window your Ollama "
+                    "server loads models with, or unset it to let the "
+                    "runner detect the window from a loaded model."
+                ) from exc
+            if ollama_num_ctx <= 0:
+                raise ConfigError(
+                    f"$OLLAMA_NUM_CTX={ollama_num_ctx} must be positive (tokens)."
+                )
+        else:
+            detected = _detect_ollama_num_ctx(ollama_host, model)
+            if detected is not None:
+                ollama_num_ctx = detected
+                sys.stderr.write(
+                    f"[ollama] detected context window {detected:,} tokens "
+                    "for loaded model via /api/ps\n"
+                )
+            else:
+                ollama_num_ctx = DEFAULT_OLLAMA_NUM_CTX
+                ollama_num_ctx_enforced = False
         env_timeout = os.getenv("OLLAMA_TIMEOUT")
         try:
             ollama_timeout = (
@@ -1896,10 +1997,14 @@ def main() -> None:
         assert ollama_num_ctx is not None
         # Pre-flight context-window guard: refuse (typed CONTEXT_OVERFLOW)
         # rather than let Ollama silently truncate the prompt and review
-        # a fragment. Cloud providers don't need this -- they 4xx on
-        # oversized prompts instead of truncating.
+        # a fragment; warn-only when the window couldn't be determined.
+        # Cloud providers don't need this -- they 4xx on oversized
+        # prompts instead of truncating.
         _ollama_prompt_guard(
-            len(system_prompt) + len(user_prompt), ollama_num_ctx, model=model
+            len(system_prompt) + len(user_prompt),
+            ollama_num_ctx,
+            model=model,
+            enforced=ollama_num_ctx_enforced,
         )
         output = _retry_on_recoverable(
             lambda: call_ollama(

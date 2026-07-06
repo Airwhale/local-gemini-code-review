@@ -56,6 +56,14 @@ class TestClassifyHttpError:
         err = self._classify(429, "slow down", retry_after="30")
         assert "Retry-After: 30s" in str(err)
 
+    def test_429_retry_after_http_date_gets_no_seconds_suffix(self):
+        # Retry-After may be an HTTP-date; appending "s" would mangle it.
+        err = self._classify(
+            429, "slow down", retry_after="Wed, 21 Oct 2015 07:28:00 GMT"
+        )
+        assert "Retry-After: Wed, 21 Oct 2015 07:28:00 GMT" in str(err)
+        assert "GMTs" not in str(err)
+
     def test_5xx_is_transport(self):
         assert isinstance(self._classify(503, "service unavailable"), TransportError)
 
@@ -141,6 +149,13 @@ class TestNormalizeOllamaHost:
     def test_whitespace_stripped(self):
         assert _normalize_ollama_host(" localhost:11434 ") == "http://localhost:11434"
 
+    @pytest.mark.parametrize("host", ["", "   "])
+    def test_empty_host_raises_config_error(self, host: str):
+        # Without the check, "" would normalize to the invalid URL "http:".
+        with pytest.raises(ConfigError) as exc_info:
+            _normalize_ollama_host(host)
+        assert "OLLAMA_HOST" in str(exc_info.value)
+
 
 # ---------------------------------------------------------------------------
 # _ollama_prompt_guard
@@ -160,6 +175,51 @@ class TestOllamaPromptGuard:
     def test_boundary_just_under_window_passes(self):
         # 4095 tokens' worth of chars against a 4096 window.
         _ollama_prompt_guard(4095 * review.OLLAMA_CHARS_PER_TOKEN, 4096, model="m")
+
+    def test_unenforced_oversize_warns_instead_of_raising(
+        self, capsys: pytest.CaptureFixture
+    ):
+        # Window unknown (env unset, model not loaded): a hard error
+        # could reject a valid run on a 32K/256K machine, so the guard
+        # only warns.
+        _ollama_prompt_guard(100_000, 4096, model="m", enforced=False)
+        err = capsys.readouterr().err
+        assert err.startswith("WARN:")
+        assert "OLLAMA_NUM_CTX" in err
+
+    def test_unenforced_small_prompt_stays_silent(
+        self, capsys: pytest.CaptureFixture
+    ):
+        _ollama_prompt_guard(1000, 4096, model="m", enforced=False)
+        assert capsys.readouterr().err == ""
+
+
+class TestMatchLoadedContext:
+    PS_DATA = {
+        "models": [
+            {"name": "qwen3-coder:30b", "model": "qwen3-coder:30b", "context_length": 32768},
+            {"name": "qwen3-coder-next:latest", "model": "qwen3-coder-next:latest", "context_length": 262144},
+        ]
+    }
+
+    def test_exact_tagged_match(self):
+        assert review._match_loaded_context(self.PS_DATA, "qwen3-coder:30b") == 32768
+
+    def test_untagged_model_matches_latest(self):
+        # Ollama normalizes untagged names to :latest when loading.
+        assert review._match_loaded_context(self.PS_DATA, "qwen3-coder-next") == 262144
+
+    def test_not_loaded_returns_none(self):
+        assert review._match_loaded_context(self.PS_DATA, "llama3:8b") is None
+
+    def test_missing_context_field_returns_none(self):
+        # Older Ollama servers predate context_length in /api/ps.
+        data = {"models": [{"name": "m:latest", "model": "m:latest"}]}
+        assert review._match_loaded_context(data, "m:latest") is None
+
+    def test_empty_or_malformed_data_returns_none(self):
+        assert review._match_loaded_context({}, "m") is None
+        assert review._match_loaded_context({"models": ["junk"]}, "m") is None
 
 
 # ---------------------------------------------------------------------------

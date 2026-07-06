@@ -154,7 +154,7 @@ Practical workflow: cloud first for the structured triage pass; local as a sanit
    - `OLLAMA_HOST=http://localhost:11434` — server URL. Override if Ollama is on a non-default port, another machine, or a WSL distro without localhost mirroring. Scheme-less `host:port` values (Ollama's own `OLLAMA_HOST` convention, e.g. `0.0.0.0:11434`) are accepted — the runner prepends `http://`.
    - `OLLAMA_MODEL=qwen3-coder:30b` — default model when `--provider ollama` is selected.
    - `OLLAMA_TIMEOUT=1800` — HTTP timeout in seconds. Default 30 minutes accommodates CPU cold-starts (10–60 s model load) plus thorough reviews; lower it if you'd rather fail fast.
-   - `OLLAMA_NUM_CTX=4096` — the context window (tokens) the runner assumes your server loads models with. See the truncation guard below.
+   - `OLLAMA_NUM_CTX=32768` — the context window (tokens) your server loads models with. Usually unnecessary: the runner reads the real window from a loaded model automatically. See the truncation guard below.
 4. Run:
 
     ```bash
@@ -163,10 +163,16 @@ Practical workflow: cloud first for the structured triage pass; local as a sanit
 
 The runner's error messages are tailored for Ollama-specific failure modes — "server unreachable" suggests `ollama serve` and `--ollama-host`; "model not pulled" gives you the exact `ollama pull <model>` command to run.
 
-**Context-window truncation guard.** Unlike the cloud providers, which return an error when a prompt exceeds the model's context, Ollama **silently truncates** prompts that don't fit the loaded context window (`num_ctx`) and generates from whatever survived. For code review that's the worst failure mode: the model reviews a fragment of your diff and returns a plausible-looking "few issues found" with exit 0. The runner therefore refuses pre-flight (typed `CONTEXT_OVERFLOW`, exit 12) when the prompt likely exceeds the window. Stock Ollama loads models at 4096 tokens; to review anything substantial locally, raise the server-side window and tell the runner about it:
+**Context-window truncation guard.** Unlike the cloud providers, which return an error when a prompt exceeds the model's context, Ollama **silently truncates** prompts that don't fit the loaded context window (`num_ctx`) and generates from whatever survived. For code review that's the worst failure mode: the model reviews a fragment of your diff and returns a plausible-looking "few issues found" with exit 0. The runner estimates the prompt size pre-flight and compares it against the window, resolved in this order:
+
+1. **`$OLLAMA_NUM_CTX` set** → treated as authoritative; a likely overflow is a hard `CONTEXT_OVERFLOW` (exit 12).
+2. **Model already loaded** → the runner reads the model's *actual* window from `GET /api/ps` (`[ollama] detected context window …` on stderr) and enforces that. In an iterative review loop this covers every round after the first.
+3. **Window unknown** (first-ever call, model not loaded) → the runner assumes the smallest stock tier (4096) but only **warns** on a likely overflow, because stock Ollama sizes the window by VRAM ([docs](https://docs.ollama.com/context-length): 4K under 24 GiB, 32K for 24–48 GiB, 256K above) and a hard error would reject valid runs on bigger machines.
+
+If you see the warning (or a `CONTEXT_OVERFLOW`), either narrow the review scope or raise the window server-side and pin it for the runner:
 
 ```bash
-# server side (pick a window your RAM can hold):
+# server side (pick a window your VRAM can hold):
 OLLAMA_CONTEXT_LENGTH=32768 ollama serve
 ```
 
