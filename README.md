@@ -275,6 +275,20 @@ uv run review.py --base main --format json --baseline round1.json --output round
 
 Matching is a two-pass heuristic: exact fingerprint (file + severity + normalized title, lines within ±10) first, then same-file location (±10 lines) for the rest — necessary because models reword titles and even re-rate severities between otherwise identical runs. Two *different* findings within 10 lines of each other can cross-match; treat `persisting`/`resolved` as strong hints, not proofs.
 
+### Multi-model panels (`--models`)
+
+```bash
+uv run review.py --base main --models pro,claude,deepseek --format json
+```
+
+Runs the same review through several models (concurrently on cloud providers, capped at 4; strictly sequentially on ollama — local models can't share RAM) and merges the parsed findings into one consensus-annotated report. Motivation is empirical: dogfooding this tool on its own PR, one model returned clean, one returned only hallucinations, and one had a single real bug among 28 findings — **cross-model agreement is the strongest cheap filter for plausible-but-wrong findings**. Expect `found_by` of 1 to be the norm; consensus (`found_by > 1`) is a rare, *high-precision* signal, not the typical case.
+
+- **Markdown output**: `# Panel review (k/n models)` header, per-model one-line results, merged findings ordered by (consensus, severity, location) each with a `Found by:` line, then every model's raw output verbatim in an appendix — nothing is lost to the merge.
+- **JSON output**: the envelope carries `models[]`, per-finding `found_by`, and a `per_model[]` array (per-model parse status, usage, truncation, or the typed error for failed models). Top-level `usage` is the sum where reported.
+- **Merging** is deliberately conservative: exact fingerprint, or same location *and* same severity. Two models disagreeing on severity for the same hunk stay two findings — consensus must not be manufactured.
+- **Exit semantics (contract)**: at least one model succeeded → **exit 0**, with each failure reported as a `WARN: [panel] <model> failed: <CATEGORY> …` stderr line (machine-readable in `per_model` for JSON). All models failed → a single `ERROR:` block chosen by fixed category precedence `CONFIG > SAFETY_REFUSAL > CONTEXT_OVERFLOW > RATE_LIMIT > PROVIDER_HICCUP > TRANSPORT > UNKNOWN` (ties broken by CLI order).
+- Mutually exclusive with `--model`; `--baseline` isn't supported with panels yet. Per-model temperature overrides and streaming are out of scope.
+
 The temperature default has been retuned twice. **0.2** (original) was too conservative: 1–2 findings per round on diffs that plausibly contained more, 5–7 rounds to converge. **0.5** surfaced more findings per round (3–5 typical) but produced a clear hallucination during cross-model integration testing — `google/gemini-2.5-pro` returned a confidently-worded HIGH-severity finding that referenced a CLI flag and "help text" that did not exist in the code; the suggested fix would have crashed the runner. **0.3** (current) is the compromise: tight enough to cut hallucination, loose enough to keep "more findings than 0.2." Override per call with `--temperature` if your project benefits from a different setting; empirical re-tuning is encouraged.
 
 ### Whole-codebase mode (`--codebase`)
@@ -409,6 +423,7 @@ Non-error stderr lines use a fixed prefix vocabulary — **no informational line
 | `[retry] …` | An automatic retry is about to happen (category, attempt, delay) |
 | `[ollama] …` | Ollama context-window detection notice (`/api/ps`) |
 | `[baseline] …` | Round-over-round finding counts when `--baseline` is given |
+| `[panel …] …` | Per-model progress in `--models` panels; `WARN: [panel] <model> failed: …` for per-model failures |
 | `skip …` | A file was dropped from the codebase bundle (size cap) |
 
 ### Auto-retry behavior
