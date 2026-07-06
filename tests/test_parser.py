@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from review import (
+from code_review.cli import (
     CallResult,
     ConfigError,
     Finding,
@@ -251,7 +251,7 @@ class TestParseFailureModes:
         assert not parsed.parse_ok
 
     def test_safe_wrapper_never_raises(self, monkeypatch: pytest.MonkeyPatch):
-        import review as review_module
+        from code_review import cli as review_module
 
         def _boom(_text: str):
             raise RuntimeError("parser bug")

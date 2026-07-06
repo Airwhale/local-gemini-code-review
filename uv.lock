@@ -90,8 +90,8 @@ wheels = [
 
 [[package]]
 name = "local-gemini-code-review"
-version = "0.1.0"
-source = { virtual = "." }
+version = "0.2.0"
+source = { editable = "." }
 dependencies = [
     { name = "httpx" },
     { name = "python-dotenv" },

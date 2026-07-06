@@ -105,6 +105,31 @@ uv run --project /path/to/local-gemini-code-review /path/to/local-gemini-code-re
 
 `uv` resolves deps on first run. No global `pip install` required.
 
+### Install as a global command (recommended)
+
+```bash
+uv tool install git+https://github.com/Airwhale/local-gemini-code-review
+# then, from ANY repo:
+code-review --base origin/main
+code-review --version
+```
+
+The wheel ships the prompt assets inside the package, so the installed `code-review` is fully self-contained. Configuration for an installed tool lives in a per-user `.env` — `%APPDATA%\code-review\.env` on Windows, `~/.config/code-review/.env` elsewhere (same contents as `.env.example`) — or point `$CODE_REVIEW_ENV` at any env file. A repo-checkout `.env` still works for the clone workflow. `$CODE_REVIEW_PROMPT_DIR` overrides the prompt assets if you want to experiment with reworded skills without editing the install.
+
+### Per-project configuration (`.code-review.toml`)
+
+Put a `.code-review.toml` in any repo you review (found by upward walk from the working directory, stopping at `.git`); it supplies project defaults for: `provider`, `model`, `models`, `temperature`, `max_tokens`, `retries`, `min_severity`, `format`, `context`, `ollama_host`, `ollama_num_ctx`, `ollama_timeout`, `include`, `exclude`.
+
+```toml
+# .code-review.toml — this project reviews with a flash panel and skips generated code
+models = ["pro", "flash"]
+min_severity = "MEDIUM"
+exclude = ["generated/**", "**/*_pb2.py"]
+context = "This repo is a payments compliance service; sanctions/AML language is domain vocabulary."
+```
+
+**Precedence: CLI flag > environment (with `.env` files merged in) > `.code-review.toml` > built-in default.** Bad values fail fast as typed `CONFIG` errors naming the layer they came from. Two security properties, because this file lives in the *reviewed* (possibly untrusted) repo: loading one is always announced on stderr (`[config] loaded …`), and **API keys are never read from it** — credentials come from the environment only. A pinned `ollama_num_ctx` here counts as user-specified, so the truncation guard is hard-enforced just like `$OLLAMA_NUM_CTX`.
+
 ## Provider selection
 
 The runner supports three transport paths — two cloud, one local:
