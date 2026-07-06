@@ -19,18 +19,32 @@ import pytest
 import review
 from review import (
     BUILTIN_CODEBASE_EXCLUDES,
+    INJECTION_GUARD,
+    CallResult,
     ConfigError,
     ContextOverflow,
+    ProviderHiccup,
     RateLimit,
     ReviewError,
+    ReviewRequest,
+    SafetyRefusal,
+    Settings,
     TransportError,
+    _apply_context,
+    _call_with_retries,
     _classify_http_error,
+    _dry_run_report,
     _format_size,
+    _format_usage_line,
     _glob_match,
+    _min_severity_instruction,
     _normalize_ollama_host,
     _number_lines,
     _ollama_prompt_guard,
+    _parse_retry_after,
     _resolve_model,
+    _usage_int,
+    _write_output_file,
 )
 
 
@@ -319,3 +333,277 @@ class TestErrorModelContract:
         review._print_error(RateLimit("x", model="m", provider="p"))
         err = capsys.readouterr().err
         assert err.startswith("ERROR: RATE_LIMIT [exit 11]\n")
+
+
+# ---------------------------------------------------------------------------
+# _parse_retry_after + retry_after_seconds attribute
+# ---------------------------------------------------------------------------
+
+
+class TestParseRetryAfter:
+    def test_delta_seconds(self):
+        assert _parse_retry_after("30") == 30.0
+
+    def test_delta_seconds_with_whitespace(self):
+        assert _parse_retry_after("  120  ") == 120.0
+
+    def test_http_date_in_future(self):
+        from datetime import datetime, timedelta, timezone
+        from email.utils import format_datetime
+
+        future = datetime.now(timezone.utc) + timedelta(seconds=120)
+        parsed = _parse_retry_after(format_datetime(future, usegmt=True))
+        assert parsed is not None
+        assert 0.0 < parsed <= 121.0
+
+    def test_http_date_in_past_clamps_to_zero(self):
+        assert _parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT") == 0.0
+
+    def test_garbage_returns_none(self):
+        assert _parse_retry_after("soon-ish") is None
+
+    def test_classify_sets_seconds_for_digits(self):
+        err = _classify_http_error(
+            429, "slow down", model="m", provider="p", retry_after="30"
+        )
+        assert isinstance(err, RateLimit)
+        assert err.retry_after_seconds == 30.0
+
+    def test_classify_sets_none_for_garbage_header(self):
+        err = _classify_http_error(
+            429, "slow down", model="m", provider="p", retry_after="soon-ish"
+        )
+        assert isinstance(err, RateLimit)
+        assert err.retry_after_seconds is None
+
+    def test_classify_no_header_leaves_none(self):
+        err = _classify_http_error(429, "slow down", model="m", provider="p")
+        assert isinstance(err, RateLimit)
+        assert err.retry_after_seconds is None
+
+
+# ---------------------------------------------------------------------------
+# _call_with_retries
+# ---------------------------------------------------------------------------
+
+
+class _FlakyCall:
+    """Callable raising the given exceptions in order, then returning a value."""
+
+    def __init__(self, failures: list[Exception], value: str = "ok"):
+        self.failures = list(failures)
+        self.value = value
+        self.calls = 0
+
+    def __call__(self) -> str:
+        self.calls += 1
+        if self.failures:
+            raise self.failures.pop(0)
+        return self.value
+
+
+@pytest.fixture
+def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    recorded: list[float] = []
+    monkeypatch.setattr(review.time, "sleep", recorded.append)
+    return recorded
+
+
+class TestCallWithRetries:
+    def test_default_retries_transient_once(self, sleeps: list[float]):
+        call = _FlakyCall([ProviderHiccup("x")])
+        assert _call_with_retries(call, label="t", retries=0) == "ok"
+        assert call.calls == 2
+        assert sleeps == [2.0]
+
+    def test_default_gives_up_after_second_transient(self, sleeps: list[float]):
+        call = _FlakyCall([TransportError("x"), TransportError("y")])
+        with pytest.raises(TransportError):
+            _call_with_retries(call, label="t", retries=0)
+        assert call.calls == 2
+        assert sleeps == [2.0]
+
+    def test_default_never_retries_rate_limit(self, sleeps: list[float]):
+        call = _FlakyCall([RateLimit("x")])
+        with pytest.raises(RateLimit):
+            _call_with_retries(call, label="t", retries=0)
+        assert call.calls == 1
+        assert sleeps == []
+
+    def test_extra_retries_backoff_sequence(self, sleeps: list[float]):
+        call = _FlakyCall([TransportError("a"), TransportError("b"), TransportError("c")])
+        assert _call_with_retries(call, label="t", retries=2) == "ok"
+        assert call.calls == 4
+        assert sleeps == [2.0, 4.0, 8.0]
+
+    def test_rate_limit_sleeps_retry_after(self, sleeps: list[float]):
+        err = RateLimit("x")
+        err.retry_after_seconds = 5.0
+        call = _FlakyCall([err])
+        assert _call_with_retries(call, label="t", retries=1) == "ok"
+        assert sleeps == [5.0]
+
+    def test_rate_limit_defaults_to_60s_without_header(self, sleeps: list[float]):
+        call = _FlakyCall([RateLimit("x")])
+        assert _call_with_retries(call, label="t", retries=1) == "ok"
+        assert sleeps == [60.0]
+
+    def test_rate_limit_sleep_clamped_with_warn(
+        self, sleeps: list[float], capsys: pytest.CaptureFixture
+    ):
+        err = RateLimit("x")
+        err.retry_after_seconds = 86400.0
+        call = _FlakyCall([err])
+        assert _call_with_retries(call, label="t", retries=1) == "ok"
+        assert sleeps == [review.MAX_RETRY_SLEEP]
+        assert "WARN:" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "exc",
+        [ConfigError("x"), SafetyRefusal("x"), ContextOverflow("x")],
+    )
+    def test_never_retried_categories(self, sleeps: list[float], exc: ReviewError):
+        call = _FlakyCall([exc])
+        with pytest.raises(type(exc)):
+            _call_with_retries(call, label="t", retries=5)
+        assert call.calls == 1
+        assert sleeps == []
+
+
+# ---------------------------------------------------------------------------
+# Injection guard, severity filter, usage line, output file
+# ---------------------------------------------------------------------------
+
+
+class TestInjectionGuard:
+    def test_default_context_carries_guard(self):
+        out = _apply_context("PROMPT", review.DEFAULT_CONTEXT)
+        assert INJECTION_GUARD in out
+        assert out.index(INJECTION_GUARD) < out.index("</CONTEXT_FOR_REVIEWER>")
+
+    def test_custom_context_carries_guard_too(self):
+        out = _apply_context("PROMPT", "my project context")
+        assert "my project context" in out
+        assert INJECTION_GUARD in out
+
+    def test_no_context_disables_guard(self):
+        assert _apply_context("PROMPT", None) == "PROMPT"
+
+
+class TestMinSeverityInstruction:
+    def test_low_is_empty(self):
+        assert _min_severity_instruction("LOW") == ""
+
+    def test_high_lists_kept_levels(self):
+        text = _min_severity_instruction("HIGH")
+        assert "<SEVERITY_FILTER>" in text
+        assert "HIGH or higher" in text
+        assert "HIGH, CRITICAL" in text
+
+    def test_critical_keeps_only_critical(self):
+        text = _min_severity_instruction("CRITICAL")
+        assert "CRITICAL or higher (CRITICAL)" in text
+
+
+class TestFormatUsageLine:
+    def test_both_counts(self):
+        line = _format_usage_line(
+            CallResult("x", prompt_tokens=48210, completion_tokens=1533),
+            "openrouter",
+            "google/gemini-2.5-pro",
+        )
+        assert line == (
+            "[usage] prompt=48,210 completion=1,533 total=49,743 tokens "
+            "(openrouter/google/gemini-2.5-pro)"
+        )
+
+    def test_no_usage_returns_none(self):
+        assert _format_usage_line(CallResult("x"), "p", "m") is None
+
+    def test_partial_usage_skips_total(self):
+        line = _format_usage_line(
+            CallResult("x", prompt_tokens=100), "p", "m"
+        )
+        assert line is not None
+        assert "completion=?" in line
+        assert "total" not in line
+
+
+class TestUsageInt:
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [(42, 42), (0, 0), (True, None), ("42", None), (None, None), (4.2, None)],
+    )
+    def test_coercion(self, value: object, expected: int | None):
+        assert _usage_int(value) == expected
+
+
+class TestWriteOutputFile:
+    def test_writes_utf8_lf(self, tmp_path):
+        target = tmp_path / "review.md"
+        _write_output_file("café\nline2\n", str(target))
+        raw = target.read_bytes()
+        assert raw == "café\nline2\n".encode("utf-8")
+        assert b"\r" not in raw
+
+    def test_unwritable_path_raises_config_error(self, tmp_path):
+        with pytest.raises(ConfigError):
+            _write_output_file("x", str(tmp_path))  # a directory, not a file
+
+
+# ---------------------------------------------------------------------------
+# Dry-run report
+# ---------------------------------------------------------------------------
+
+
+def _settings(**overrides) -> Settings:
+    base = dict(
+        provider="openrouter",
+        model="google/gemini-2.5-pro",
+        temperature=0.3,
+        max_tokens=16000,
+        retries=0,
+        min_severity="LOW",
+        context=None,
+        output=None,
+    )
+    base.update(overrides)
+    return Settings(**base)
+
+
+class TestDryRunReport:
+    def test_diff_mode_fields(self):
+        request = ReviewRequest(
+            system_prompt="S" * 100,
+            user_prompt="U" * 300,
+            mode="diff",
+            payload_chars=250,
+        )
+        report = _dry_run_report(_settings(), request)
+        assert "DRY RUN" in report
+        assert "provider:          openrouter" in report
+        assert "mode:              diff" in report
+        assert "est_prompt_tokens: ~100" in report
+        assert "files:" not in report
+
+    def test_codebase_mode_lists_files(self, tmp_path):
+        f = tmp_path / "a.py"
+        f.write_text("x = 1\n", encoding="utf-8")
+        request = ReviewRequest(
+            system_prompt="S",
+            user_prompt="U",
+            mode="codebase",
+            payload_chars=6,
+            files=[f],
+        )
+        report = _dry_run_report(_settings(), request)
+        assert "files:             1" in report
+        assert "a.py" in report
+
+    def test_ollama_window_line(self):
+        request = ReviewRequest("S", "U", "diff", 1)
+        report = _dry_run_report(
+            _settings(provider="ollama"), request,
+            ollama_window="4,096 tokens (advisory-default)",
+        )
+        assert "ollama_window:     4,096 tokens (advisory-default)" in report
