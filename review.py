@@ -64,6 +64,7 @@ import subprocess
 import sys
 import time
 import tomllib
+import traceback
 from pathlib import Path
 from typing import Callable, TypeVar
 
@@ -168,7 +169,10 @@ class ContextOverflow(ReviewError):
         "Narrow the diff scope: ``--include`` / ``--exclude`` in codebase "
         "mode, or a smaller ``--base`` ref in diff mode. Do not retry "
         "without reducing scope -- a second call with the same payload "
-        "will hit the same limit."
+        "will hit the same limit. Exception: if the message says "
+        "max_tokens was hit before any content appeared (reasoning "
+        "models can spend the whole budget thinking), raise "
+        "``--max-tokens`` instead of narrowing scope."
     )
 
 
@@ -218,7 +222,9 @@ class TransportError(ReviewError):
 # refusals on our own PRs.
 
 DEFAULT_CONTEXT = (
-    "The diff below is from a legitimate software-engineering project "
+    # "code below" not "diff below": the same prefix is used by both diff
+    # mode and --codebase mode (where the payload is a file bundle).
+    "The code below is from a legitimate software-engineering project "
     "undergoing authorized code review. The code may include defensive "
     "security measures, adversarial test fixtures, policy enforcement "
     "logic, or domain language that looks adversarial in isolation "
@@ -265,6 +271,25 @@ HTTP_TIMEOUT = 300.0  # Gemini 2.5 Pro on a ~5K-line diff lands ~30-60s; pad
 # for that worst case, so Ollama gets its own ceiling. Override with
 # $OLLAMA_TIMEOUT if you're on slower hardware or running larger models.
 DEFAULT_OLLAMA_TIMEOUT = 1800.0  # 30 minutes
+
+# Ollama context-window guard. Unlike the cloud providers -- which return
+# a 4xx when the prompt exceeds the model's context -- Ollama silently
+# TRUNCATES a prompt that doesn't fit the loaded context window
+# (``num_ctx``) and generates from whatever survived. For a code review
+# that's the worst failure mode: the model reviews a fragment of the
+# diff, returns exit 0, and the output looks like a legitimate "few
+# issues found" review. The OpenAI-compatible endpoint has no way to
+# pass ``num_ctx`` per request, so the runner can't widen the window
+# itself; instead it refuses pre-flight (typed CONTEXT_OVERFLOW) when
+# the prompt likely exceeds the window.
+#
+# Stock Ollama loads models with a 4096-token context unless the server
+# was started with ``OLLAMA_CONTEXT_LENGTH`` or the model's Modelfile
+# sets ``num_ctx``. If you've raised the server-side window, set
+# ``$OLLAMA_NUM_CTX`` to the same value so the runner's guard matches.
+# Token estimate is the standard ~4 chars/token.
+DEFAULT_OLLAMA_NUM_CTX = 4096
+OLLAMA_CHARS_PER_TOKEN = 4
 
 # Sampling temperature for the model. History of this constant:
 #
@@ -335,7 +360,7 @@ MODEL_ALIASES_BY_PROVIDER: dict[str, dict[str, str]] = {
         # quality/speed sweet spot on CPU because active param count
         # drives inference speed, not total params). ``local-pro`` is
         # the larger MoE (80B/3B active) for users who want higher
-        # quality and can spare the disk (~40 GB) for marginal speed
+        # quality and can spare the disk (~52 GB) for marginal speed
         # cost. Users who haven't pulled a given tag get a typed
         # ConfigError from ``call_ollama`` pointing them at the right
         # ``ollama pull`` command.
@@ -415,7 +440,12 @@ BUILTIN_CODEBASE_EXCLUDES: tuple[str, ...] = (
     # Minified / generated bundles.
     "*.min.js",
     "*.min.css",
-    # Build outputs occasionally tracked by mistake.
+    # Build outputs occasionally tracked by mistake. Both spellings are
+    # needed: fnmatch's ``*`` can match the empty string but the literal
+    # ``/`` in ``*/dist/*`` cannot, so ``dist/bundle.js`` at the repo
+    # root only matches the un-prefixed variant.
+    "dist/*",
+    "build/*",
     "*/dist/*",
     "*/build/*",
     # Binary / asset extensions: skip outright (model can't review).
@@ -562,6 +592,14 @@ def _run_git(args: list[str]) -> str:
             encoding="utf-8",
             errors="replace",
         )
+    except FileNotFoundError as exc:
+        # Same typed-error contract as ``pr_diff`` gives missing ``gh``:
+        # a raw FileNotFoundError traceback would break the documented
+        # ``ERROR: <CATEGORY> [exit <N>]`` stderr contract.
+        raise ConfigError(
+            "`git` not found on PATH. Install git (or fix PATH) to use "
+            "the diff / codebase modes.",
+        ) from exc
     except subprocess.CalledProcessError as exc:
         # Raise a typed error rather than ``sys.exit(exc.returncode)``
         # so an LLM caller sees the documented ``ERROR: CONFIG [exit 2]``
@@ -776,6 +814,7 @@ def _classify_http_error(
     *,
     model: str,
     provider: str,
+    retry_after: str | None = None,
 ) -> ReviewError:
     """Map a 4xx/5xx response to the right typed error.
 
@@ -785,22 +824,37 @@ def _classify_http_error(
     that doesn't match any pattern, and that's fine: it falls through to
     a generic ``ReviewError`` which surfaces as exit 1 with the response
     body in ``detail`` so a caller can decide.
+
+    Order matters: the 5xx check runs BEFORE the substring match so a
+    provider-side failure page that happens to contain a phrase like
+    "too long" or "token limit" stays a retryable TRANSPORT error
+    instead of being misclassified as a do-not-retry CONTEXT_OVERFLOW.
     """
     body_lower = body.lower()
     if status == 429:
+        wait_hint = (
+            f" (Retry-After: {retry_after}s)" if retry_after else ""
+        )
         return RateLimit(
-            f"{provider} returned HTTP 429",
+            f"{provider} returned HTTP 429{wait_hint}",
             detail=body[:1000],
             model=model,
             provider=provider,
         )
-    # Match the family of provider phrases that signal context-length
-    # overflow, kept as a tuple so adding a new variant is a one-line
-    # edit. Each phrase was added based on an actual provider response
-    # observed in the wild or in published vendor docs; do not add
-    # speculative phrases without verifying a provider uses them, or
-    # you risk false-positive ContextOverflow classifications on
-    # unrelated 4xx errors.
+    if 500 <= status < 600:
+        return TransportError(
+            f"{provider} returned HTTP {status} (provider-side failure)",
+            detail=body[:1000],
+            model=model,
+            provider=provider,
+        )
+    # 4xx only from here down. Match the family of provider phrases that
+    # signal context-length overflow, kept as a tuple so adding a new
+    # variant is a one-line edit. Each phrase was added based on an
+    # actual provider response observed in the wild or in published
+    # vendor docs; do not add speculative phrases without verifying a
+    # provider uses them, or you risk false-positive ContextOverflow
+    # classifications on unrelated 4xx errors.
     CONTEXT_OVERFLOW_PHRASES = (
         "context_length",
         "too long",
@@ -816,19 +870,31 @@ def _classify_http_error(
             model=model,
             provider=provider,
         )
-    if 500 <= status < 600:
-        return TransportError(
-            f"{provider} returned HTTP {status} (provider-side failure)",
-            detail=body[:1000],
-            model=model,
-            provider=provider,
-        )
     return ReviewError(
         f"{provider} returned HTTP {status}",
         detail=body[:1000],
         model=model,
         provider=provider,
     )
+
+
+def _warn_if_truncated(hit_token_ceiling: bool, max_tokens: int, provider: str) -> None:
+    """Warn on stderr when the model returned content but stopped at the
+    ``max_tokens`` ceiling.
+
+    Without this, a review cut off mid-finding is indistinguishable from
+    a complete one: the runner exits 0 and an LLM caller parses the
+    partial findings list as if it were the whole review. Truncation with
+    non-empty content is a warning rather than an error because the
+    partial output is still useful; empty content at the ceiling stays a
+    hard ContextOverflow in the provider callers.
+    """
+    if hit_token_ceiling:
+        sys.stderr.write(
+            f"WARN: {provider} output was truncated at max_tokens="
+            f"{max_tokens}; the review below may be incomplete. "
+            "Re-run with a higher --max-tokens for full output.\n"
+        )
 
 
 def call_openrouter(
@@ -889,7 +955,11 @@ def call_openrouter(
 
     if response.status_code >= 400:
         raise _classify_http_error(
-            response.status_code, response.text, model=model, provider="openrouter"
+            response.status_code,
+            response.text,
+            model=model,
+            provider="openrouter",
+            retry_after=response.headers.get("retry-after"),
         )
 
     try:
@@ -926,6 +996,11 @@ def call_openrouter(
     content = message.get("content")
 
     if content:
+        _warn_if_truncated(
+            bool(finish_reasons & {"length", "max_tokens"}),
+            max_tokens,
+            "openrouter",
+        )
         return content
 
     # Null / empty content -- classify by the union of finish_reasons.
@@ -1001,7 +1076,11 @@ def call_gemini(
 
     if response.status_code >= 400:
         raise _classify_http_error(
-            response.status_code, response.text, model=model, provider="gemini"
+            response.status_code,
+            response.text,
+            model=model,
+            provider="gemini",
+            retry_after=response.headers.get("retry-after"),
         )
 
     try:
@@ -1041,6 +1120,7 @@ def call_gemini(
     text = "".join(part.get("text", "") for part in parts)
 
     if text:
+        _warn_if_truncated(finish_reason == "MAX_TOKENS", max_tokens, "gemini")
         return text
 
     # Null / empty content -- classify by finishReason.
@@ -1065,6 +1145,52 @@ def call_gemini(
         model=model,
         provider="gemini",
     )
+
+
+def _normalize_ollama_host(host: str) -> str:
+    """Return ``host`` as a scheme-qualified base URL.
+
+    Ollama's own convention for ``$OLLAMA_HOST`` is scheme-less
+    ``host:port`` (e.g. ``0.0.0.0:11434`` -- the exact form WSL / remote
+    users already have exported for the ``ollama`` CLI). Passed to httpx
+    verbatim, that raises ``UnsupportedProtocol``, which is a
+    ``RequestError`` subclass -- so it would be misclassified as a
+    retryable TRANSPORT error when the real problem is config. Prepending
+    ``http://`` when no scheme is present accepts both conventions.
+    Trailing slashes are stripped so path-joining with
+    ``OLLAMA_CHAT_PATH`` can't produce ``//``.
+    """
+    host = host.strip()
+    if "://" not in host:
+        host = f"http://{host}"
+    return host.rstrip("/")
+
+
+def _ollama_prompt_guard(prompt_chars: int, num_ctx: int, *, model: str) -> None:
+    """Raise ``ContextOverflow`` when the prompt likely exceeds Ollama's
+    loaded context window.
+
+    Ollama silently truncates prompts that don't fit ``num_ctx`` and
+    generates from the fragment that survived -- no error, exit 0, and a
+    plausible-looking review of a fraction of the code. Refusing
+    pre-flight with a typed error is the only reliable defense, because
+    the OpenAI-compatible endpoint offers no per-request ``num_ctx``
+    control. See ``DEFAULT_OLLAMA_NUM_CTX`` for the default rationale.
+    """
+    approx_tokens = prompt_chars // OLLAMA_CHARS_PER_TOKEN
+    if approx_tokens >= num_ctx:
+        raise ContextOverflow(
+            f"Prompt is ~{approx_tokens:,} tokens ({prompt_chars:,} chars) "
+            f"but the Ollama context-window guard is {num_ctx:,} tokens. "
+            "Ollama silently truncates oversized prompts, which would "
+            "produce a review of only a fragment of the code. Either "
+            "narrow the scope (--include / --exclude / smaller --base), "
+            "or raise the server's window (start Ollama with "
+            "OLLAMA_CONTEXT_LENGTH=<tokens>) and set $OLLAMA_NUM_CTX to "
+            "the same value so this guard matches.",
+            model=model,
+            provider="ollama",
+        )
 
 
 def call_ollama(
@@ -1177,7 +1303,11 @@ def call_ollama(
 
     if response.status_code >= 400:
         raise _classify_http_error(
-            response.status_code, response.text, model=model, provider="ollama"
+            response.status_code,
+            response.text,
+            model=model,
+            provider="ollama",
+            retry_after=response.headers.get("retry-after"),
         )
 
     try:
@@ -1204,6 +1334,9 @@ def call_ollama(
     content = message.get("content")
 
     if content:
+        _warn_if_truncated(
+            finish_reason in {"length", "max_tokens"}, max_tokens, "ollama"
+        )
         return content
 
     # Null / empty content. Ollama doesn't have content-filter / safety
@@ -1415,8 +1548,8 @@ def main() -> None:
             "generateContent endpoint directly and needs ``GEMINI_API_KEY``. "
             "``ollama`` posts to a local Ollama server's OpenAI-compatible "
             "endpoint (no API key; configure with ``--ollama-host`` / "
-            "$OLLAMA_HOST / $OLLAMA_MODEL / $OLLAMA_TIMEOUT). "
-            "Override with $CODE_REVIEW_PROVIDER."
+            "$OLLAMA_HOST / $OLLAMA_MODEL / $OLLAMA_TIMEOUT / "
+            "$OLLAMA_NUM_CTX). Override with $CODE_REVIEW_PROVIDER."
         ),
     )
     parser.add_argument(
@@ -1576,6 +1709,7 @@ def main() -> None:
     api_key: str | None = None
     ollama_host: str | None = None
     ollama_timeout: float | None = None
+    ollama_num_ctx: int | None = None
 
     if args.provider == "openrouter":
         api_key = os.getenv("OPENROUTER_API_KEY")
@@ -1600,11 +1734,28 @@ def main() -> None:
         # CLI / env / default. Validation of the host URL is implicit
         # in the call -- a bad URL produces a typed ConnectError-derived
         # ConfigError from ``call_ollama`` with a clear message.
-        ollama_host = (
+        ollama_host = _normalize_ollama_host(
             args.ollama_host
             or os.getenv("OLLAMA_HOST")
             or DEFAULT_OLLAMA_HOST
         )
+        env_num_ctx = os.getenv("OLLAMA_NUM_CTX")
+        try:
+            ollama_num_ctx = (
+                int(env_num_ctx) if env_num_ctx is not None
+                else DEFAULT_OLLAMA_NUM_CTX
+            )
+        except ValueError as exc:
+            raise ConfigError(
+                f"$OLLAMA_NUM_CTX={env_num_ctx!r} is not a valid integer "
+                "(tokens). Set it to the context window your Ollama "
+                "server loads models with (OLLAMA_CONTEXT_LENGTH), or "
+                f"unset it to use the default ({DEFAULT_OLLAMA_NUM_CTX})."
+            ) from exc
+        if ollama_num_ctx <= 0:
+            raise ConfigError(
+                f"$OLLAMA_NUM_CTX={ollama_num_ctx} must be positive (tokens)."
+            )
         env_timeout = os.getenv("OLLAMA_TIMEOUT")
         try:
             ollama_timeout = (
@@ -1736,12 +1887,20 @@ def main() -> None:
             label="gemini",
         )
     else:  # ollama
-        # ollama_host and ollama_timeout are non-None here -- the
-        # config-check block above sets defaults if they weren't
+        # ollama_host / ollama_timeout / ollama_num_ctx are non-None here
+        # -- the config-check block above sets defaults if they weren't
         # provided. The assertions document that for readers and
         # narrow the type for the lambda closure.
         assert ollama_host is not None
         assert ollama_timeout is not None
+        assert ollama_num_ctx is not None
+        # Pre-flight context-window guard: refuse (typed CONTEXT_OVERFLOW)
+        # rather than let Ollama silently truncate the prompt and review
+        # a fragment. Cloud providers don't need this -- they 4xx on
+        # oversized prompts instead of truncating.
+        _ollama_prompt_guard(
+            len(system_prompt) + len(user_prompt), ollama_num_ctx, model=model
+        )
         output = _retry_on_recoverable(
             lambda: call_ollama(
                 system_prompt=system_prompt,
@@ -1766,6 +1925,20 @@ def _entrypoint() -> None:
     try:
         main()
     except ReviewError as err:
+        _print_error(err)
+        sys.exit(err.exit_code)
+    except KeyboardInterrupt:
+        sys.stderr.write("Interrupted.\n")
+        sys.exit(130)
+    except Exception as exc:
+        # Honor the README's stderr contract (``ERROR: UNKNOWN [exit 1]``)
+        # even for unexpected bugs, so an LLM caller can classify the
+        # failure without parsing a raw traceback. The traceback still
+        # ships in the Detail line for humans debugging the runner.
+        err = ReviewError(
+            f"unhandled {type(exc).__name__}: {exc}",
+            detail=traceback.format_exc(),
+        )
         _print_error(err)
         sys.exit(err.exit_code)
 
