@@ -412,6 +412,16 @@ A hostile diff can contain text aimed at the *reviewer* rather than the compiler
 
 No prompt-level guard is airtight. When reviewing untrusted PRs (`--pr` against a fork you don't control), treat the review as advisory, and never auto-apply suggested changes from it.
 
+## Non-goals
+
+Deliberate boundaries, so contributions and reviews don't relitigate them:
+
+- **Not an agent.** One deterministic request per model per chunk; no tool-calling loops, no letting the model run git, no auto-applying suggested fixes. The tool's value is a hard contract (typed exits, stable stderr, predictable cost) that agents and scripts compose — the moment it gets agentic it competes with Claude Code / gemini-cli and loses the predictability that makes it worth calling from them.
+- **Upstream prompts are never edited.** `skills/code-review-commons/SKILL.md` and `commands/code-review.toml` stay byte-identical to upstream. Fork-owned prompt content is appended at runtime in Python or lives in fork-added files. Structured output is recovered by *parsing*, never by prompting for JSON.
+- **Thin dependency surface.** `httpx` + `python-dotenv`, stdlib for everything else. No Pydantic (isinstance guards at the JSON boundaries suffice), no Typer/Rich, no platformdirs. Every dependency is an upgrade treadmill this single-file-at-heart tool doesn't need.
+- **Curated alias tables stay small.** Aliases are for models that earned a place as second-opinion reviewers; everything else works via raw `--model` slugs.
+- **API keys come from the environment only** — never from per-project config, which lives in potentially untrusted repos.
+
 ## Error model (for LLM callers)
 
 If you're an LLM agent calling this tool in a loop, here's the contract.

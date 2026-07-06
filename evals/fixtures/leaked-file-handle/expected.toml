@@ -1,0 +1,11 @@
+# Planted bug: the with-block was replaced by manual open/close, and the
+# validation raise happens between them -- a failing record leaks the
+# handle (and leaves a truncated/empty file behind on Windows).
+
+[[bug]]
+file = "exporter.py"
+line_range = [4, 12]
+keywords = [
+    "leak", "not closed", "unclosed", "context manager", "with open",
+    "with statement", "finally", "resource", "close", "exception",
+]

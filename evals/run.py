@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Eval harness: run the reviewer against planted-bug fixtures and score it.
+
+Turns temperature / model tuning from anecdote into data. Each fixture
+under ``evals/fixtures/<name>/`` is a ``diff.patch`` with known planted
+bugs described in ``expected.toml`` (``[[bug]]`` entries with a target
+file, an approximate line range, and a keyword list). A planted bug
+counts as CAUGHT when any finding names the right file and mentions any
+keyword in its title+body; findings matching no planted bug count as
+noise (potential false positives -- some may be legitimate extra
+findings, so read them before drawing conclusions).
+
+Costs real tokens: the harness prints the planned call count and asks
+for confirmation unless --yes is passed.
+
+    uv run evals/run.py --model flash
+    uv run evals/run.py --model pro --model claude --temperature 0.3 --temperature 0.5
+    uv run evals/run.py --fixture off-by-one --model flash --yes
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+EVALS_DIR = Path(__file__).parent
+REPO_ROOT = EVALS_DIR.parent
+FIXTURES_DIR = EVALS_DIR / "fixtures"
+
+
+def discover_fixtures(only: list[str]) -> list[Path]:
+    fixtures = sorted(
+        d for d in FIXTURES_DIR.iterdir()
+        if (d / "diff.patch").is_file() and (d / "expected.toml").is_file()
+    )
+    if only:
+        wanted = set(only)
+        fixtures = [f for f in fixtures if f.name in wanted]
+        missing = wanted - {f.name for f in fixtures}
+        if missing:
+            sys.exit(f"unknown fixture(s): {', '.join(sorted(missing))}")
+    return fixtures
+
+
+def run_review(fixture: Path, model: str, temperature: float) -> dict:
+    """Invoke the runner on a fixture diff; return the JSON envelope."""
+    cmd = [
+        sys.executable, str(REPO_ROOT / "review.py"),
+        "--diff-file", str(fixture / "diff.patch"),
+        "--format", "json",
+        "--model", model,
+        "--temperature", str(temperature),
+    ]
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8",
+        errors="replace", cwd=REPO_ROOT,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"review exited {result.returncode} for {fixture.name}:\n"
+            f"{result.stderr.strip()[-500:]}"
+        )
+    return json.loads(result.stdout)
+
+
+def score(envelope: dict, expected: dict) -> tuple[int, int, int]:
+    """Return (bugs_caught, bugs_total, noise_findings)."""
+    findings = envelope.get("findings") or []
+    bugs = expected.get("bug") or []
+    matched_findings: set[int] = set()
+    caught = 0
+    for bug in bugs:
+        for idx, finding in enumerate(findings):
+            if idx in matched_findings:
+                continue
+            if finding.get("file") != bug["file"]:
+                continue
+            haystack = f"{finding.get('title', '')} {finding.get('body', '')}".lower()
+            if any(keyword.lower() in haystack for keyword in bug["keywords"]):
+                caught += 1
+                matched_findings.add(idx)
+                break
+    noise = len(findings) - len(matched_findings)
+    return caught, len(bugs), noise
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--model", action="append", default=[], metavar="SLUG",
+        help="Model slug/alias; repeatable. Default: flash (cheap).",
+    )
+    parser.add_argument(
+        "--temperature", action="append", type=float, default=[],
+        metavar="T", help="Temperature; repeatable. Default: 0.3.",
+    )
+    parser.add_argument(
+        "--fixture", action="append", default=[], metavar="NAME",
+        help="Run only this fixture; repeatable. Default: all.",
+    )
+    parser.add_argument(
+        "--yes", action="store_true",
+        help="Skip the cost confirmation prompt.",
+    )
+    args = parser.parse_args()
+
+    models = args.model or ["flash"]
+    temperatures = args.temperature or [0.3]
+    fixtures = discover_fixtures(args.fixture)
+    if not fixtures:
+        sys.exit("no fixtures found")
+
+    total_calls = len(fixtures) * len(models) * len(temperatures)
+    print(
+        f"{len(fixtures)} fixture(s) x {len(models)} model(s) x "
+        f"{len(temperatures)} temperature(s) = {total_calls} paid API call(s)"
+    )
+    if not args.yes:
+        answer = input("proceed? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            sys.exit("aborted")
+
+    rows = []
+    for model in models:
+        for temperature in temperatures:
+            for fixture in fixtures:
+                expected = tomllib.loads(
+                    (fixture / "expected.toml").read_text(encoding="utf-8-sig")
+                )
+                try:
+                    envelope = run_review(fixture, model, temperature)
+                except RuntimeError as exc:
+                    print(f"ERROR {fixture.name} [{model} T={temperature}]: {exc}")
+                    rows.append((model, temperature, fixture.name, "ERR", "-", "-"))
+                    continue
+                caught, total, noise = score(envelope, expected)
+                rows.append(
+                    (model, temperature, fixture.name,
+                     f"{caught}/{total}", str(noise),
+                     "ok" if envelope.get("parse_ok") else "parse_fail")
+                )
+
+    print()
+    header = ("model", "T", "fixture", "recall", "noise", "parse")
+    widths = [
+        max(len(str(row[i])) for row in [header, *rows]) for i in range(6)
+    ]
+    for row in [header, *rows]:
+        print("  ".join(str(cell).ljust(widths[i]) for i, cell in enumerate(row)))
+
+    caught_total = sum(
+        int(r[3].split("/")[0]) for r in rows if r[3] not in ("ERR",)
+    )
+    bugs_total = sum(
+        int(r[3].split("/")[1]) for r in rows if r[3] not in ("ERR",)
+    )
+    if bugs_total:
+        print(f"\noverall recall: {caught_total}/{bugs_total}")
+
+
+if __name__ == "__main__":
+    main()

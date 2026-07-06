@@ -3626,10 +3626,7 @@ def _build_request(args: argparse.Namespace, settings: Settings) -> ReviewReques
                 "WARN: --include / --exclude are ignored outside "
                 "--codebase mode.\n"
             )
-        if args.pr:
-            diff = pr_diff(args.pr)
-        else:
-            diff = git_diff_local(args.base, args.staged)
+        diff = _read_diff_source(args)
         if not diff.strip():
             sys.stderr.write("No diff found. Nothing to review.\n")
             sys.exit(0)
@@ -3724,10 +3721,7 @@ def _build_requests(args: argparse.Namespace, settings: Settings) -> list[Review
             )
         return requests
 
-    if args.pr:
-        diff = pr_diff(args.pr)
-    else:
-        diff = git_diff_local(args.base, args.staged)
+    diff = _read_diff_source(args)
     if not diff.strip():
         sys.stderr.write("No diff found. Nothing to review.\n")
         sys.exit(0)
@@ -3745,6 +3739,24 @@ def _build_requests(args: argparse.Namespace, settings: Settings) -> list[Review
             )
         )
     return requests
+
+
+def _read_diff_source(args: argparse.Namespace) -> str:
+    """Fetch the diff for the active diff mode (git, gh, file, or stdin)."""
+    if args.diff_file is not None:
+        if args.diff_file == "-":
+            return sys.stdin.read()
+        try:
+            # utf-8-sig: tolerate Windows-editor BOMs like the other
+            # user-supplied files.
+            return Path(args.diff_file).read_text(encoding="utf-8-sig")
+        except OSError as exc:
+            raise ConfigError(
+                f"Cannot read --diff-file {args.diff_file!r}: {exc}"
+            ) from exc
+    if args.pr:
+        return pr_diff(args.pr)
+    return git_diff_local(args.base, args.staged)
 
 
 def _validate_flag_combos(args: argparse.Namespace) -> None:
@@ -3775,6 +3787,11 @@ def _validate_flag_combos(args: argparse.Namespace) -> None:
         raise ConfigError(
             "--full-files applies to diff modes only; --codebase already "
             "sends full file content."
+        )
+    if args.full_files and args.diff_file is not None:
+        raise ConfigError(
+            "--full-files needs the diff to come from this working tree "
+            "(git/gh); a --diff-file diff has no local files to reference."
         )
 
 
@@ -4075,6 +4092,17 @@ def main() -> None:
         "--staged",
         action="store_true",
         help="Review staged changes only.",
+    )
+    source.add_argument(
+        "--diff-file",
+        default=None,
+        metavar="PATH",
+        dest="diff_file",
+        help=(
+            "Review a unified diff read from this file instead of "
+            "invoking git ('-' reads stdin). Powers the eval harness "
+            "and lets other tools hand the runner a diff directly."
+        ),
     )
     source.add_argument(
         "--codebase",

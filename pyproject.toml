@@ -29,7 +29,24 @@ packages = ["code_review"]
 [dependency-groups]
 dev = [
     "pytest>=8",
+    "ruff>=0.6",
+    "mypy>=1.10",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+extend-exclude = ["tests/fixtures"]
+
+[tool.ruff.lint]
+# Defaults (pyflakes + pycodestyle errors) plus import hygiene. The
+# heavily-commented style means long prose comments are fine; E501 is
+# enforced only on code lines via the formatter's line-length.
+extend-select = ["I"]
+
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+files = ["code_review"]

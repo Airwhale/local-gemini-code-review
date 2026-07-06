@@ -163,7 +163,7 @@ class TestChangedFilePaths:
 def _combo_args(**overrides) -> argparse.Namespace:
     base = dict(
         chunk=False, models=None, full_files=False,
-        baseline=None, codebase=False,
+        baseline=None, codebase=False, diff_file=None,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -177,6 +177,7 @@ class TestFlagCombos:
             dict(chunk=True, full_files=True),
             dict(chunk=True, baseline="r.json"),
             dict(full_files=True, codebase=True),
+            dict(full_files=True, diff_file="d.patch"),
         ],
     )
     def test_rejected_pairs(self, kwargs: dict):

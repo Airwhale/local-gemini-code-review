@@ -1,0 +1,22 @@
+diff --git a/pagination.py b/pagination.py
+index 1111111..2222222 100644
+--- a/pagination.py
++++ b/pagination.py
+@@ -1,12 +1,15 @@
+ def paginate(items, page_size):
+     """Split items into pages of page_size."""
+     pages = []
+-    for start in range(0, len(items), page_size):
+-        pages.append(items[start:start + page_size])
++    total_pages = len(items) // page_size
++    for page_number in range(total_pages):
++        start = page_number * page_size
++        pages.append(items[start:start + page_size])
+     return pages
+
+
+ def last_page(items, page_size):
+     """Return the final page."""
+-    return paginate(items, page_size)[-1]
++    pages = paginate(items, page_size)
++    return pages[-1]
