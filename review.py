@@ -60,7 +60,10 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import fnmatch
+import hashlib
+import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -1679,6 +1682,513 @@ def _resolve_model(args: argparse.Namespace) -> str:
     return model
 
 
+# ---------------------------------------------------------------------------
+# Structured output: markdown findings parser (--format json / --baseline)
+# ---------------------------------------------------------------------------
+#
+# The prompts stay byte-identical to upstream; structure is recovered by
+# DETERMINISTICALLY parsing the rigid markdown the OUTPUT templates
+# mandate (`# ... summary:`, `## File: path`, `### L<N>: [SEV] title`).
+# The parser is deliberately tolerant: real models drift from the
+# template in observed ways (diff-anchored `### L+117:` headings from
+# deepseek, ```diff-tagged suggestion fences), each of which is handled
+# below and pinned by fixtures in tests/fixtures/. Parse failure must
+# never destroy a paid-for review: the wrapper degrades to
+# ``parse_ok=False`` with the raw markdown embedded in the envelope.
+
+_SUMMARY_RE = re.compile(
+    r"^#\s+(?:Change|Codebase review)\s+summary:\s*(.*)$", re.I
+)
+_SUMMARY_FALLBACK_RE = re.compile(r"^#\s+.*?summary\s*:?\s*(.*)$", re.I)
+_FILE_RE = re.compile(r"^##\s+File:\s*(.+?)\s*$", re.I)
+_FINDING_RE = re.compile(r"^###\s+(.*)$")
+# Opening fences may carry an info string (```diff); closing fences are
+# backticks-only with at least the opening's backtick count.
+_FENCE_RE = re.compile(r"^\s{0,3}(`{3,})(\S*)\s*$")
+# `\bL\s*[+-]?(\d+)`: accepts L117, L 117, and the diff-anchored L+117 /
+# L-42 forms observed in real model output (the upstream skill tells
+# models to reference `+`/`-` lines, and some transcribe the marker).
+_LINE_TOKEN_RE = re.compile(r"\bL\s*[+-]?(\d+)", re.I)
+_BARE_LINE_RE = re.compile(r"^(\d+)\s*:")
+_SEVERITY_RE = re.compile(r"\[?\s*(CRITICAL|HIGH|MEDIUM|LOW)\s*\]?", re.I)
+# Lead-in tolerates markdown emphasis: **Suggested change:** etc.
+_SUGGESTION_LEADIN_RE = re.compile(
+    r"^[*_]{0,2}Suggested (?:change|fix)[*_]{0,2}:?[*_]{0,2}\s*$", re.I
+)
+_CLEAN_RE = re.compile(r"^No issues found\.", re.M)
+
+
+@dataclasses.dataclass
+class Finding:
+    """One review finding recovered from the model's markdown."""
+
+    file: str | None
+    line: int | None
+    severity: str
+    title: str
+    body: str
+    suggestion: str | None
+
+
+@dataclasses.dataclass
+class ParsedReview:
+    """Result of parsing a review; ``problems`` lists tolerated defects."""
+
+    summary: str | None
+    findings: list[Finding]
+    clean: bool
+    parse_ok: bool
+    problems: list[str]
+
+
+def normalize_title(title: str) -> str:
+    """Normalize a finding title for fingerprinting.
+
+    Lowercase; backticks/quotes stripped (models quote identifiers
+    inconsistently run-to-run); trailing period dropped; whitespace
+    collapsed. Deliberately lossy -- the goal is stability across runs
+    at T=0.3, not readability.
+    """
+    title = title.lower().strip()
+    title = title.replace("`", "").replace('"', "").replace("'", "")
+    title = title.rstrip(".")
+    return " ".join(title.split())
+
+
+def finding_fingerprint(finding: Finding) -> str:
+    """Stable 12-hex-char identity for a finding.
+
+    The line number is deliberately EXCLUDED from the hash: line drift
+    between review rounds is expected (code moves), so proximity is
+    checked separately in ``findings_match``. Hashing the line would
+    make every drifted finding look new.
+    """
+    key = f"{finding.file or ''}|{finding.severity}|{normalize_title(finding.title)}"
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+
+
+def _fingerprints_match(
+    fp_a: str, line_a: int | None, fp_b: str, line_b: int | None
+) -> bool:
+    """Fingerprint equality plus line proximity (±10).
+
+    Either line being ``None`` matches on fingerprint alone -- real
+    models emit line-less findings (observed: deepseek `### L+0:`
+    headings), and refusing to match those would mark the same finding
+    "new" every round.
+    """
+    if fp_a != fp_b:
+        return False
+    if line_a is None or line_b is None:
+        return True
+    return abs(line_a - line_b) <= 10
+
+
+def findings_match(a: Finding, b: Finding) -> bool:
+    """True when two findings are the same issue (see _fingerprints_match)."""
+    return _fingerprints_match(
+        finding_fingerprint(a), a.line, finding_fingerprint(b), b.line
+    )
+
+
+def _parse_finding_heading(
+    heading: str,
+) -> tuple[int | None, str, str, list[str]]:
+    """Extract ``(line, severity, title, problems)`` from a ### heading."""
+    problems: list[str] = []
+    line: int | None = None
+    consumed_end = 0
+
+    line_match = _LINE_TOKEN_RE.search(heading)
+    if line_match:
+        line = int(line_match.group(1))
+        consumed_end = line_match.end()
+    else:
+        bare = _BARE_LINE_RE.match(heading)
+        if bare:
+            line = int(bare.group(1))
+            consumed_end = bare.end()
+    if line == 0:
+        # Diff-position artifact (observed: `### L+0:`); content lines
+        # are 1-indexed, so 0 means "no usable line", not line zero.
+        line = None
+        problems.append(f"line 0 in heading {heading!r} mapped to None")
+    elif line is None:
+        problems.append(f"no line number in heading {heading!r}")
+
+    severity_match = _SEVERITY_RE.search(heading)
+    if severity_match:
+        severity = severity_match.group(1).upper()
+        consumed_end = max(consumed_end, severity_match.end())
+    else:
+        severity = "UNKNOWN"
+        problems.append(f"no severity in heading {heading!r}")
+
+    title = heading[consumed_end:].strip().lstrip(":]-–— ").strip()
+    if not title:
+        title = "(untitled)"
+        problems.append(f"empty title in heading {heading!r}")
+
+    return line, severity, title, problems
+
+
+def _extract_suggestion(body_lines: list[str]) -> tuple[str, str | None]:
+    """Split a finding body into ``(body, suggestion)``.
+
+    Precedence: a fence preceded by a ``Suggested change:`` lead-in
+    always wins. A ``suggestion``/``diff``-tagged fence WITHOUT a
+    lead-in qualifies only when it is the LAST block of the body -- a
+    tagged fence mid-body is the model quoting the reviewed hunk, not
+    proposing a fix, and must stay in the body.
+    """
+
+    def _fence_span(start: int) -> tuple[int, int, str] | None:
+        """Return (open_idx, close_idx, info) for a fence opening at/after
+        ``start`` (skipping blank lines), or None."""
+        i = start
+        while i < len(body_lines) and not body_lines[i].strip():
+            i += 1
+        if i >= len(body_lines):
+            return None
+        opening = _FENCE_RE.match(body_lines[i])
+        if not opening:
+            return None
+        ticks, info = opening.group(1), opening.group(2).lower()
+        for j in range(i + 1, len(body_lines)):
+            closing = _FENCE_RE.match(body_lines[j])
+            if closing and len(closing.group(1)) >= len(ticks) and not closing.group(2):
+                return i, j, info
+        return None
+
+    # Pass 1: explicit lead-in.
+    for idx, line in enumerate(body_lines):
+        if _SUGGESTION_LEADIN_RE.match(line):
+            span = _fence_span(idx + 1)
+            if span is None:
+                continue
+            open_idx, close_idx, _info = span
+            suggestion = "\n".join(body_lines[open_idx + 1 : close_idx])
+            remainder = body_lines[:idx] + body_lines[close_idx + 1 :]
+            return _join_body(remainder), suggestion or None
+
+    # Pass 2: trailing tagged fence.
+    span = None
+    scan = 0
+    while scan < len(body_lines):
+        found = _fence_span(scan)
+        if found is None:
+            scan += 1
+            continue
+        span = found
+        scan = found[1] + 1
+    if span is not None:
+        open_idx, close_idx, info = span
+        trailing = all(not l.strip() for l in body_lines[close_idx + 1 :])
+        if info in {"suggestion", "diff"} and trailing:
+            suggestion = "\n".join(body_lines[open_idx + 1 : close_idx])
+            remainder = body_lines[:open_idx]
+            return _join_body(remainder), suggestion or None
+
+    return _join_body(body_lines), None
+
+
+def _join_body(lines: list[str]) -> str:
+    """Join body lines, trimming leading/trailing blank lines."""
+    text = "\n".join(lines)
+    return text.strip("\n").strip()
+
+
+def parse_review_markdown(text: str) -> ParsedReview:
+    """Parse the model's review markdown into structured findings.
+
+    Line-based state machine, NOT document-level regex: fenced code
+    blocks legally contain ``###`` and ``diff --git`` lines, so headers
+    are only recognized outside fences (tracked with the opening fence's
+    backtick count; a closing fence needs at least as many backticks and
+    no info string).
+    """
+    problems: list[str] = []
+    summary: str | None = None
+    findings: list[Finding] = []
+    heading_count = 0
+    any_unreadable = False
+
+    current_file: str | None = None
+    open_heading: tuple[int | None, str, str] | None = None
+    open_file: str | None = None
+    body_lines: list[str] = []
+
+    in_fence = False
+    fence_ticks = 0
+
+    def _close_finding() -> None:
+        nonlocal open_heading
+        if open_heading is None:
+            return
+        line, severity, title = open_heading
+        body, suggestion = _extract_suggestion(body_lines)
+        findings.append(
+            Finding(
+                file=open_file,
+                line=line,
+                severity=severity,
+                title=title,
+                body=body,
+                suggestion=suggestion,
+            )
+        )
+        open_heading = None
+        body_lines.clear()
+
+    for raw_line in text.splitlines():
+        if in_fence:
+            closing = _FENCE_RE.match(raw_line)
+            if closing and len(closing.group(1)) >= fence_ticks and not closing.group(2):
+                in_fence = False
+            if open_heading is not None:
+                body_lines.append(raw_line)
+            continue
+
+        fence = _FENCE_RE.match(raw_line)
+        if fence:
+            in_fence = True
+            fence_ticks = len(fence.group(1))
+            if open_heading is not None:
+                body_lines.append(raw_line)
+            continue
+
+        summary_match = _SUMMARY_RE.match(raw_line) or _SUMMARY_FALLBACK_RE.match(
+            raw_line
+        )
+        if summary_match and summary is None:
+            _close_finding()
+            summary = summary_match.group(1).strip() or None
+            continue
+
+        file_match = _FILE_RE.match(raw_line)
+        if file_match:
+            _close_finding()
+            path = file_match.group(1).strip().strip("`\"'")
+            # Normalize Windows separators so fingerprints are stable
+            # across platforms and across model quoting styles.
+            current_file = path.replace("\\", "/")
+            continue
+
+        finding_match = _FINDING_RE.match(raw_line)
+        if finding_match:
+            _close_finding()
+            heading_count += 1
+            heading = finding_match.group(1).strip()
+            line, severity, title, heading_problems = _parse_finding_heading(heading)
+            problems.extend(heading_problems)
+            if line is None and severity == "UNKNOWN":
+                any_unreadable = True
+            if current_file is None:
+                problems.append(
+                    f"finding {heading!r} appeared before any '## File:' header"
+                )
+            open_heading = (line, severity, title)
+            open_file = current_file
+            continue
+
+        if open_heading is not None:
+            body_lines.append(raw_line)
+
+    _close_finding()
+
+    if summary is None:
+        problems.append("no summary heading found")
+
+    clean = not findings and bool(_CLEAN_RE.search(text))
+    parse_ok = clean or bool(findings) or (summary is not None and heading_count == 0)
+    if any_unreadable:
+        parse_ok = False
+
+    return ParsedReview(
+        summary=summary,
+        findings=findings,
+        clean=clean,
+        parse_ok=parse_ok,
+        problems=problems,
+    )
+
+
+def parse_review_markdown_safe(text: str) -> ParsedReview:
+    """``parse_review_markdown`` that never raises.
+
+    A parser bug must not destroy a paid-for review: any unexpected
+    exception degrades to ``parse_ok=False`` (the JSON envelope then
+    carries the raw markdown) instead of an ``ERROR: UNKNOWN`` exit.
+    """
+    try:
+        return parse_review_markdown(text)
+    except Exception as exc:
+        return ParsedReview(
+            summary=None,
+            findings=[],
+            clean=False,
+            parse_ok=False,
+            problems=[f"parser crashed: {type(exc).__name__}: {exc}"],
+        )
+
+
+def load_baseline(path: str) -> dict:
+    """Load and validate a ``--baseline`` JSON file (a prior run's
+    ``--format json`` output). Failures are the user's config, hence
+    ConfigError -- and this runs BEFORE the model call so a bad baseline
+    never burns tokens."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except OSError as exc:
+        raise ConfigError(f"Cannot read --baseline file {path!r}: {exc}") from exc
+    except ValueError as exc:
+        raise ConfigError(
+            f"--baseline file {path!r} is not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(doc, dict) or doc.get("schema_version") != 1:
+        raise ConfigError(
+            f"--baseline file {path!r} is not a schema_version=1 review "
+            "envelope (expected the output of a --format json run)."
+        )
+    return doc
+
+
+def _location_match(
+    file_a: str | None, line_a: int | None, file_b: str | None, line_b: int | None
+) -> bool:
+    """Same file and lines within ±10 (a missing line matches any line)."""
+    if file_a != file_b:
+        return False
+    if line_a is None or line_b is None:
+        return True
+    return abs(line_a - line_b) <= 10
+
+
+def diff_against_baseline(
+    current: list[Finding], baseline_doc: dict
+) -> tuple[list[str], list[dict]]:
+    """Compare current findings against a prior run's envelope.
+
+    Returns ``(statuses, resolved)``: one ``"new"``/``"persisting"``
+    status per current finding, plus the baseline entries nothing
+    matched -- informational "resolved since last round".
+
+    Two greedy passes, each consuming baseline entries so one entry
+    can't vouch for two current findings:
+
+    1. **Strong**: fingerprint (file+severity+normalized title) equal,
+       lines within ±10.
+    2. **Relaxed**: same file, lines within ±10 -- title and severity
+       ignored. Empirically required: on back-to-back identical runs at
+       T=0.3 the model rewords every title ("add a comment explaining
+       the default" vs "add a comment to clarify its purpose") and even
+       re-rates severities (HIGH -> MEDIUM on the same function), so a
+       title-hashed fingerprint alone matched 0 of 8 genuinely repeated
+       findings. Location survives rewording; it carries the match.
+
+    Still heuristic: two *different* findings within 10 lines of each
+    other in the same file can cross-match in pass 2. Greedy consumption
+    bounds the damage to one mislabeled status per collision.
+    """
+    baseline_entries = [
+        entry
+        for entry in baseline_doc.get("findings") or []
+        if isinstance(entry, dict) and isinstance(entry.get("fingerprint"), str)
+    ]
+
+    def _entry_line(entry: dict) -> int | None:
+        line = entry.get("line")
+        return line if isinstance(line, int) else None
+
+    def _entry_file(entry: dict) -> str | None:
+        file = entry.get("file")
+        return file if isinstance(file, str) else None
+
+    unmatched = list(baseline_entries)
+    statuses: list[str | None] = [None] * len(current)
+
+    # Pass 1: strong fingerprint match.
+    for idx, finding in enumerate(current):
+        fp = finding_fingerprint(finding)
+        for entry_idx, entry in enumerate(unmatched):
+            if _fingerprints_match(
+                fp, finding.line, entry["fingerprint"], _entry_line(entry)
+            ):
+                unmatched.pop(entry_idx)
+                statuses[idx] = "persisting"
+                break
+
+    # Pass 2: relaxed location match for whatever pass 1 left over.
+    for idx, finding in enumerate(current):
+        if statuses[idx] is not None:
+            continue
+        for entry_idx, entry in enumerate(unmatched):
+            if _location_match(
+                finding.file, finding.line, _entry_file(entry), _entry_line(entry)
+            ):
+                unmatched.pop(entry_idx)
+                statuses[idx] = "persisting"
+                break
+
+    return [s or "new" for s in statuses], unmatched
+
+
+def build_json_envelope(
+    *,
+    mode: str,
+    provider: str,
+    model: str,
+    temperature: float,
+    parsed: ParsedReview,
+    result: CallResult,
+    raw_markdown: str,
+    statuses: list[str] | None = None,
+    resolved: list[dict] | None = None,
+) -> dict:
+    """Assemble the ``--format json`` stdout document (schema_version 1).
+
+    ``raw`` is embedded only when parsing failed, so a caller always has
+    the full model output one way or the other. Exit code stays 0 on
+    parse failure -- exit codes describe transport/config outcomes, not
+    model formatting; agents branch on ``parse_ok``.
+    """
+    findings_out = []
+    for idx, finding in enumerate(parsed.findings):
+        entry = dataclasses.asdict(finding)
+        entry["fingerprint"] = finding_fingerprint(finding)
+        if statuses is not None:
+            entry["status"] = statuses[idx]
+        findings_out.append(entry)
+    envelope: dict = {
+        "schema_version": 1,
+        "mode": mode,
+        "provider": provider,
+        "model": model,
+        "temperature": temperature,
+        "summary": parsed.summary,
+        "clean": parsed.clean,
+        "findings": findings_out,
+        "usage": (
+            {
+                "prompt_tokens": result.prompt_tokens,
+                "completion_tokens": result.completion_tokens,
+            }
+            if result.prompt_tokens is not None
+            or result.completion_tokens is not None
+            else None
+        ),
+        "truncated": result.truncated,
+        "parse_ok": parsed.parse_ok,
+        "problems": parsed.problems,
+    }
+    if resolved is not None:
+        envelope["resolved"] = resolved
+    if not parsed.parse_ok:
+        envelope["raw"] = raw_markdown
+    return envelope
+
+
 def _min_severity_instruction(level: str) -> str:
     """Fork-owned prompt appendix implementing ``--min-severity``.
 
@@ -1778,6 +2288,8 @@ class Settings:
     min_severity: str
     context: str | None
     output: str | None
+    format: str = "markdown"
+    baseline: str | None = None
     api_key: str | None = None
     referer: str | None = None
     title: str | None = None
@@ -1918,6 +2430,19 @@ def _resolve_settings(args: argparse.Namespace) -> Settings:
             "Set --retries or $CODE_REVIEW_RETRIES to a non-negative integer."
         )
 
+    # Output format: CLI wins, then env, then markdown. The env value is
+    # validated here because argparse ``choices`` only guards CLI input,
+    # not defaults sourced from the environment.
+    if args.format is not None:
+        output_format = args.format
+    else:
+        output_format = os.getenv("CODE_REVIEW_FORMAT") or "markdown"
+    if output_format not in ("markdown", "json"):
+        raise ConfigError(
+            f"$CODE_REVIEW_FORMAT={output_format!r} is not a valid format. "
+            "Use 'markdown' or 'json'."
+        )
+
     # Safety context: --no-context wins, then explicit --context, then
     # env, then default. Empty string from env is treated as "use
     # default" rather than "disabled" -- pass --no-context explicitly to
@@ -2012,6 +2537,8 @@ def _resolve_settings(args: argparse.Namespace) -> Settings:
         min_severity=args.min_severity,
         context=context,
         output=args.output,
+        format=output_format,
+        baseline=args.baseline,
         api_key=api_key,
         referer=referer,
         title=title,
@@ -2419,6 +2946,32 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--format",
+        choices=("markdown", "json"),
+        default=None,
+        help=(
+            "Output format. ``markdown`` (default) prints the model's "
+            "review verbatim. ``json`` parses the review into a "
+            "structured findings envelope (schema_version 1) -- the "
+            "prompts are unchanged; parsing is local and deterministic. "
+            "On parse failure the envelope carries parse_ok=false plus "
+            "the raw markdown, still exit 0. Override with "
+            "$CODE_REVIEW_FORMAT."
+        ),
+    )
+    parser.add_argument(
+        "--baseline",
+        default=None,
+        metavar="PATH",
+        help=(
+            "A prior run's --format json output. Current findings are "
+            "marked new/persisting against it and disappeared findings "
+            "are reported as resolved -- the round-over-round workflow: "
+            "--format json --output r.json, fix things, then re-run "
+            "with --baseline r.json."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         dest="dry_run",
@@ -2439,6 +2992,11 @@ def main() -> None:
         )
 
     settings = _resolve_settings(args)
+    # Validate the baseline BEFORE the model call so a bad file never
+    # burns tokens.
+    baseline_doc = (
+        load_baseline(settings.baseline) if settings.baseline is not None else None
+    )
     request = _build_request(args, settings)
 
     if args.dry_run:
@@ -2482,9 +3040,51 @@ def main() -> None:
     usage_line = _format_usage_line(result, settings.provider, settings.model)
     if usage_line is not None:
         sys.stderr.write(usage_line + "\n")
-    print(result.content)
+
+    # Structured-output tail: parse only when something consumes the
+    # parse (--format json or --baseline); markdown stdout stays the
+    # model's verbatim output either way.
+    parsed: ParsedReview | None = None
+    statuses: list[str] | None = None
+    resolved: list[dict] | None = None
+    if settings.format == "json" or baseline_doc is not None:
+        parsed = parse_review_markdown_safe(result.content)
+    if baseline_doc is not None:
+        assert parsed is not None
+        if parsed.parse_ok:
+            statuses, resolved = diff_against_baseline(parsed.findings, baseline_doc)
+            new = statuses.count("new")
+            persisting = statuses.count("persisting")
+            sys.stderr.write(
+                f"[baseline] {len(parsed.findings)} finding(s): {new} new, "
+                f"{persisting} persisting, {len(resolved)} resolved\n"
+            )
+        else:
+            sys.stderr.write(
+                "WARN: --baseline skipped; the review output could not be "
+                "parsed into findings (see parse problems).\n"
+            )
+
+    if settings.format == "json":
+        assert parsed is not None
+        envelope = build_json_envelope(
+            mode=request.mode,
+            provider=settings.provider,
+            model=settings.model,
+            temperature=settings.temperature,
+            parsed=parsed,
+            result=result,
+            raw_markdown=result.content,
+            statuses=statuses,
+            resolved=resolved,
+        )
+        stdout_text = json.dumps(envelope, indent=2, ensure_ascii=False)
+    else:
+        stdout_text = result.content
+
+    print(stdout_text)
     if settings.output is not None:
-        _write_output_file(result.content, settings.output)
+        _write_output_file(stdout_text, settings.output)
 
 
 def _entrypoint() -> None:
