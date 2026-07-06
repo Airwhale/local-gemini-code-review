@@ -27,6 +27,7 @@ Optional environment variables:
 - `OPENROUTER_MODEL` / `GEMINI_MODEL` / `OLLAMA_MODEL` — override the per-provider default model
 - `OLLAMA_HOST` — Ollama server URL (default `http://localhost:11434`). Override for non-default ports, remote Ollama, or WSL distros without localhost mirroring.
 - `OLLAMA_TIMEOUT` — HTTP timeout for Ollama calls in seconds (default `1800`, i.e. 30 minutes — accommodates CPU cold-starts and thorough reviews).
+- `OLLAMA_NUM_CTX` — the context window (tokens) the Ollama server loads models with. Usually unset: the runner reads the real window from a loaded model via `/api/ps` and hard-enforces it (`CONTEXT_OVERFLOW`, exit 12, because Ollama silently truncates oversized prompts instead of erroring). When the window can't be determined it assumes the smallest stock VRAM tier (4096) and only warns. Set explicitly to override detection and make the guard hard even before the model is first loaded.
 
 ---
 
@@ -126,7 +127,7 @@ The runner's Ollama-specific errors are surgical: a connection refusal raises `C
 | Alias | Resolves to | Notes |
 |---|---|---|
 | `local` | `qwen3-coder:30b` | Current Ollama default. 30B MoE with ~3.3B active params — the recommended quality/speed balance on CPU. |
-| `local-pro` | `qwen3-coder-next` | 80B/3B MoE. Higher quality at the cost of ~40 GB download and slightly slower active path. |
+| `local-pro` | `qwen3-coder-next` | 80B/3B MoE. Higher quality at the cost of ~52 GB download and slightly slower active path. |
 
 **The `gemini` (direct-API) provider has no aliases** — it takes bare Gemini model names only (e.g. `gemini-2.5-pro`, `gemini-2.5-flash`). Raw provider-native slugs always pass through unchanged, so anything OpenRouter serves or anything pulled into Ollama — including newer models without aliases yet — works via `--model <slug>`.
 
@@ -229,7 +230,7 @@ The runner exits with **typed exit codes** so an LLM caller can react differentl
 | 2 | CONFIG | fix env / CLI flag; don't retry |
 | 10 | SAFETY_REFUSAL | retry with `--model claude` |
 | 11 | RATE_LIMIT | wait 60s; switch provider if persistent |
-| 12 | CONTEXT_OVERFLOW | narrow scope; don't retry as-is |
+| 12 | CONTEXT_OVERFLOW | narrow scope; don't retry as-is (if max_tokens was hit before any content: raise `--max-tokens`; if the Ollama guard fired: raise `OLLAMA_CONTEXT_LENGTH` + `$OLLAMA_NUM_CTX`) |
 | 13 | PROVIDER_HICCUP | retry; runner already auto-retried once |
 | 14 | TRANSPORT | exponential backoff; escalate after 3 |
 | 1 | UNKNOWN | read stderr; escalate |
@@ -267,7 +268,11 @@ See the README's "Safety context" section for the default phrasing.
 
 8. **Ollama "model not pulled" returns a `CONFIG` error (exit 2), not a 404.** The runner intercepts the 404 from the local server and surfaces it as a typed `CONFIG` error with the exact `ollama pull <model>` command to run. Don't retry without pulling first — retry without changes hits the same error.
 
-9. **Ollama review depth is lower than cloud.** Local models, especially on CPU, tend to under-report findings versus a cloud reviewer on the same diff. This is the inverse of the cloud-hallucinates problem documented under "Local vs cloud." A clean "no issues" from Ollama is **not** equivalent in confidence to a clean review from `claude` or `pro` — treat it as a sanity check, not a final verdict, when stakes are high.
+9. **Truncated-but-nonempty output warns on stderr.** If the model hits the `max_tokens` ceiling but still returned content, the runner prints the partial review (exit 0) plus a `WARN: ... truncated at max_tokens` line on stderr. If you're parsing findings programmatically, check stderr for that warning before treating the list as complete.
+
+10. **Ollama silently truncates oversized prompts — the runner guards against it.** Ollama generates from whatever fragment of the prompt fits `num_ctx` instead of erroring, which would yield a plausible-looking review of a fraction of the diff. The runner estimates prompt tokens pre-flight and compares against the window, resolved as: `$OLLAMA_NUM_CTX` if set (hard exit 12 on overflow) → the loaded model's actual window from `/api/ps` (hard exit 12; covers every round after the first in an iterative loop) → assume the smallest stock VRAM tier, 4096, and **warn only** (stock windows are VRAM-dependent: 4K/32K/256K, so a hard error could reject a valid run on a bigger machine). If you see the WARN, set `$OLLAMA_NUM_CTX` to your actual window; to enlarge the window itself, `OLLAMA_CONTEXT_LENGTH=32768 ollama serve` (or the app settings slider).
+
+11. **Ollama review depth is lower than cloud.** Local models, especially on CPU, tend to under-report findings versus a cloud reviewer on the same diff. This is the inverse of the cloud-hallucinates problem documented under "Local vs cloud." A clean "no issues" from Ollama is **not** equivalent in confidence to a clean review from `claude` or `pro` — treat it as a sanity check, not a final verdict, when stakes are high.
 
 ---
 

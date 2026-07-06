@@ -64,7 +64,7 @@ The rest of this README is the general-audience documentation (humans, contribut
 | `skills/code-review-codebase/SKILL.md` | **new** | Fork-specific whole-codebase review skill. Same persona / severity rubric as the upstream `code-review-commons` skill, but Critical Constraints adapted to permit comments on any line of any file in the bundle (the upstream "comment only on `+`/`-` lines" rule forbids commenting on whole-file content). |
 | `commands/codebase-review.toml` | **new** | Fork-specific command for `--codebase` mode. Defines the bundle delimiter and per-file-findings output shape. |
 | `pyproject.toml` | **new** | `uv`-managed deps (`httpx`, `python-dotenv`). |
-| `.env.example` | **new** | Documents `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, optional model / provider overrides, and the Ollama-local config (`OLLAMA_HOST`, `OLLAMA_MODEL`, `OLLAMA_TIMEOUT`). |
+| `.env.example` | **new** | Documents `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, optional model / provider overrides, and the Ollama-local config (`OLLAMA_HOST`, `OLLAMA_MODEL`, `OLLAMA_TIMEOUT`, `OLLAMA_NUM_CTX`). |
 | `.gitignore` | **new** | Protects `.env` and the `uv` virtualenv from leaking. |
 | `docs/llm-code-review-runbook.md` | **new** | Operational runbook for using the tool as an LLM iteration partner. |
 | `README.md` | **modified** | This file — documents the fork's runner alongside the upstream CLI mode. |
@@ -148,12 +148,13 @@ Practical workflow: cloud first for the structured triage pass; local as a sanit
     ollama pull qwen3-coder:30b
     ```
 
-   Alternative: `qwen3-coder-next` (80B/3B MoE, higher quality, ~40 GB download).
+   Alternative: `qwen3-coder-next` (80B/3B MoE, higher quality, ~52 GB download).
 
 3. (Optional) Override defaults via `.env`:
-   - `OLLAMA_HOST=http://localhost:11434` — server URL. Override if Ollama is on a non-default port, another machine, or a WSL distro without localhost mirroring.
+   - `OLLAMA_HOST=http://localhost:11434` — server URL. Override if Ollama is on a non-default port, another machine, or a WSL distro without localhost mirroring. Scheme-less `host:port` values (Ollama's own `OLLAMA_HOST` convention, e.g. `0.0.0.0:11434`) are accepted — the runner prepends `http://`.
    - `OLLAMA_MODEL=qwen3-coder:30b` — default model when `--provider ollama` is selected.
    - `OLLAMA_TIMEOUT=1800` — HTTP timeout in seconds. Default 30 minutes accommodates CPU cold-starts (10–60 s model load) plus thorough reviews; lower it if you'd rather fail fast.
+   - `OLLAMA_NUM_CTX=32768` — the context window (tokens) your server loads models with. Usually unnecessary: the runner reads the real window from a loaded model automatically. See the truncation guard below.
 4. Run:
 
     ```bash
@@ -161,6 +162,24 @@ Practical workflow: cloud first for the structured triage pass; local as a sanit
     ```
 
 The runner's error messages are tailored for Ollama-specific failure modes — "server unreachable" suggests `ollama serve` and `--ollama-host`; "model not pulled" gives you the exact `ollama pull <model>` command to run.
+
+**Context-window truncation guard.** Unlike the cloud providers, which return an error when a prompt exceeds the model's context, Ollama **silently truncates** prompts that don't fit the loaded context window (`num_ctx`) and generates from whatever survived. For code review that's the worst failure mode: the model reviews a fragment of your diff and returns a plausible-looking "few issues found" with exit 0. The runner estimates the prompt size pre-flight and compares it against the window, resolved in this order:
+
+1. **`$OLLAMA_NUM_CTX` set** → treated as authoritative; a likely overflow is a hard `CONTEXT_OVERFLOW` (exit 12).
+2. **Model already loaded** → the runner reads the model's *actual* window from `GET /api/ps` (`[ollama] detected context window …` on stderr) and enforces that. In an iterative review loop this covers every round after the first.
+3. **Window unknown** (first-ever call, model not loaded) → the runner assumes the smallest stock tier (4096) but only **warns** on a likely overflow, because stock Ollama sizes the window by VRAM ([docs](https://docs.ollama.com/context-length): 4K under 24 GiB, 32K for 24–48 GiB, 256K above) and a hard error would reject valid runs on bigger machines.
+
+If you see the warning (or a `CONTEXT_OVERFLOW`), either narrow the review scope or raise the window server-side and pin it for the runner:
+
+```bash
+# server side (pick a window your VRAM can hold):
+OLLAMA_CONTEXT_LENGTH=32768 ollama serve
+```
+
+```dotenv
+# runner side (.env) — must match the server:
+OLLAMA_NUM_CTX=32768
+```
 
 ### Model aliases
 
@@ -183,7 +202,7 @@ The `--model` flag accepts any provider-native slug, plus a curated set of short
 | Alias | Resolves to | Notes |
 |---|---|---|
 | `local` | `qwen3-coder:30b` | Current Ollama default. 30B MoE with ~3.3B active params — the recommended quality/speed balance on CPU. |
-| `local-pro` | `qwen3-coder-next` | 80B/3B MoE. Higher quality at the cost of ~40 GB download + slightly slower active path. |
+| `local-pro` | `qwen3-coder-next` | 80B/3B MoE. Higher quality at the cost of ~52 GB download + slightly slower active path. |
 
 **The `gemini` (direct-API) provider has no aliases** — it takes bare Gemini model names only (e.g. `gemini-2.5-pro`, `gemini-2.5-flash`). Passing an OpenRouter alias like `claude` with `--provider gemini` errors out clearly.
 
@@ -204,7 +223,7 @@ Raw provider-native slugs still pass through unchanged, so anything OpenRouter s
 Two more runtime knobs:
 
 - `--temperature <float>` (default `0.3`, env `CODE_REVIEW_TEMPERATURE`): sampling randomness. Higher = more findings per call, more hallucinations. Lower = tighter, fewer findings.
-- `--max-tokens <int>` (default `16000`, env `CODE_REVIEW_MAX_TOKENS`): ceiling on output. Not a target — you pay only for what's emitted. Default avoids mid-finding truncation on thorough reviews.
+- `--max-tokens <int>` (default `16000`, env `CODE_REVIEW_MAX_TOKENS`): ceiling on output. Not a target — you pay only for what's emitted. Default avoids mid-finding truncation on thorough reviews. If the model does hit the ceiling mid-review, the runner still prints the partial output but emits a `WARN: ... truncated at max_tokens` line on stderr so callers know the findings list may be incomplete.
 
 The temperature default has been retuned twice. **0.2** (original) was too conservative: 1–2 findings per round on diffs that plausibly contained more, 5–7 rounds to converge. **0.5** surfaced more findings per round (3–5 typical) but produced a clear hallucination during cross-model integration testing — `google/gemini-2.5-pro` returned a confidently-worded HIGH-severity finding that referenced a CLI flag and "help text" that did not exist in the code; the suggested fix would have crashed the runner. **0.3** (current) is the compromise: tight enough to cut hallucination, loose enough to keep "more findings than 0.2." Override per call with `--temperature` if your project benefits from a different setting; empirical re-tuning is encouraged.
 
@@ -298,7 +317,7 @@ If you're an LLM agent calling this tool in a loop, here's the contract.
 | **2** | CONFIG | Missing API key or invalid CLI / env arg | **Do not retry without fixing.** Read stderr, correct config, then re-run. |
 | **10** | SAFETY_REFUSAL | Model refused (content filter fired) | Retry with `--model claude` (Anthropic is the least refusal-prone on security / policy / adversarial-fixture code). If refused across models, the content may need human review. |
 | **11** | RATE_LIMIT | HTTP 429 from the provider | Wait 30–60s, then retry. If the limit is per-key per-day (common on free tiers), switch `--provider` or `--model`. |
-| **12** | CONTEXT_OVERFLOW | Diff exceeded the model's token budget or the runner's 700K-char bundle cap | Narrow scope: `--include` / `--exclude` in codebase mode, or a smaller `--base` ref in diff mode. **Do not retry without reducing scope.** |
+| **12** | CONTEXT_OVERFLOW | Diff exceeded the model's token budget, the runner's 700K-char bundle cap, or the Ollama context-window guard | Narrow scope: `--include` / `--exclude` in codebase mode, or a smaller `--base` ref in diff mode. **Do not retry without reducing scope.** Exception: if the message says max_tokens was hit before any content appeared (reasoning models can spend the whole budget thinking), raise `--max-tokens` instead. For the Ollama guard, raise the server's `OLLAMA_CONTEXT_LENGTH` and set `$OLLAMA_NUM_CTX` to match. |
 | **13** | PROVIDER_HICCUP | Null content with no clear cause (no safety flag, no length hit) | The runner already auto-retried once; if you see this, both attempts failed. Wait a few seconds and retry; if still hicupped, switch provider. |
 | **14** | TRANSPORT | HTTP 5xx, timeout, or connection error | The runner already retried once at 2s. Retry with exponential backoff (4s, 8s); escalate if 3 retries fail. |
 | **1** | UNKNOWN | Catchall (unexpected exception, non-JSON response, etc.) | Read stderr for the surviving exception; escalate if unclear. |
