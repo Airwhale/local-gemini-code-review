@@ -105,6 +105,7 @@ class TestPromptRoot:
         [
             "not [ valid toml",  # TOMLDecodeError
             'other = "field"',  # valid TOML, no `prompt` key
+            "prompt = 123",  # `prompt` present but not a string
         ],
     )
     def test_bad_command_toml_is_config_error(

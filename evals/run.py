@@ -81,16 +81,34 @@ def run_review(fixture: Path, model: str, temperature: float) -> dict:
 
 
 def score(envelope: dict, expected: dict) -> tuple[int, int, int]:
-    """Return (bugs_caught, bugs_total, noise_findings)."""
+    """Return (bugs_caught, bugs_total, noise_findings).
+
+    A finding matches a planted bug when it names the right file,
+    mentions any keyword, and -- when the fixture declares a
+    ``line_range`` and the finding carries a line number -- points
+    inside that range. Line-less findings skip the range check (models
+    legitimately omit lines sometimes; punishing that would measure
+    formatting, not recall). If models cite defensible nearby lines,
+    widen the fixture's range rather than adding slack here.
+    """
     findings = envelope.get("findings") or []
     bugs = expected.get("bug") or []
     matched_findings: set[int] = set()
     caught = 0
     for bug in bugs:
+        line_range = bug.get("line_range")
         for idx, finding in enumerate(findings):
             if idx in matched_findings:
                 continue
             if finding.get("file") != bug["file"]:
+                continue
+            line = finding.get("line")
+            if (
+                isinstance(line_range, list)
+                and len(line_range) == 2
+                and isinstance(line, int)
+                and not (line_range[0] <= line <= line_range[1])
+            ):
                 continue
             haystack = f"{finding.get('title', '')} {finding.get('body', '')}".lower()
             if any(keyword.lower() in haystack for keyword in bug["keywords"]):

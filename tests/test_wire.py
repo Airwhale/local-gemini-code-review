@@ -167,6 +167,21 @@ class TestOpenRouterWire:
             _openrouter()
         assert exc_info.value.retry_after_seconds == 30.0
 
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"choices": ["not-an-object"]},  # non-dict choice
+            {"choices": [{"message": ["not-an-object"]}]},  # non-dict message
+            {"choices": [{"message": {"content": {"nested": "x"}}}]},  # non-str content
+        ],
+    )
+    def test_malformed_nested_shapes_are_hiccup(self, monkeypatch, payload):
+        # The malformed-response contract (exit 13, retryable) must hold
+        # for nested shapes too, not just top-level non-object JSON.
+        _mock(monkeypatch, lambda req: _json_response(payload))
+        with pytest.raises(ProviderHiccup):
+            _openrouter()
+
     def test_401_is_config_error_naming_the_key(self, monkeypatch):
         # Reproduced live: an invalid OpenRouter key returns 401, which
         # used to fall through to UNKNOWN [exit 1]. It's a fix-your-key
@@ -218,6 +233,25 @@ class TestOpenRouterWire:
 
 
 class TestGeminiWire:
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"candidates": ["not-an-object"]},  # non-dict candidate
+            {"candidates": [{"content": "not-an-object"}]},  # non-dict content
+            # Junk parts entries are skipped -> empty text -> typed
+            # empty-content classification (finishReason STOP -> hiccup).
+            {
+                "candidates": [
+                    {"finishReason": "STOP", "content": {"parts": [123, {"text": 5}]}}
+                ]
+            },
+        ],
+    )
+    def test_malformed_nested_shapes_are_hiccup(self, monkeypatch, payload):
+        _mock(monkeypatch, lambda req: _json_response(payload))
+        with pytest.raises(ProviderHiccup):
+            _gemini()
+
     def test_success_with_usage_metadata(self, monkeypatch):
         _mock(
             monkeypatch,
@@ -289,6 +323,18 @@ class TestGeminiWire:
 
 
 class TestOllamaWire:
+    def test_non_string_content_is_typed_not_crash(self, monkeypatch):
+        # Malformed nested shape -> typed empty-content classification,
+        # never a raw AttributeError/TypeError escaping to UNKNOWN.
+        _mock(
+            monkeypatch,
+            lambda req: _json_response(
+                {"message": {"content": 42}, "done_reason": "stop"}
+            ),
+        )
+        with pytest.raises(ProviderHiccup):
+            _ollama()
+
     def test_native_success_shape(self, monkeypatch):
         def handler(req):
             body = json.loads(req.content)

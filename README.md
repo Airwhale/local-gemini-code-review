@@ -125,7 +125,7 @@ One review source per run (mutually exclusive):
 |---|---|
 | *(none)* | Diff: current branch vs `origin/HEAD` merge-base — matches the upstream `gemini-cli` `/code-review` shape. |
 | `--base <ref>` | Diff: vs an explicit base ref (**includes uncommitted changes**, so iterative loops work without committing each pass). |
-| `--pr <N>` | Diff: pulls a GitHub PR diff via `gh pr diff` (requires `gh auth login`). |
+| `--pr <N>` | Diff: pulls a GitHub PR diff via `gh pr diff` (requires `gh auth login`). **Add `--repo owner/name` on forks**: a bare PR number resolves through gh's default-repo logic (`gh repo set-default`), which often points at the upstream repo — the runner announces the resolved PR URL on stderr (`[gh] reviewing PR #N: <url>`, also during `--dry-run`) so a wrong target is visible before tokens are spent. |
 | `--staged` | Diff: staged changes only — pre-commit style. |
 | `--diff-file <path>` | Diff: review a unified diff read from a file (`-` reads stdin) instead of invoking git — for piping diffs from other tools, replaying saved diffs, and the eval harness. Not combinable with `--full-files` (a handed-in diff has no local files to reference). |
 | `--codebase` | Whole codebase: bundles tracked files (via `git ls-files`) and reviews them all. Narrow with `--include` / `--exclude` globs. |
@@ -433,6 +433,7 @@ Non-error stderr lines use a fixed prefix vocabulary — **no informational line
 | `[retry] …` | An automatic retry is about to happen (category, attempt, delay) |
 | `[ollama] …` | Ollama context-window detection notice (`/api/ps`) |
 | `[config] …` | A `.code-review.toml` was found and loaded (path announced — a security property, since the file lives in the reviewed repo) |
+| `[gh] reviewing PR #N: <url>` | The repository a `--pr` number resolved to — check it when you haven't pinned `--repo` |
 | `[baseline] …` | Round-over-round finding counts when `--baseline` is given |
 | `[panel …] …` | Per-model progress in `--models` panels |
 | `[chunk …] …` | Per-chunk progress in `--chunk` runs |
@@ -485,7 +486,7 @@ uv run --group dev mypy                #       ─┘
 Behavior-level changes should also run the **eval harness** — planted-bug fixtures scored for recall and noise, so tuning debates (temperature, models, prompts) are settled with data instead of anecdotes:
 
 ```bash
-uv run evals/run.py --model flash                          # 3 fixtures × 1 model = 3 paid API calls
+uv run evals/run.py --model flash                          # 4 fixtures × 1 model = 4 paid API calls
 uv run evals/run.py --model pro --temperature 0.2 --temperature 0.5   # sweep combinations
 ```
 

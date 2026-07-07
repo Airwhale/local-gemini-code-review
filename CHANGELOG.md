@@ -15,6 +15,7 @@ The M1–M7 roadmap: the single-file runner became an installable, testable, age
 - `--full-files` (changed files' full content as reference context) and `--chunk` (file-boundary splitting for over-budget payloads, fail-fast, `[chunk i/n]` progress).
 - `--diff-file PATH|-`: review a prepared unified diff (pipelines, replay, the eval harness).
 - `--dry-run`, `--output`, `--retries` (Retry-After-aware, clamped), `--min-severity`, `--no-project-config`, `--version`, `[usage]` token stderr line.
+- `--repo owner/name` pins the repository for `--pr` (bare PR numbers resolve through gh's default-repo logic, which on forks often points at upstream); every `--pr` run announces the resolved PR URL on stderr (`[gh] reviewing PR #N: <url>`).
 - Per-project `.code-review.toml` (upward walk, announced on load, unknown keys dropped with a WARN).
 - Ollama native `/api/chat` with a context-window truncation guard: 3-tier window resolution (`$OLLAMA_NUM_CTX` → `/api/ps` detection → advisory), per-request `num_ctx`, and a post-call `prompt_eval_count` verify that caught a real silent truncation in live testing.
 - Quality infra: 286-test suite including `httpx.MockTransport` wire tests and frozen real-model parser fixtures; ruff + mypy (source *and* tests/evals) gating CI on ubuntu + windows; wheel-content verification; an eval harness with planted-bug fixtures **and a clean-diff control** scoring recall and hallucination noise.
@@ -35,7 +36,7 @@ The M1–M7 roadmap: the single-file runner became an installable, testable, age
 
 ### Fixed
 
-- Severity regex no longer matches substrings ("Below" → `LOW`); panel consensus no longer merges line-less findings by location; `$CODE_REVIEW_PROVIDER` values are validated like CLI ones; `Retry-After` parsing survives overflow/malformed headers; non-object provider JSON is typed `PROVIDER_HICCUP`; panel `--dry-run` probes every model's window; eval harness exits non-zero when any run errors; missing/partial prompt-asset dirs are typed `CONFIG` instead of raw tracebacks; BOM-prefixed config files parse on Windows.
+- Severity regex no longer matches substrings ("Below" → `LOW`); panel consensus no longer merges line-less findings by location; `$CODE_REVIEW_PROVIDER` values are validated like CLI ones; `Retry-After` parsing survives overflow/malformed headers; non-object provider JSON is typed `PROVIDER_HICCUP` — including *nested* malformed shapes (non-dict choices/message/candidates/content, non-string content), which previously escaped as raw `AttributeError` → `UNKNOWN`; panel `--dry-run` probes every model's window; eval harness exits non-zero when any run errors and its scoring honors each fixture's `line_range` (right-file/right-keyword/wrong-location no longer counts as caught); missing/partial prompt-asset dirs and non-string command `prompt` values are typed `CONFIG` instead of raw tracebacks; BOM-prefixed config files parse on Windows.
 
 ## [0.1.0] — 2026-07-06 (PR #2)
 

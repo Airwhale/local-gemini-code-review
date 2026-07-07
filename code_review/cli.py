@@ -679,13 +679,21 @@ def load_command_prompt(name: str) -> str:
             detail=str(exc),
         ) from exc
     try:
-        return tomllib.loads(text)["prompt"]
+        prompt = tomllib.loads(text)["prompt"]
     except (tomllib.TOMLDecodeError, KeyError) as exc:
         raise ConfigError(
             f"Prompt asset {asset} is not a valid command file: expected "
             "TOML with a top-level `prompt` key.",
             detail=str(exc),
         ) from exc
+    if not isinstance(prompt, str):
+        # `prompt = 123` parses fine but crashes later in template
+        # substitution -- fail at the asset boundary as typed CONFIG.
+        raise ConfigError(
+            f"Prompt asset {asset} has a non-string `prompt` value "
+            f"({type(prompt).__name__})."
+        )
+    return prompt
 
 
 def _user_config_dir() -> Path:
@@ -884,17 +892,27 @@ def git_diff_local(base: str | None, staged: bool) -> str:
     return _run_git(["git", "diff", "-U5", "--merge-base", "origin/HEAD"])
 
 
-def pr_diff(pr_number: int) -> str:
-    """Pull a PR's diff via `gh`. Requires `gh auth login` to have run.
+def _run_gh(args: list[str], repo: str | None) -> str:
+    """Run a ``gh pr …`` command and return stdout.
+
+    ``repo`` pins the target repository (``--repo owner/name``). This
+    matters: bare ``gh pr N`` resolves through gh's own default-repo
+    logic (``gh repo set-default``), which on forks routinely points at
+    the UPSTREAM repo -- so ``--pr 3`` would silently review someone
+    else's PR #3. The runner also announces the resolved PR URL on
+    stderr (see ``_read_diff_source``) so the wrong target is visible
+    even without ``--repo``.
 
     Same Windows-locale concern as ``_run_git``: explicit
     ``encoding="utf-8"`` keeps PR diffs containing em-dashes, arrows,
     section signs, and other non-ASCII characters from being mangled
     into cp1252 mojibake before the model sees them.
     """
+    if repo:
+        args = [*args, "--repo", repo]
     try:
         result = subprocess.run(
-            ["gh", "pr", "diff", str(pr_number), "--patch"],
+            args,
             capture_output=True,
             text=True,
             check=True,
@@ -910,68 +928,43 @@ def pr_diff(pr_number: int) -> str:
         ) from exc
     except subprocess.CalledProcessError as exc:
         raise ConfigError(
-            f"`gh pr diff {pr_number}` failed (exit {exc.returncode})",
+            f"`{' '.join(args)}` failed (exit {exc.returncode})",
             detail=exc.stderr.strip(),
         ) from exc
     return result.stdout
 
 
-def pr_changed_files(pr_number: int) -> list[Path]:
+def pr_diff(pr_number: int, repo: str | None = None) -> str:
+    """Pull a PR's diff via `gh`. Requires `gh auth login` to have run."""
+    return _run_gh(["gh", "pr", "diff", str(pr_number), "--patch"], repo)
+
+
+def pr_changed_files(pr_number: int, repo: str | None = None) -> list[Path]:
     """List a PR's changed file paths via ``gh pr diff --name-only``."""
-    try:
-        result = subprocess.run(
-            ["gh", "pr", "diff", str(pr_number), "--name-only"],
-            capture_output=True,
-            text=True,
-            check=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-    except FileNotFoundError as exc:
-        raise ConfigError(
-            "`gh` not found on PATH. Install GitHub CLI to use --pr.",
-        ) from exc
-    except subprocess.CalledProcessError as exc:
-        raise ConfigError(
-            f"`gh pr diff {pr_number} --name-only` failed (exit {exc.returncode})",
-            detail=exc.stderr.strip(),
-        ) from exc
-    return [Path(line) for line in result.stdout.splitlines() if line]
+    output = _run_gh(["gh", "pr", "diff", str(pr_number), "--name-only"], repo)
+    return [Path(line) for line in output.splitlines() if line]
 
 
-def pr_head_sha(pr_number: int) -> str:
+def _gh_pr_view_field(pr_number: int, field: str, repo: str | None) -> str:
+    """One field from ``gh pr view --json`` (e.g. headRefOid, url)."""
+    output = _run_gh(
+        ["gh", "pr", "view", str(pr_number), "--json", field, "--jq", f".{field}"],
+        repo,
+    )
+    return output.strip()
+
+
+def pr_head_sha(pr_number: int, repo: str | None = None) -> str:
     """The PR's current head commit SHA via ``gh pr view``."""
-    try:
-        result = subprocess.run(
-            [
-                "gh",
-                "pr",
-                "view",
-                str(pr_number),
-                "--json",
-                "headRefOid",
-                "--jq",
-                ".headRefOid",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-    except FileNotFoundError as exc:
-        raise ConfigError(
-            "`gh` not found on PATH. Install GitHub CLI to use --pr.",
-        ) from exc
-    except subprocess.CalledProcessError as exc:
-        raise ConfigError(
-            f"`gh pr view {pr_number}` failed (exit {exc.returncode})",
-            detail=exc.stderr.strip(),
-        ) from exc
-    return result.stdout.strip()
+    return _gh_pr_view_field(pr_number, "headRefOid", repo)
 
 
-def _guard_pr_full_files(pr_number: int) -> None:
+def pr_url(pr_number: int, repo: str | None = None) -> str:
+    """The PR's canonical URL -- names the owner/repo it resolved to."""
+    return _gh_pr_view_field(pr_number, "url", repo)
+
+
+def _guard_pr_full_files(pr_number: int, repo: str | None = None) -> None:
     """Refuse ``--full-files`` with ``--pr`` unless HEAD is the PR head.
 
     The PR diff comes from GitHub, but ``--full-files`` reads reference
@@ -982,7 +975,7 @@ def _guard_pr_full_files(pr_number: int) -> None:
     gets a WARN: uncommitted edits are the user's own visible state, and
     hard-failing on them would break the fix-and-re-review loop.
     """
-    head = pr_head_sha(pr_number)
+    head = pr_head_sha(pr_number, repo)
     local = _run_git(["git", "rev-parse", "HEAD"]).strip()
     if local != head:
         raise ConfigError(
@@ -1006,7 +999,7 @@ def changed_file_paths(args: argparse.Namespace) -> list[Path]:
     reference set always matches the diff the model reviews.
     """
     if args.pr:
-        return pr_changed_files(args.pr)
+        return pr_changed_files(args.pr, args.repo)
     if args.staged:
         output = _run_git(["git", "diff", "--cached", "--name-only"])
     elif args.base:
@@ -1536,6 +1529,17 @@ def call_openrouter(
             provider="openrouter",
         )
     choice = choices[0]
+    # Same malformed-shape contract as the top-level check: nested
+    # non-object values (a string in choices[], a list for message)
+    # must surface as retryable PROVIDER_HICCUP, not as an
+    # AttributeError escaping to UNKNOWN.
+    if not isinstance(choice, dict):
+        raise ProviderHiccup(
+            "OpenRouter choices[0] is not an object",
+            detail=str(data)[:1000],
+            model=model,
+            provider="openrouter",
+        )
     # Inspect both ``finish_reason`` (OpenAI-standard normalized value)
     # and ``native_finish_reason`` (OpenRouter's pass-through of the
     # underlying provider's raw reason). They can disagree: a provider
@@ -1544,12 +1548,27 @@ def call_openrouter(
     # ``finish_reason="stop"`` -- preferring one over the other would
     # miss that signal. We classify by the UNION of both fields, so a
     # safety signal from either source wins over a generic "stop".
-    finish_reason = (choice.get("finish_reason") or "").lower()
-    native_finish_reason = (choice.get("native_finish_reason") or "").lower()
+    # str() coercion: a numeric/oddly-typed reason must not crash
+    # ``.lower()``.
+    finish_reason = str(choice.get("finish_reason") or "").lower()
+    native_finish_reason = str(choice.get("native_finish_reason") or "").lower()
     finish_reasons = {finish_reason, native_finish_reason} - {""}
     message = choice.get("message") or {}
+    if not isinstance(message, dict):
+        raise ProviderHiccup(
+            "OpenRouter message is not an object",
+            detail=str(data)[:1000],
+            model=model,
+            provider="openrouter",
+        )
     content = message.get("content")
+    if content is not None and not isinstance(content, str):
+        # Non-string content falls through to the empty-content
+        # classification below, which always ends in a typed raise.
+        content = None
     usage = data.get("usage") or {}
+    if not isinstance(usage, dict):
+        usage = {}  # optional metadata -- degrade, don't fail the review
 
     if content:
         truncated = bool(finish_reasons & {"length", "max_tokens"})
@@ -1661,6 +1680,8 @@ def call_gemini(
     # Gemini can refuse at the prompt level (before generation) by
     # returning ``promptFeedback.blockReason`` with no candidates.
     prompt_feedback = data.get("promptFeedback") or {}
+    if not isinstance(prompt_feedback, dict):
+        prompt_feedback = {}  # malformed feedback -> fall through to candidates
     block_reason = prompt_feedback.get("blockReason")
     if block_reason:
         raise SafetyRefusal(
@@ -1679,11 +1700,37 @@ def call_gemini(
             provider="gemini",
         )
     candidate = candidates[0]
-    finish_reason = (candidate.get("finishReason") or "").upper()
+    # Same malformed-shape contract as the top-level check: nested
+    # non-object values must surface as retryable PROVIDER_HICCUP, not
+    # as an AttributeError escaping to UNKNOWN. Non-dict parts entries
+    # and non-string texts are skipped rather than fatal -- an empty
+    # result then flows into the empty-content classification below,
+    # which always ends in a typed raise.
+    if not isinstance(candidate, dict):
+        raise ProviderHiccup(
+            "Gemini candidates[0] is not an object",
+            detail=str(data)[:1000],
+            model=model,
+            provider="gemini",
+        )
+    finish_reason = str(candidate.get("finishReason") or "").upper()
     content_block = candidate.get("content") or {}
+    if not isinstance(content_block, dict):
+        raise ProviderHiccup(
+            "Gemini candidate content is not an object",
+            detail=str(data)[:1000],
+            model=model,
+            provider="gemini",
+        )
     parts = content_block.get("parts") or []
-    text = "".join(part.get("text", "") for part in parts)
+    text = "".join(
+        part_text
+        for part in parts
+        if isinstance(part, dict) and isinstance(part_text := part.get("text"), str)
+    )
     usage = data.get("usageMetadata") or {}
+    if not isinstance(usage, dict):
+        usage = {}  # optional metadata -- degrade, don't fail the review
 
     if text:
         truncated = finish_reason == "MAX_TOKENS"
@@ -2061,7 +2108,9 @@ def call_ollama(
     # prompt_eval_count / eval_count usage fields.
     message = data.get("message") or {}
     content = message.get("content") if isinstance(message, dict) else None
-    done_reason = (data.get("done_reason") or "").lower()
+    if content is not None and not isinstance(content, str):
+        content = None  # non-string content -> typed empty-content path
+    done_reason = str(data.get("done_reason") or "").lower()
     prompt_eval = _usage_int(data.get("prompt_eval_count"))
     eval_count = _usage_int(data.get("eval_count"))
 
@@ -3834,7 +3883,7 @@ def _build_request(args: argparse.Namespace, settings: Settings) -> ReviewReques
         reference = ""
         if args.full_files:
             if args.pr:
-                _guard_pr_full_files(args.pr)
+                _guard_pr_full_files(args.pr, args.repo)
             ref_paths = _filter_reviewable(changed_file_paths(args))
             reference = build_reference_section(ref_paths)
             if len(diff) + len(reference) > MAX_BUNDLE_CHARS:
@@ -3956,7 +4005,14 @@ def _read_diff_source(args: argparse.Namespace) -> str:
                 f"Cannot read --diff-file {args.diff_file!r}: {exc}"
             ) from exc
     if args.pr:
-        return pr_diff(args.pr)
+        # Announce the resolved PR URL: without --repo, gh's default-repo
+        # logic decides which repository "--pr N" means, and on forks
+        # that default often points at UPSTREAM -- the URL makes a wrong
+        # resolution visible before tokens are spent (--dry-run included).
+        sys.stderr.write(
+            f"[gh] reviewing PR #{args.pr}: {pr_url(args.pr, args.repo)}\n"
+        )
+        return pr_diff(args.pr, args.repo)
     return git_diff_local(args.base, args.staged)
 
 
@@ -3993,6 +4049,11 @@ def _validate_flag_combos(args: argparse.Namespace) -> None:
         raise ConfigError(
             "--full-files needs the diff to come from this working tree "
             "(git/gh); a --diff-file diff has no local files to reference."
+        )
+    if args.repo is not None and not args.pr:
+        raise ConfigError(
+            "--repo only applies to --pr (it pins which repository the "
+            "PR number refers to). Drop it, or add --pr N."
         )
 
 
@@ -4299,7 +4360,24 @@ def main() -> None:
     source.add_argument(
         "--pr",
         type=int,
-        help="GitHub PR number to review (uses `gh pr diff`).",
+        help=(
+            "GitHub PR number to review (uses `gh pr diff`). Without "
+            "--repo, gh's own default-repo resolution decides which "
+            "repository the number refers to -- the runner announces "
+            "the resolved PR URL on stderr so a wrong default is "
+            "visible."
+        ),
+    )
+    parser.add_argument(
+        "--repo",
+        default=None,
+        metavar="OWNER/NAME",
+        help=(
+            "Pin the GitHub repository for --pr (passed to every gh "
+            "call). Recommended on forks, where gh's default "
+            "(`gh repo set-default`) often points at the upstream repo "
+            "and a bare --pr N would review the wrong project's PR."
+        ),
     )
     source.add_argument(
         "--staged",

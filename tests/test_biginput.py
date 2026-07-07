@@ -159,6 +159,60 @@ class TestChangedFilePaths:
         assert calls == [["git", "diff", "--name-only", "--merge-base", "origin/HEAD"]]
 
 
+class TestGhRepoPin:
+    """Bare `gh pr N` resolves through gh's default-repo logic, which on
+    forks often points at UPSTREAM -- --repo must pin every gh call, and
+    the PR URL announce must make the resolution visible."""
+
+    class _Result:
+        stdout = "out\n"
+        stderr = ""
+
+    def _capture(self, monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+        calls: list[list[str]] = []
+
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            return self._Result()
+
+        monkeypatch.setattr(review.subprocess, "run", fake_run)
+        return calls
+
+    def test_repo_appended_to_every_gh_call(self, monkeypatch: pytest.MonkeyPatch):
+        calls = self._capture(monkeypatch)
+        review.pr_diff(7, "owner/name")
+        review.pr_changed_files(7, "owner/name")
+        review.pr_head_sha(7, "owner/name")
+        review.pr_url(7, "owner/name")
+        assert len(calls) == 4
+        for args in calls:
+            assert args[:2] == ["gh", "pr"]
+            assert args[-2:] == ["--repo", "owner/name"]
+
+    def test_without_repo_command_stays_bare(self, monkeypatch: pytest.MonkeyPatch):
+        calls = self._capture(monkeypatch)
+        review.pr_diff(7)
+        assert "--repo" not in calls[0]
+
+    def test_pr_url_queries_the_url_field(self, monkeypatch: pytest.MonkeyPatch):
+        calls = self._capture(monkeypatch)
+        assert review.pr_url(7) == "out"
+        assert "--json" in calls[0]
+        assert "url" in calls[0]
+
+    def test_read_diff_source_announces_pr_url(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ):
+        monkeypatch.setattr(
+            review, "pr_url", lambda pr, repo=None: "https://github.com/o/n/pull/7"
+        )
+        monkeypatch.setattr(review, "pr_diff", lambda pr, repo=None: "diff text")
+        args = argparse.Namespace(diff_file=None, pr=7, repo=None)
+        assert review._read_diff_source(args) == "diff text"
+        err = capsys.readouterr().err
+        assert "[gh] reviewing PR #7: https://github.com/o/n/pull/7" in err
+
+
 class TestGuardPrFullFiles:
     """--full-files with --pr must not silently pair a GitHub-sourced
     diff with file bodies from an unrelated local checkout."""
@@ -174,7 +228,7 @@ class TestGuardPrFullFiles:
         local_head: str,
         dirty: bool = False,
     ) -> None:
-        monkeypatch.setattr(review, "pr_head_sha", lambda pr: pr_head)
+        monkeypatch.setattr(review, "pr_head_sha", lambda pr, repo=None: pr_head)
 
         def fake_run_git(args: list[str]) -> str:
             if args[:3] == ["git", "rev-parse", "HEAD"]:
@@ -209,13 +263,15 @@ class TestGuardPrFullFiles:
 
 
 def _combo_args(**overrides) -> argparse.Namespace:
-    base = dict(
+    base: dict[str, Any] = dict(
         chunk=False,
         models=None,
         full_files=False,
         baseline=None,
         codebase=False,
         diff_file=None,
+        pr=None,
+        repo=None,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -230,6 +286,7 @@ class TestFlagCombos:
             dict(chunk=True, baseline="r.json"),
             dict(full_files=True, codebase=True),
             dict(full_files=True, diff_file="d.patch"),
+            dict(repo="owner/name"),  # --repo only applies to --pr
         ],
     )
     def test_rejected_pairs(self, kwargs: dict):
@@ -239,6 +296,7 @@ class TestFlagCombos:
     def test_valid_combos_pass(self):
         _validate_flag_combos(_combo_args(chunk=True))
         _validate_flag_combos(_combo_args(full_files=True))
+        _validate_flag_combos(_combo_args(pr=7, repo="owner/name"))
         _validate_flag_combos(_combo_args())
 
 

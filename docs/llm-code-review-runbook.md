@@ -66,7 +66,7 @@ Secrets are configured once (per-user or checkout `.env` — see Setup) and work
 |----------------------|----------------------------------------------------------------|-----------------------------------------|
 | *(none)*             | diff: merge-base against `origin/HEAD`                         | quick check on current branch           |
 | `--base origin/main` | diff: two-dot diff vs ref, **includes working tree**           | iterating before commit                 |
-| `--pr <N>`           | diff: `gh pr diff N` (requires `gh auth login`)                | reviewing an existing PR                |
+| `--pr <N>`           | diff: `gh pr diff N` (requires `gh auth login`). On forks add `--repo owner/name` — bare N resolves via gh's default repo, often the upstream. The resolved PR URL is announced on stderr (`[gh] reviewing PR #N: <url>`); verify it. | reviewing an existing PR                |
 | `--staged`           | diff: staged-only                                              | pre-commit hook style                   |
 | `--diff-file <path>` | diff: unified diff read from a file (`-` = stdin), no git      | replaying a saved diff; feeding a diff from another tool |
 | `--codebase`         | whole codebase: `git ls-files` bundled (filtered); see below   | auditing an unfamiliar repo             |
