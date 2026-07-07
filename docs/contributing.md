@@ -25,6 +25,12 @@
 > also run the eval harness — `uv run evals/run.py --model flash` — it
 > spends real tokens and asks for confirmation unless `--yes`; the
 > `Evals` GitHub workflow is manual-dispatch for the same reason.
+>
+> The PR template mirrors all of this as a checklist. For orientation,
+> [architecture.md](./architecture.md) maps the request flow, design
+> decisions, and code layout; user-facing changes get a line in
+> [CHANGELOG.md](../CHANGELOG.md); security-relevant boundaries are
+> documented in [SECURITY.md](../SECURITY.md).
 
 We would love to accept your patches and contributions to this project.
 

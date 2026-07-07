@@ -1,0 +1,27 @@
+name: Feature request
+description: Propose a new capability or an improvement to an existing one
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One check first: the README's **Non-goals** section lists things this tool deliberately doesn't do (agentic loops, auto-fix, prompting for JSON, editing upstream prompts). Proposals inside those lines need a strong case for why the line should move.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that the tool makes hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Flags, config keys, output shape — as concretely as you can. If it touches the exit-code/stderr contract or the JSON envelope, call that out.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Workarounds you've considered
+      description: e.g. wrapping the CLI, --diff-file preprocessing, a .code-review.toml default.
