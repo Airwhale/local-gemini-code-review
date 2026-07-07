@@ -38,24 +38,36 @@ and ``--provider ollama`` also accept named aliases (see
 ``MODEL_ALIASES_BY_PROVIDER`` below) so you can write ``--model claude``
 or ``--model local`` instead of the full slug.
 
+Install as a global command (the primary interface), or run from a checkout:
+
+    uv tool install git+https://github.com/Airwhale/local-gemini-code-review
+    code-review --base origin/main            # then, from any repo
+    uv run review.py --base origin/main       # equivalent, from a checkout
+
 Diff modes (default) review a git diff:
 
-    uv run review.py                          # diff current branch vs origin/HEAD merge-base
-    uv run review.py --base main              # diff vs an explicit base ref
-    uv run review.py --pr 6                   # review a GitHub PR (uses `gh pr diff`)
-    uv run review.py --staged                 # staged changes only
+    code-review                               # diff current branch vs origin/HEAD merge-base
+    code-review --base main                   # diff vs an explicit base ref
+    code-review --pr 6                        # review a GitHub PR (uses `gh pr diff`)
+    code-review --staged                      # staged changes only
+    code-review --diff-file changes.patch     # review a diff from a file (- = stdin)
 
 Whole-codebase mode reviews tracked files (filtered):
 
-    uv run review.py --codebase
-    uv run review.py --codebase --include 'backend/**/*.py'
-    uv run review.py --codebase --exclude '**/test_*'
+    code-review --codebase
+    code-review --codebase --include 'backend/**/*.py'
+    code-review --codebase --exclude '**/test_*'
 
-The .env loaded from this script's directory (not CWD) -- copy `.env.example`
-to `.env` once at the runner location and invoke from any project folder.
-Set whichever of `OPENROUTER_API_KEY` / `GEMINI_API_KEY` your chosen provider
-needs (Ollama doesn't need an API key -- just set `OLLAMA_HOST` if your
-server isn't at the default `http://localhost:11434`).
+See --help for the full flag set (panels, chunking, JSON output, ...).
+
+Env files load in layers, and real environment variables always win:
+$CODE_REVIEW_ENV file (if set), then the per-user config dir
+(%APPDATA%\\code-review\\.env on Windows, ~/.config/code-review/.env
+elsewhere -- the home for an installed tool), then a checkout's repo-root
+.env (see .env.example). Set whichever of `OPENROUTER_API_KEY` /
+`GEMINI_API_KEY` your chosen provider needs (Ollama needs no API key --
+just set `OLLAMA_HOST` if your server isn't at the default
+`http://localhost:11434`).
 """
 
 from __future__ import annotations
@@ -4168,10 +4180,11 @@ def main() -> None:
             "value (``google/gemini-2.5-pro`` for openrouter, "
             "``gemini-2.5-pro`` for gemini, ``qwen3-coder:30b`` for "
             "ollama). Override with $OPENROUTER_MODEL / $GEMINI_MODEL / "
-            "$OLLAMA_MODEL respectively. Aliases: pro/flash/claude/"
-            "claude-opus/gpt/gpt-mini/deepseek (openrouter); "
-            "local/local-pro (ollama). ``gemini-2.5-flash`` / "
-            "``flash`` is ~3x faster with some quality loss."
+            "$OLLAMA_MODEL respectively. Aliases: pro/gemini-pro, "
+            "flash/gemini-flash, claude/claude-sonnet, claude-opus, "
+            "gpt, gpt-mini, deepseek (openrouter); local, local-pro "
+            "(ollama) -- full table in the README. ``flash`` is ~3x "
+            "faster than ``pro`` with some quality loss."
         ),
     )
     parser.add_argument(
@@ -4288,9 +4301,9 @@ def main() -> None:
         help=(
             "Only report findings at or above this severity "
             "(LOW/MEDIUM/HIGH/CRITICAL; case-insensitive). Default LOW "
-            "= no filter. Implemented as a fork-owned instruction "
-            "appended to the prompt; the upstream prompt files are "
-            "untouched."
+            "= no filter. Override with $CODE_REVIEW_MIN_SEVERITY. "
+            "Implemented as a fork-owned instruction appended to the "
+            "prompt; the upstream prompt files are untouched."
         ),
     )
     parser.add_argument(

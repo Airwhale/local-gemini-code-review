@@ -1,6 +1,6 @@
 # LLM code-review runbook
 
-Operational guide for using `review.py` as an iteration partner during code work. Same workflow whether you're a human developer or a coding agent (Claude, Codex, etc.).
+Operational guide for using the `code-review` runner as an iteration partner during code work. Same workflow whether you're a human developer or a coding agent (Claude, Codex, etc.).
 
 The runner is a thin Python wrapper around the upstream `gemini-cli-extensions/code-review` skill + command prompts. It POSTs them to OpenRouter, the Gemini API, or a local Ollama server (offline / no API key / no token cost), and prints structured-markdown findings — same prompts, same output shape as the GitHub `/gemini review` bot, without the 5–15 min webhook → job-queue wait.
 
@@ -10,9 +10,17 @@ The runner is a thin Python wrapper around the upstream `gemini-cli-extensions/c
 
 ```
 Repository:    https://github.com/Airwhale/local-gemini-code-review
-Entry point:   review.py at the repo root
-Dependencies:  uv-managed -- first run installs them
-Config:        .env at the runner's repo root (NOT at the project being reviewed)
+Entry point:   installed `code-review` command (uv tool install git+<repo URL>),
+               or `uv run review.py` from a checkout -- the two are equivalent
+Dependencies:  uv-managed -- install/first run handles them
+Secrets:       .env, loaded in layers (real env vars always win):
+                 1. $CODE_REVIEW_ENV file, if set
+                 2. %APPDATA%\code-review\.env (Windows) /
+                    ~/.config/code-review/.env (elsewhere)
+                 3. the checkout's repo-root .env
+Per-project:   non-secret defaults in .code-review.toml at the REVIEWED repo's
+               root (models, excludes, severity floor, context). Secrets are
+               never read from the reviewed repo.
 ```
 
 Set the key for whichever cloud provider you'll use; missing keys fail fast with a clear error. The local provider needs no key — just a running Ollama server.
@@ -21,33 +29,33 @@ Set the key for whichever cloud provider you'll use; missing keys fail fast with
 - `GEMINI_API_KEY` — direct Google AI Studio path
 - *(none)* — local Ollama. Requires `ollama serve` running and at least one model pulled.
 
-Optional environment variables:
+Optional environment variables (each also has a `.code-review.toml` key; the tuning knobs also have flags — see the table below):
 
-- `CODE_REVIEW_PROVIDER` — set provider default (e.g. `ollama`)
-- `OPENROUTER_MODEL` / `GEMINI_MODEL` / `OLLAMA_MODEL` — override the per-provider default model
-- `OLLAMA_HOST` — Ollama server URL (default `http://localhost:11434`). Override for non-default ports, remote Ollama, or WSL distros without localhost mirroring.
-- `OLLAMA_TIMEOUT` — HTTP timeout for Ollama calls in seconds (default `1800`, i.e. 30 minutes — accommodates CPU cold-starts and thorough reviews).
-- `OLLAMA_NUM_CTX` — the context window (tokens) the runner REQUESTS per call via the native endpoint's `options.num_ctx`. Usually unset: the runner reads a loaded model's real window via `/api/ps`, requests that, and hard-enforces it pre-flight (`CONTEXT_OVERFLOW`, exit 12, because Ollama silently truncates oversized prompts instead of erroring). When the window is unknown, `num_ctx` is omitted (the server keeps its VRAM-tier default), the guard warns, and `prompt_eval_count` is verified after the call as a hard backstop. Set explicitly to pin the window everywhere — requested per call, no server restart, RAM permitting.
+- `CODE_REVIEW_PROVIDER` — provider default (e.g. `ollama`)
+- `OPENROUTER_MODEL` / `GEMINI_MODEL` / `OLLAMA_MODEL` — per-provider default model
+- `CODE_REVIEW_TEMPERATURE` / `CODE_REVIEW_MAX_TOKENS` / `CODE_REVIEW_MIN_SEVERITY` / `CODE_REVIEW_RETRIES` / `CODE_REVIEW_FORMAT` / `CODE_REVIEW_CONTEXT` — tuning knobs
+- `OLLAMA_HOST` — Ollama server URL (default `http://localhost:11434`; scheme-less `host:port` accepted)
+- `OLLAMA_TIMEOUT` — HTTP timeout in seconds (default `1800` — accommodates CPU cold-starts and thorough reviews)
+- `OLLAMA_NUM_CTX` — pin the context window the runner requests per call. Usually unset: the runner detects a loaded model's real window via `/api/ps` and requests that. Full mechanics: gotcha 10 below and the README's "Context-window truncation guard".
 
 ---
 
 ## Invocation
 
-From any project directory:
+Installed (recommended) — from any repo:
 
 ```bash
-cd /path/to/your-project
+code-review --base origin/main
+```
+
+From a checkout, either inside the runner directory or pointing at it:
+
+```bash
+uv run review.py --pr 42
 uv run --project /path/to/local-gemini-code-review /path/to/local-gemini-code-review/review.py --base origin/main
 ```
 
-Or from the runner directory against an external CWD:
-
-```bash
-cd /path/to/local-gemini-code-review
-uv run review.py --pr 42
-```
-
-The runner reads `.env` from its own directory — configure once, invoke from anywhere.
+Secrets are configured once (per-user or checkout `.env` — see Setup) and work from any directory. Per-project defaults come from the reviewed repo's `.code-review.toml`; loading one is announced with a `[config] loaded <path>` stderr line.
 
 ### Source modes (mutually exclusive)
 
@@ -57,6 +65,7 @@ The runner reads `.env` from its own directory — configure once, invoke from a
 | `--base origin/main` | diff: two-dot diff vs ref, **includes working tree**           | iterating before commit                 |
 | `--pr <N>`           | diff: `gh pr diff N` (requires `gh auth login`)                | reviewing an existing PR                |
 | `--staged`           | diff: staged-only                                              | pre-commit hook style                   |
+| `--diff-file <path>` | diff: unified diff read from a file (`-` = stdin), no git      | replaying a saved diff; feeding a diff from another tool |
 | `--codebase`         | whole codebase: `git ls-files` bundled (filtered); see below   | auditing an unfamiliar repo             |
 
 ### Providers
@@ -71,13 +80,16 @@ The runner reads `.env` from its own directory — configure once, invoke from a
 
 ### Local vs cloud — pick deliberately
 
+The two paths have **different failure modes**, not a strict quality ordering:
 
+- **Cloud hallucinates.** Fast, structured, thorough — but at review temperatures it occasionally produces confident, well-formatted findings about code that doesn't exist (the observed case is documented under "Tuning sampling" below). Verify findings against actual code before accepting.
+- **Local under-reports.** Slower and sparser, but doesn't typically invent findings that contradict the diff. On the diff that produced the cloud hallucination, the local model returned a clean "no issues" — see gotcha 11: a local "clean" is a sanity check, not a verdict.
 
 **Use cloud when:** you want fast, structured triage; iterating against a small diff; converging in fewer rounds matters more than zero false positives.
 
 **Use Ollama (local) when:** you're offline; the code is sensitive enough you don't want it leaving the machine; you want a free sanity check; the cloud providers are rate-limited / down; you want a second-opinion pass after a cloud review (different blind spots catch different things).
 
-**For high-stakes PRs**, run *both* and reconcile.  You should also probably consider using other models on Openrouter:  Kimi, Sonnet, and ChatGPT are all good options and will likely all pick up different bugs.
+**For high-stakes PRs**, run both and reconcile — or better, run an OpenRouter panel (`--models pro,claude,deepseek`): different vendors surface different bugs, and cross-model agreement is a high-precision signal (see "Panels for high-stakes reviews" below).
 
 ### Setting up Ollama (when `--provider ollama` is right)
 
@@ -108,28 +120,12 @@ The runner's Ollama-specific errors are surgical: a connection refusal raises `C
 
 ### Model selection
 
-`--model <slug>` overrides the default. Aliases are **scoped per provider** — each one only resolves under its declared `--provider`. Passing an alias to the wrong provider raises a typed `CONFIG` error naming the right one rather than sending an invalid model name to the upstream API.
+`--model <slug>` overrides the default. Aliases are **scoped per provider** — each one only resolves under its declared `--provider`; the wrong pairing raises a typed `CONFIG` error naming the right one. The full alias tables are canonical in the README's "Model aliases" section; the operational shorthand:
 
-**OpenRouter aliases** (use with `--provider openrouter`, the default):
-
-| Alias | Resolves to | Notes |
-|---|---|---|
-| `pro` / `gemini-pro` | `google/gemini-2.5-pro` | Current default. |
-| `flash` / `gemini-flash` | `google/gemini-2.5-flash` | ~3× faster than `pro` with some quality loss — use during heavy iteration, switch to `pro` for the final pass. |
-| `claude` / `claude-sonnet` | `anthropic/claude-sonnet-4.5` | Great as a second-opinion reviewer alongside a Gemini round. |
-| `claude-opus` | `anthropic/claude-opus-4.5` | Larger model; slower and pricier. |
-| `gpt` | `openai/gpt-5` | Independent third opinion. |
-| `gpt-mini` | `openai/gpt-5-mini` | Cheaper / faster GPT. |
-| `deepseek` | `deepseek/deepseek-chat-v3.1` | Cheap, surprisingly strong on code review. |
-
-**Ollama aliases** (use with `--provider ollama`):
-
-| Alias | Resolves to | Notes |
-|---|---|---|
-| `local` | `qwen3-coder:30b` | Current Ollama default. 30B MoE with ~3.3B active params — the recommended quality/speed balance on CPU. |
-| `local-pro` | `qwen3-coder-next` | 80B/3B MoE. Higher quality at the cost of ~52 GB download and slightly slower active path. |
-
-**The `gemini` (direct-API) provider has no aliases** — it takes bare Gemini model names only (e.g. `gemini-2.5-pro`, `gemini-2.5-flash`). Raw provider-native slugs always pass through unchanged, so anything OpenRouter serves or anything pulled into Ollama — including newer models without aliases yet — works via `--model <slug>`.
+- **Iterate with `flash`** (~3× faster than `pro`, some quality loss), **finish with `pro`**.
+- **Second opinion: `claude`** — the strongest cross-vendor complement to a Gemini round; `deepseek` is the cheap third opinion, `gpt` the independent one.
+- **Local: `local`** (`qwen3-coder:30b`); `local-pro` if disk and patience allow.
+- The `gemini` direct-API provider has **no aliases** — bare Gemini model names only. Raw slugs always pass through on every provider, so unaliased models work via `--model <slug>`.
 
 ### Tuning sampling: `--temperature` and `--max-tokens`
 
@@ -139,7 +135,7 @@ Two runtime knobs control how much the model says and how exploratory it is:
 |---|---|---|---|
 | `--temperature <float>` | `0.3` (env: `CODE_REVIEW_TEMPERATURE`) | Sampling randomness. Higher = more exploration, more findings per call, more hallucinations. Lower = tighter, more conservative, fewer findings. | Drop to `0.2` for security-critical PRs where decline-comment overhead is expensive. Raise to `0.5–0.7` for first-pass audits where you want maximum coverage and can afford the false-positive rate. |
 | `--max-tokens <int>` | `16000` (env: `CODE_REVIEW_MAX_TOKENS`) | Ceiling on output token count. Not a target — you pay only for what the model actually emits. Default ensures a thorough review isn't truncated mid-finding. | Rarely needs changing. Drop to `4000` if you genuinely want short, focused output (e.g. CI-step where only critical findings matter). Raise if you see truncated `Suggested change:` blocks in very large reviews. |
-| `--min-severity <LEVEL>` | `LOW` (no filter) | Prompt-level severity floor: `MEDIUM`/`HIGH`/`CRITICAL` drop lower-severity findings from the output entirely. | `HIGH` for fast pre-commit gates; leave at `LOW` for the thorough pre-PR pass. |
+| `--min-severity <LEVEL>` | `LOW` (no filter; env: `CODE_REVIEW_MIN_SEVERITY`) | Prompt-level severity floor: `MEDIUM`/`HIGH`/`CRITICAL` drop lower-severity findings from the output entirely. | `HIGH` for fast pre-commit gates; leave at `LOW` for the thorough pre-PR pass. |
 | `--retries <N>` | `0` (env: `CODE_REVIEW_RETRIES`) | Extra retry attempts beyond the built-in single transient retry; `N > 0` also retries RATE_LIMIT honoring `Retry-After` (clamped 300s). | Set `2–3` for unattended runs; keep `0` when your agent loop manages its own backoff. |
 
 The temperature default has been retuned twice based on empirical observation:
@@ -159,11 +155,7 @@ uv run review.py --codebase --exclude '**/test_*'        # widen then narrow
 uv run review.py --codebase --model claude               # use Claude as the codebase reviewer
 ```
 
-Selection pipeline: `git ls-files` → user `--include` (if any) → user `--exclude` → built-in defensive excludes (lock files, minified bundles, binary asset extensions, `*/dist/*`, `*/build/*`) → drop individual files >100 KB (logged on stderr).
-
-Pre-flight bundle cap is 700 K chars (~175 K tokens — conservative against both Gemini 2.5 Pro's 1 M context and Claude Sonnet 4.5's 200 K context). If the bundle exceeds the cap, the runner exits with the 10 largest files in the current selection so you can target `--exclude` effectively rather than paying for a request that would fail mid-flight.
-
-Output is the same severity-tagged per-file findings format as diff mode — same accept/decline heuristics apply.
+Selection pipeline and the 700K-char bundle cap are documented in the README's "Whole-codebase mode"; over the cap, the runner lists the 10 largest files so you can target `--exclude` (or use `--chunk` — see "Scaling scope" below). Output is the same severity-tagged per-file findings format as diff mode — same accept/decline heuristics apply.
 
 ---
 
@@ -174,7 +166,7 @@ Output is the same severity-tagged per-file findings format as diff mode — sam
 2. (If reviewing untracked files in codebase mode: `git add -N <paths>`
    first so `git ls-files` sees them. No staged content; just makes
    them visible to the bundler.)
-3. Run:  uv run --project <runner> <runner>/review.py --base origin/main
+3. Run:  code-review --base origin/main   (checkout: uv run review.py ...)
 4. Read the structured-markdown output. Findings are tagged
    CRITICAL > HIGH > MEDIUM > LOW.
 5. For each finding, decide: accept or decline.
@@ -237,19 +229,27 @@ The runner exits with **typed exit codes** so an LLM caller can react differentl
 | 14 | TRANSPORT | exponential backoff; escalate after 3 |
 | 1 | UNKNOWN | read stderr; escalate |
 
-Stderr always starts with a stable line `ERROR: <CATEGORY> [exit <N>]` followed by free-form human-readable detail. An agent can grep that prefix to extract the category without parsing. Informational stderr lines never start with `ERROR:` — they use the fixed prefixes `Reviewing`, `WARN:`, `[usage]`, `[retry]`, `[ollama]`, and `skip` (full table in the README's "Stderr format" section).
+Stderr always starts with a stable line `ERROR: <CATEGORY> [exit <N>]` followed by free-form human-readable detail. An agent can grep that prefix to extract the category without parsing. Informational stderr lines never start with `ERROR:` — the full fixed prefix vocabulary lives in the README's "Stderr format" table (one source of truth; don't rely on partial lists). `Ctrl-C` exits 130 with `Interrupted.` on stderr.
 
 The runner **auto-retries once** on `PROVIDER_HICCUP` and `TRANSPORT` before exiting; other categories surface immediately because retrying without changes doesn't help. Pass `--retries N` (env `CODE_REVIEW_RETRIES`) to grant N additional attempts with exponential backoff — that also enables `RATE_LIMIT` retries honoring the provider's `Retry-After` (clamped to 300s). `CONFIG` / `SAFETY_REFUSAL` / `CONTEXT_OVERFLOW` are never retried. An agent that manages its own retry loop should keep `--retries 0` (the default) to stay in control of timing.
 
 Two agent-facing conveniences: `--dry-run` resolves everything and prints prompt sizes / est. tokens / the file list without spending tokens (read-only git/gh subprocesses and the Ollama `/api/ps` probe still run, so exit-12 parity holds), and `--output <path>` writes the review to a file alongside stdout. `--min-severity HIGH` narrows a round to the findings worth acting on first.
 
-**For high-stakes reviews, run a panel.** `--models pro,claude,deepseek --format json` fans the same review across models and merges findings with `found_by` consensus annotations. A finding two vendors agree on is nearly always real; a singleton is where hallucinations live (see "Local vs cloud"). Panel exit contract: ≥1 model succeeded → exit 0 with per-model failures as `WARN: [panel] …` lines and `per_model[].error` entries; all failed → one typed error chosen by `CONFIG > SAFETY_REFUSAL > CONTEXT_OVERFLOW > RATE_LIMIT > PROVIDER_HICCUP > TRANSPORT > UNKNOWN`.
+## Consuming output programmatically (`--format json`, `--baseline`)
 
-**Invocation:** an installed `code-review` (via `uv tool install`) runs from any repo; a checkout uses `uv run review.py`. Per-project defaults (models, excludes, severity floor, project-specific safety context) belong in a `.code-review.toml` at the reviewed repo's root — precedence is CLI > env > project config > default, config loads are announced on stderr, and credentials are never read from project config.
+**Prefer `--format json` when consuming findings programmatically.** It parses the markdown into `{summary, findings[{file, line, severity, title, body, suggestion, fingerprint}], parse_ok, …}` locally (prompts unchanged); on parse failure it exits 0 with `parse_ok: false` and the raw markdown embedded — branch on the field, not the exit code.
 
-**Reach for `--full-files` when hunk context isn't enough.** Diff review sees ±5 lines around each change; `--full-files` adds the changed files' complete content as reference so the model can catch changes that are locally fine but wrong against code elsewhere in the file. **Reach for `--chunk` when the payload can't fit** (huge diffs, whole codebases through a small local window): sequential per-chunk reviews, fail-fast (exit 0 only if every chunk succeeded), at the documented cost of cross-chunk blindness.
+Chain rounds with `--output round1.json` then `--baseline round1.json`: findings come back tagged `new`/`persisting` plus a `resolved` list, which replaces "re-read the whole review and remember what you declined" with set arithmetic. Matching is heuristic (location carries reworded titles; ±10-line window) — treat statuses as strong hints. Full envelope schema: README, "Structured output".
 
-**Prefer `--format json` when consuming findings programmatically.** It parses the markdown into `{summary, findings[{file, line, severity, title, body, suggestion, fingerprint}], parse_ok, …}` locally (prompts unchanged); on parse failure it exits 0 with `parse_ok: false` and the raw markdown embedded — branch on the field, not the exit code. Chain rounds with `--output round1.json` then `--baseline round1.json`: findings come back tagged `new`/`persisting` plus a `resolved` list, which replaces "re-read the whole review and remember what you declined" with set arithmetic. Matching is heuristic (location carries reworded titles; ±10-line window) — treat statuses as strong hints.
+## Panels for high-stakes reviews (`--models`)
+
+`--models pro,claude,deepseek --format json` fans the same review across models and merges findings with `found_by` consensus annotations. A finding two vendors agree on is nearly always real; a singleton is where hallucinations live (see "Local vs cloud"). Expect `found_by=1` as the norm — consensus is a rare, high-precision signal. Panel exit contract: ≥1 model succeeded → exit 0 with per-model failures as `WARN: [panel] …` lines and `per_model[].error` entries; all failed → one typed error chosen by `CONFIG > SAFETY_REFUSAL > CONTEXT_OVERFLOW > RATE_LIMIT > PROVIDER_HICCUP > TRANSPORT > UNKNOWN`.
+
+## Scaling scope (`--full-files`, `--chunk`)
+
+**Reach for `--full-files` when hunk context isn't enough.** Diff review sees ±5 lines around each change; `--full-files` adds the changed files' complete content as reference so the model can catch changes that are locally fine but wrong against code elsewhere in the file.
+
+**Reach for `--chunk` when the payload can't fit** (huge diffs, whole codebases through a small local window): sequential per-chunk reviews at file granularity, fail-fast (exit 0 only if every chunk succeeded), at the documented cost of cross-chunk blindness — cross-file findings don't survive chunk boundaries, so prefer a bigger window or narrower scope when you can.
 
 ## Safety context
 
@@ -261,7 +261,7 @@ See the README's "Safety context" section for the default phrasing.
 
 ## Known gotchas
 
-1. **Free-tier 429 on Gemini direct.** `--provider gemini --model gemini-2.5-pro` requires a paid Google AI Studio plan; the free tier returns HTTP 429 immediately (`RATE_LIMIT`, exit 11). Either use `--provider openrouter` (preferred) or `--model gemini-2.5-flash`.
+1. **Free-tier 429 on Gemini direct.** `--provider gemini --model gemini-2.5-pro` required a paid Google AI Studio plan as of late 2025 — the free tier returned HTTP 429 immediately (`RATE_LIMIT`, exit 11). Quota policy is Google's to change; the symptom is what's stable. Either use `--provider openrouter` (preferred) or `--model gemini-2.5-flash`.
 
 2. **Codebase mode line numbers used to drift.** Before commit `b124501`, the bundle had no per-line anchors and the model estimated line positions from visual context, drifting 5–150 lines depending on file size. As of `b124501` every content line is pre-numbered (`cat -n` style) and the model transcribes the prefix instead of counting. If you ever see drift again on a current build, that's a regression worth investigating — the prompt or bundle format may have been changed in a way that broke the contract.
 
@@ -357,13 +357,13 @@ This is the artifact a human reviewer reads to understand what changed and why. 
 The command shape used most often during iterative work:
 
 ```bash
-uv run --project /path/to/local-gemini-code-review /path/to/local-gemini-code-review/review.py --base origin/main 2>&1 | tee /tmp/review.md
+code-review --base origin/main --output /tmp/review.md
 ```
 
-Tail the file in another shell, or pipe to `head -80` if you only want the top findings.
+(`--output` writes stdout to the file too — no `tee` needed, and it works the same on Windows. From a checkout, substitute `uv run review.py`.) Re-read the file across steps instead of re-invoking the tool; pipe stdout to `head -80` if you only want the top findings.
 
 ---
 
 ## Provenance
 
-This fork keeps the upstream `gemini-cli-extensions/code-review` skill and command prompts byte-identical so upstream improvements rebase cleanly. Fork additions: `review.py` (three-provider runner: OpenRouter / Gemini API / local Ollama), `pyproject.toml`, `.env.example`, `.gitignore`, this runbook, and a rewritten root `README.md`. See the root README for the full list of fork modifications and how to sync against upstream.
+This fork keeps the upstream `gemini-cli-extensions/code-review` skill and command prompts byte-identical so upstream improvements merge cleanly. Fork additions: the `code_review/` runner package (three providers: OpenRouter / Gemini API / local Ollama; `review.py` remains as a checkout shim), the codebase-review skill + command, `pyproject.toml` packaging (`code-review` entry point), `.env.example`, `tests/`, `evals/`, the CI workflows, this runbook, and a rewritten root `README.md`. See the root README's "Fork provenance" section for the full table and upstream-sync commands.
