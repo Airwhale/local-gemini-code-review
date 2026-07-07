@@ -91,7 +91,7 @@ Unlike the cloud providers, which return an error when a prompt exceeds the mode
 
 | Window resolution | What the runner sends | Enforcement |
 |---|---|---|
-| `$OLLAMA_NUM_CTX` set (env or project config) | that value | **Hard** pre-flight `CONTEXT_OVERFLOW` (exit 12) on likely overflow. Requested per call — no server restart; KV cache scales with the window, so stay within RAM/VRAM. |
+| `$OLLAMA_NUM_CTX` set (env only — the reviewed repo's `.code-review.toml` deliberately can't set it; see [Per-project configuration](#per-project-configuration-code-reviewtoml)) | that value | **Hard** pre-flight `CONTEXT_OVERFLOW` (exit 12) on likely overflow. Requested per call — no server restart; KV cache scales with the window, so stay within RAM/VRAM. |
 | Model already loaded | the actual window read from `GET /api/ps` (`[ollama] detected context window …` on stderr), sent back unchanged — no reload | **Hard** pre-flight. In an iterative loop this covers every round after the first. |
 | Unknown (first call, model cold) | `num_ctx` **omitted** — the server keeps its VRAM-tier default ([docs](https://docs.ollama.com/context-length): 4K < 24 GiB, 32K for 24–48 GiB, 256K above) | Warn-only pre-flight, then a **hard post-call verify**: if the response's `prompt_eval_count` sits at the window (re-probed once the model is loaded), the output is *discarded* with exit 12 rather than returned as a bogus review. |
 

@@ -18,7 +18,7 @@ The M1–M7 roadmap: the single-file runner became an installable, testable, age
 - `--repo owner/name` pins the repository for `--pr` (bare PR numbers resolve through gh's default-repo logic, which on forks often points at upstream); every `--pr` run announces the resolved PR URL on stderr (`[gh] reviewing PR #N: <url>`).
 - Per-project `.code-review.toml` (upward walk, announced on load, unknown keys dropped with a WARN).
 - Ollama native `/api/chat` with a context-window truncation guard: 3-tier window resolution (`$OLLAMA_NUM_CTX` → `/api/ps` detection → advisory), per-request `num_ctx`, and a post-call `prompt_eval_count` verify that caught a real silent truncation in live testing.
-- Quality infra: 286-test suite including `httpx.MockTransport` wire tests and frozen real-model parser fixtures; ruff + mypy (source *and* tests/evals) gating CI on ubuntu + windows; wheel-content verification; an eval harness with planted-bug fixtures **and a clean-diff control** scoring recall and hallucination noise.
+- Quality infra: an offline test suite (several hundred tests: `httpx.MockTransport` wire tests, frozen real-model parser fixtures, contract pins); ruff + mypy (source *and* tests/evals) gating CI on ubuntu + windows; wheel-content verification; an eval harness with planted-bug fixtures **and a clean-diff control** scoring recall and hallucination noise.
 - Docs: rewritten README (contract tables for agent callers), operations runbook, architecture overview, SECURITY.md threat model, issue/PR templates.
 
 ### Changed
