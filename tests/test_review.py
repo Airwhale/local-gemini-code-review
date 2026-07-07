@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -665,7 +666,7 @@ class TestWriteOutputFile:
 
 
 def _settings(**overrides) -> Settings:
-    base = dict(
+    base: dict[str, Any] = dict(
         provider="openrouter",
         model="google/gemini-2.5-pro",
         temperature=0.3,

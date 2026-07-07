@@ -18,9 +18,12 @@ Secrets:       .env, loaded in layers (real env vars always win):
                  2. %APPDATA%\code-review\.env (Windows) /
                     ~/.config/code-review/.env (elsewhere)
                  3. the checkout's repo-root .env
-Per-project:   non-secret defaults in .code-review.toml at the REVIEWED repo's
-               root (models, excludes, severity floor, context). Secrets are
-               never read from the reviewed repo.
+Per-project:   review-shaping defaults in .code-review.toml at the REVIEWED
+               repo's root (provider, models, excludes, severity floor,
+               format, tuning). Secrets, prompt context, and ollama_*
+               endpoint/window settings are NEVER read from the reviewed
+               repo (untrusted-checkout injection/exfiltration vectors);
+               --no-project-config ignores the file entirely.
 ```
 
 Set the key for whichever cloud provider you'll use; missing keys fail fast with a clear error. The local provider needs no key — just a running Ollama server.
@@ -29,7 +32,7 @@ Set the key for whichever cloud provider you'll use; missing keys fail fast with
 - `GEMINI_API_KEY` — direct Google AI Studio path
 - *(none)* — local Ollama. Requires `ollama serve` running and at least one model pulled.
 
-Optional environment variables (each also has a `.code-review.toml` key; the tuning knobs also have flags — see the table below):
+Optional environment variables (most also have a `.code-review.toml` key — but not `CODE_REVIEW_CONTEXT` or the `OLLAMA_*` settings, which are never read from the reviewed repo; the tuning knobs also have flags — see the table below):
 
 - `CODE_REVIEW_PROVIDER` — provider default (e.g. `ollama`)
 - `OPENROUTER_MODEL` / `GEMINI_MODEL` / `OLLAMA_MODEL` — per-provider default model
@@ -55,7 +58,7 @@ uv run review.py --pr 42
 uv run --project /path/to/local-gemini-code-review /path/to/local-gemini-code-review/review.py --base origin/main
 ```
 
-Secrets are configured once (per-user or checkout `.env` — see Setup) and work from any directory. Per-project defaults come from the reviewed repo's `.code-review.toml`; loading one is announced with a `[config] loaded <path>` stderr line.
+Secrets are configured once (per-user or checkout `.env` — see Setup) and work from any directory. Per-project defaults come from the reviewed repo's `.code-review.toml`; loading one is announced with a `[config] loaded <path>` stderr line. **When auditing an untrusted checkout, pass `--no-project-config`**: the file can shape the review (model choice, temperature, and `exclude` — which can hide files from `--codebase`), though it can never set credentials, prompt context, or the Ollama endpoint.
 
 ### Source modes (mutually exclusive)
 
@@ -135,7 +138,7 @@ Two runtime knobs control how much the model says and how exploratory it is:
 |---|---|---|---|
 | `--temperature <float>` | `0.3` (env: `CODE_REVIEW_TEMPERATURE`) | Sampling randomness. Higher = more exploration, more findings per call, more hallucinations. Lower = tighter, more conservative, fewer findings. | Drop to `0.2` for security-critical PRs where decline-comment overhead is expensive. Raise to `0.5–0.7` for first-pass audits where you want maximum coverage and can afford the false-positive rate. |
 | `--max-tokens <int>` | `16000` (env: `CODE_REVIEW_MAX_TOKENS`) | Ceiling on output token count. Not a target — you pay only for what the model actually emits. Default ensures a thorough review isn't truncated mid-finding. | Rarely needs changing. Drop to `4000` if you genuinely want short, focused output (e.g. CI-step where only critical findings matter). Raise if you see truncated `Suggested change:` blocks in very large reviews. |
-| `--min-severity <LEVEL>` | `LOW` (no filter; env: `CODE_REVIEW_MIN_SEVERITY`) | Prompt-level severity floor: `MEDIUM`/`HIGH`/`CRITICAL` drop lower-severity findings from the output entirely. | `HIGH` for fast pre-commit gates; leave at `LOW` for the thorough pre-PR pass. |
+| `--min-severity <LEVEL>` | `LOW` (no filter; env: `CODE_REVIEW_MIN_SEVERITY`) | Severity floor: `MEDIUM`/`HIGH`/`CRITICAL` drop lower-severity findings. Asked of the model in the prompt AND enforced post-parse in `--format json` envelopes and panel reports (verbatim markdown stays best-effort). | `HIGH` for fast pre-commit gates; leave at `LOW` for the thorough pre-PR pass. |
 | `--retries <N>` | `0` (env: `CODE_REVIEW_RETRIES`) | Extra retry attempts beyond the built-in single transient retry; `N > 0` also retries RATE_LIMIT honoring `Retry-After` (clamped 300s). | Set `2–3` for unattended runs; keep `0` when your agent loop manages its own backoff. |
 
 The temperature default has been retuned twice based on empirical observation:

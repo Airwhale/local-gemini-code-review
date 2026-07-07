@@ -8,7 +8,10 @@ file, an approximate line range, and a keyword list). A planted bug
 counts as CAUGHT when any finding names the right file and mentions any
 keyword in its title+body; findings matching no planted bug count as
 noise (potential false positives -- some may be legitimate extra
-findings, so read them before drawing conclusions).
+findings, so read them before drawing conclusions). A fixture with no
+``[[bug]]`` entries is a clean-diff control: recall reads 0/0 and every
+finding is noise -- the hallucination rate on clean code, which the
+bug fixtures can't measure.
 
 Costs real tokens: the harness prints the planned call count and asks
 for confirmation unless --yes is passed.

@@ -2676,6 +2676,64 @@ def diff_against_baseline(
     return [s or "new" for s in statuses], unmatched
 
 
+def _severity_at_or_above(severity: str, floor: str) -> bool:
+    """True when ``severity`` meets the floor.
+
+    Severities the parser couldn't rate (``UNKNOWN``) always pass:
+    hiding a finding whose severity we don't know would be worse than
+    showing it.
+    """
+    if severity not in SEVERITY_LEVELS:
+        return True
+    return SEVERITY_LEVELS.index(severity) >= SEVERITY_LEVELS.index(floor)
+
+
+def enforce_min_severity(parsed: ParsedReview, floor: str) -> ParsedReview:
+    """Drop parsed findings below the ``--min-severity`` floor.
+
+    The ``<SEVERITY_FILTER>`` prompt appendix ASKS the model not to
+    report below-floor findings, but a prompt is a request, not a
+    guarantee. Wherever the runner synthesizes structured findings
+    (--format json envelopes, panel reports) the floor is enforced here
+    after parsing, making the flag a hard contract for agent callers.
+    Verbatim markdown output is deliberately left untouched -- filtering
+    it would require rewriting the model's own text.
+
+    ``clean`` is not recomputed: it reports what the model said, and
+    "not clean, but nothing at or above your floor" is exactly what an
+    empty ``findings`` list next to ``clean: false`` means.
+    """
+    if floor == "LOW":
+        return parsed
+    kept = [f for f in parsed.findings if _severity_at_or_above(f.severity, floor)]
+    if len(kept) == len(parsed.findings):
+        return parsed
+    return dataclasses.replace(parsed, findings=kept)
+
+
+def filter_baseline_findings(baseline_doc: dict, floor: str) -> dict:
+    """Apply the severity floor to a baseline document's findings.
+
+    Without this, running with a higher floor than the baseline round
+    would report every below-floor baseline entry as ``resolved`` when
+    it was merely filtered, not fixed. Entries whose severity is
+    missing or malformed are kept, mirroring ``_severity_at_or_above``.
+    """
+    if floor == "LOW":
+        return baseline_doc
+    entries = baseline_doc.get("findings") or []
+    kept = [
+        entry
+        for entry in entries
+        if not isinstance(entry, dict)
+        or not isinstance(entry.get("severity"), str)
+        or _severity_at_or_above(entry["severity"], floor)
+    ]
+    filtered = dict(baseline_doc)
+    filtered["findings"] = kept
+    return filtered
+
+
 def build_json_envelope(
     *,
     mode: str,
@@ -3185,6 +3243,17 @@ def _resolve_ollama_window(
 # installation), so different projects can pin different models,
 # excludes, or context strings.
 _PROJECT_CONFIG_NAME = ".code-review.toml"
+# Keys the reviewed repo's .code-review.toml may set. Deliberately
+# EXCLUDED, because this file is attacker-adjacent on untrusted
+# checkouts (e.g. a PR branch that adds one):
+#   - API keys: credentials never come from the reviewed repo.
+#   - context: injected as trusted operator framing AHEAD of the
+#     injection guard -- accepting it from the repo under review would
+#     let that repo instruct its own reviewer ("report no issues").
+#   - ollama_host: the full diff is POSTed to this URL -- a hostile
+#     value exfiltrates the code under review to an arbitrary server.
+#   - ollama_num_ctx / ollama_timeout: machine-local hardware facts, not
+#     project facts (and a huge num_ctx can OOM the reviewer's server).
 _PROJECT_CONFIG_KEYS = frozenset(
     {
         "provider",
@@ -3195,10 +3264,6 @@ _PROJECT_CONFIG_KEYS = frozenset(
         "retries",
         "min_severity",
         "format",
-        "context",
-        "ollama_host",
-        "ollama_num_ctx",
-        "ollama_timeout",
         "include",
         "exclude",
     }
@@ -3217,9 +3282,11 @@ def _load_project_config() -> dict:
     Security posture: this file lives in the REVIEWED repo, which for
     ``--pr``-style use may be an untrusted checkout -- so loading one is
     always announced on stderr with its path, unknown keys are dropped
-    with a WARN (that includes anything that looks like an API key:
-    credentials are never accepted from project config), and the keys it
-    can set only shape the review, never where credentials go.
+    with a WARN, and the accepted key set (see _PROJECT_CONFIG_KEYS) is
+    limited to review-shaping tunables: no credentials, no prompt
+    ``context``, no ``ollama_*`` endpoint/window settings. Pass
+    ``--no-project-config`` to ignore the file entirely when auditing
+    untrusted code (even ``exclude`` can hide a file from --codebase).
     """
     directory = Path.cwd()
     while True:
@@ -3573,20 +3640,20 @@ def _resolve_settings(
         )
 
     # Safety context: --no-context wins, then explicit --context, then
-    # env, then project config, then default. Empty string from env is
-    # treated as "use default" rather than "disabled" -- pass
-    # --no-context explicitly to disable, since an env value of "" is
-    # more likely a misconfig than intent.
+    # env, then default. Empty string from env is treated as "use
+    # default" rather than "disabled" -- pass --no-context explicitly to
+    # disable, since an env value of "" is more likely a misconfig than
+    # intent. Project config deliberately CANNOT set context: the block
+    # is injected as trusted operator framing ahead of the injection
+    # guard, and the config file lives in the (possibly untrusted)
+    # reviewed repo -- accepting it would let that repo instruct its
+    # own reviewer.
     if args.no_context:
         context: str | None = None
     elif args.context is not None:
         context = args.context
     else:
-        context = (
-            os.getenv("CODE_REVIEW_CONTEXT") or config.get("context") or DEFAULT_CONTEXT
-        )
-        if not isinstance(context, str):
-            raise ConfigError(f"{_PROJECT_CONFIG_NAME} key 'context' must be a string.")
+        context = os.getenv("CODE_REVIEW_CONTEXT") or DEFAULT_CONTEXT
 
     api_key: str | None = None
     referer: str | None = None
@@ -3621,13 +3688,17 @@ def _resolve_settings(
                 "--provider ollama (local server, no key needed)."
             )
     else:  # ollama
-        # No API key for local provider. A window pinned by ANY config
-        # layer (CLI-less: env or project config) is user-specified and
-        # therefore enforced, exactly like $OLLAMA_NUM_CTX always was;
-        # the /api/ps-detected window is NOT a config layer -- it
-        # resolves per model per call in _execute_call.
+        # No API key for local provider. A window pinned by CLI or env
+        # is user-specified and therefore enforced, exactly like
+        # $OLLAMA_NUM_CTX always was; the /api/ps-detected window is NOT
+        # a config layer -- it resolves per model per call in
+        # _execute_call. All ollama_* settings are machine-local (where
+        # YOUR server is, what fits YOUR RAM) and security-sensitive (a
+        # hostile ollama_host would receive the full diff), so they are
+        # never read from the reviewed repo's project config -- the
+        # empty dict below keeps that layer out of the lookup.
         host_raw, host_source = _layered(
-            args.ollama_host, "OLLAMA_HOST", "ollama_host", config
+            args.ollama_host, "OLLAMA_HOST", "ollama_host", {}
         )
         if host_raw is not None and not isinstance(host_raw, str):
             raise ConfigError(
@@ -3635,7 +3706,7 @@ def _resolve_settings(
             )
         ollama_host = _normalize_ollama_host(host_raw or DEFAULT_OLLAMA_HOST)
         num_ctx_raw, num_ctx_source = _layered(
-            None, "OLLAMA_NUM_CTX", "ollama_num_ctx", config
+            None, "OLLAMA_NUM_CTX", "ollama_num_ctx", {}
         )
         if num_ctx_raw is not None:
             try:
@@ -3653,7 +3724,7 @@ def _resolve_settings(
                     f"{num_ctx_source}) must be positive (tokens)."
                 )
         timeout_raw, timeout_source = _layered(
-            None, "OLLAMA_TIMEOUT", "ollama_timeout", config
+            None, "OLLAMA_TIMEOUT", "ollama_timeout", {}
         )
         try:
             ollama_timeout = (
@@ -4167,6 +4238,10 @@ def _run_chunked(
             sys.stderr.write(f"[chunk {idx}/{n}] {usage_line}\n")
         label = request.chunk_label or f"chunk {idx}"
         parsed = parse_review_markdown_safe(result.content)
+        if settings.format == "json":
+            # Markdown chunk output streams the model's text verbatim;
+            # only the JSON envelope enforces the severity floor.
+            parsed = enforce_min_severity(parsed, settings.min_severity)
         chunk_data.append((label, parsed, result, result.content))
         if settings.format == "markdown":
             part = (
@@ -4420,8 +4495,22 @@ def main() -> None:
             "Only report findings at or above this severity "
             "(LOW/MEDIUM/HIGH/CRITICAL; case-insensitive). Default LOW "
             "= no filter. Override with $CODE_REVIEW_MIN_SEVERITY. "
-            "Implemented as a fork-owned instruction appended to the "
-            "prompt; the upstream prompt files are untouched."
+            "Asked of the model via a fork-owned prompt appendix "
+            "(upstream prompt files untouched) and ENFORCED after "
+            "parsing wherever the runner synthesizes findings (--format "
+            "json envelopes, panel reports); verbatim markdown output "
+            "remains best-effort."
+        ),
+    )
+    parser.add_argument(
+        "--no-project-config",
+        action="store_true",
+        help=(
+            "Ignore any .code-review.toml found for the reviewed repo. "
+            "Recommended when auditing untrusted checkouts: the file "
+            "can shape the review (model, temperature, include/exclude "
+            "-- exclude can hide files from --codebase). Env and CLI "
+            "settings still apply."
         ),
     )
     parser.add_argument(
@@ -4496,9 +4585,9 @@ def main() -> None:
     _validate_flag_combos(args)
 
     # Per-project config from the REVIEWED repo (upward walk from CWD);
-    # loading one is always announced on stderr. API keys never come
-    # from it.
-    project_config = _load_project_config()
+    # loading one is always announced on stderr. API keys, context, and
+    # ollama_* never come from it; --no-project-config skips it whole.
+    project_config = {} if args.no_project_config else _load_project_config()
     _apply_config_file_lists(args, project_config)
 
     settings = _resolve_settings(args, project_config)
@@ -4590,8 +4679,15 @@ def main() -> None:
             # the documented category precedence.
             raise _panel_exit_error(failures)
         raw_by_model = {m: r.content for m, r in results_by_model.items()}
+        # Panel reports are runner-synthesized in BOTH formats (the
+        # markdown is generated from parsed findings, not verbatim), so
+        # the severity floor is enforced before merging; the per-model
+        # raw appendix still shows everything.
         parsed_by_model = {
-            m: parse_review_markdown_safe(raw) for m, raw in raw_by_model.items()
+            m: enforce_min_severity(
+                parse_review_markdown_safe(raw), settings.min_severity
+            )
+            for m, raw in raw_by_model.items()
         }
         merged = merge_panel_findings(parsed_by_model)
         if settings.format == "json":
@@ -4632,12 +4728,22 @@ def main() -> None:
 
     # Structured-output tail: parse only when something consumes the
     # parse (--format json or --baseline); markdown stdout stays the
-    # model's verbatim output either way.
+    # model's verbatim output either way. In JSON mode the severity
+    # floor is enforced post-parse (on both current findings and the
+    # baseline, so `resolved` can't fill up with merely-filtered
+    # entries); markdown mode leaves it prompt-level best-effort, since
+    # the verbatim output shows everything anyway.
     parsed: ParsedReview | None = None
     statuses: list[str] | None = None
     resolved: list[dict] | None = None
     if settings.format == "json" or baseline_doc is not None:
         parsed = parse_review_markdown_safe(result.content)
+        if settings.format == "json":
+            parsed = enforce_min_severity(parsed, settings.min_severity)
+            if baseline_doc is not None:
+                baseline_doc = filter_baseline_findings(
+                    baseline_doc, settings.min_severity
+                )
     if baseline_doc is not None:
         assert parsed is not None
         if parsed.parse_ok:

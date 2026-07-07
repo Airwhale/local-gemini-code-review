@@ -12,6 +12,7 @@ parser whose whole job is tolerating real-model drift.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -19,8 +20,11 @@ from code_review.cli import (
     CallResult,
     ConfigError,
     Finding,
+    ParsedReview,
     build_json_envelope,
     diff_against_baseline,
+    enforce_min_severity,
+    filter_baseline_findings,
     finding_fingerprint,
     findings_match,
     load_baseline,
@@ -287,7 +291,7 @@ class TestDogfoodFixtures:
 
 class TestFingerprints:
     def _finding(self, **overrides) -> Finding:
-        base = dict(
+        base: dict[str, Any] = dict(
             file="a.py",
             line=42,
             severity="HIGH",
@@ -318,6 +322,78 @@ class TestFingerprints:
         assert finding_fingerprint(self._finding()) != finding_fingerprint(
             self._finding(severity="LOW")
         )
+
+
+class TestMinSeverityEnforcement:
+    """The <SEVERITY_FILTER> prompt block is a request; JSON envelopes
+    and panel reports enforce the floor post-parse via these helpers."""
+
+    def _finding(self, severity: str) -> Finding:
+        return Finding(
+            file="a.py",
+            line=10,
+            severity=severity,
+            title=f"{severity} finding",
+            body="",
+            suggestion=None,
+        )
+
+    def _parsed(self, severities: list[str]) -> ParsedReview:
+        return ParsedReview(
+            summary="s",
+            findings=[self._finding(s) for s in severities],
+            clean=False,
+            parse_ok=True,
+            problems=[],
+        )
+
+    def test_drops_below_floor(self):
+        parsed = self._parsed(["LOW", "MEDIUM", "HIGH", "CRITICAL"])
+        filtered = enforce_min_severity(parsed, "HIGH")
+        assert [f.severity for f in filtered.findings] == ["HIGH", "CRITICAL"]
+
+    def test_unknown_severity_always_kept(self):
+        # Hiding a finding the parser couldn't rate would be worse than
+        # showing it.
+        parsed = self._parsed(["LOW", "UNKNOWN"])
+        filtered = enforce_min_severity(parsed, "CRITICAL")
+        assert [f.severity for f in filtered.findings] == ["UNKNOWN"]
+
+    def test_low_floor_is_noop_same_object(self):
+        parsed = self._parsed(["LOW"])
+        assert enforce_min_severity(parsed, "LOW") is parsed
+
+    def test_nothing_dropped_returns_same_object(self):
+        parsed = self._parsed(["HIGH", "CRITICAL"])
+        assert enforce_min_severity(parsed, "HIGH") is parsed
+
+    def test_clean_and_parse_ok_untouched(self):
+        # `clean` reports what the model said; an all-filtered review is
+        # "not clean, but nothing at your floor", not "clean".
+        parsed = self._parsed(["LOW"])
+        filtered = enforce_min_severity(parsed, "HIGH")
+        assert filtered.findings == []
+        assert filtered.clean is False
+        assert filtered.parse_ok is True
+
+    def test_baseline_entries_filtered_too(self):
+        # Below-floor baseline entries must not surface as "resolved"
+        # when they were merely filtered, not fixed.
+        doc = {
+            "findings": [
+                {"severity": "LOW", "fingerprint": "abc", "file": "a.py"},
+                {"severity": "HIGH", "fingerprint": "def", "file": "a.py"},
+            ]
+        }
+        filtered = filter_baseline_findings(doc, "HIGH")
+        assert [e["severity"] for e in filtered["findings"]] == ["HIGH"]
+        # Original document is not mutated.
+        assert len(doc["findings"]) == 2
+
+    def test_baseline_malformed_entries_kept(self):
+        doc = {"findings": [{"fingerprint": "abc"}, "not-a-dict"]}
+        filtered = filter_baseline_findings(doc, "HIGH")
+        assert filtered["findings"] == [{"fingerprint": "abc"}, "not-a-dict"]
 
 
 class TestBaseline:

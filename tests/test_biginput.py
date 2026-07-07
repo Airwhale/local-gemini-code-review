@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -242,7 +243,7 @@ class TestFlagCombos:
 
 
 def _settings(**overrides) -> Settings:
-    base = dict(
+    base: dict[str, Any] = dict(
         provider="openrouter",
         model="m",
         temperature=0.3,

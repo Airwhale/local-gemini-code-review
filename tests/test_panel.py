@@ -5,6 +5,7 @@ resolution rules."""
 from __future__ import annotations
 
 import argparse
+from typing import Any
 
 import pytest
 
@@ -44,7 +45,7 @@ def _finding(
     )
 
 
-def _parsed(findings: list[Finding], summary: str = "s") -> ParsedReview:
+def _parsed(findings: list[Finding], summary: str | None = "s") -> ParsedReview:
     return ParsedReview(
         summary=summary,
         findings=findings,
@@ -262,7 +263,7 @@ class TestPanelRendering:
 
 
 def _args(**overrides) -> argparse.Namespace:
-    base = dict(
+    base: dict[str, Any] = dict(
         base=None,
         pr=None,
         staged=False,

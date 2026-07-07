@@ -49,4 +49,4 @@ extend-select = ["I"]
 [tool.mypy]
 python_version = "3.11"
 check_untyped_defs = true
-files = ["code_review"]
+files = ["code_review", "tests", "evals"]

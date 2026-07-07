@@ -146,7 +146,8 @@ A 700,000-char (~175K-token) bundle cap is enforced pre-flight — conservative 
 
 - `--temperature <float>` (default `0.3`, env `CODE_REVIEW_TEMPERATURE`): sampling randomness — higher finds more per call but hallucinates more. The default was retuned twice on evidence: 0.2 was too conservative (1–2 findings/round, slow convergence), 0.5 produced a confident hallucination in cross-model testing, 0.3 is the compromise. The full story lives in the [runbook](./docs/llm-code-review-runbook.md#tuning-sampling---temperature-and---max-tokens); the [eval harness](#development) can settle retuning debates with data.
 - `--max-tokens <int>` (default `16000`, env `CODE_REVIEW_MAX_TOKENS`): output ceiling, not a target — you pay only for what's emitted. If the model hits it mid-review, the partial output still prints, with a `WARN: … truncated at max_tokens` stderr line so callers know the list may be incomplete.
-- `--min-severity <LEVEL>` (default `LOW` = no filter, env `CODE_REVIEW_MIN_SEVERITY`): report only findings at or above `MEDIUM`/`HIGH`/`CRITICAL` — a fast pre-commit gate vs. the thorough pre-PR pass. Implemented as a fork-owned prompt appendix; upstream prompt files stay untouched.
+- `--min-severity <LEVEL>` (default `LOW` = no filter, env `CODE_REVIEW_MIN_SEVERITY`): report only findings at or above `MEDIUM`/`HIGH`/`CRITICAL` — a fast pre-commit gate vs. the thorough pre-PR pass. Asked of the model via a fork-owned prompt appendix (upstream prompt files stay untouched) **and enforced after parsing** wherever the runner synthesizes findings: `--format json` envelopes (including the baseline diff, so `resolved` can't fill with merely-filtered entries) and panel reports. Verbatim markdown output remains best-effort — the model's own text isn't rewritten. Findings whose severity couldn't be parsed are always kept.
+- `--no-project-config`: ignore any `.code-review.toml` found for the reviewed repo — recommended when auditing untrusted checkouts (see [Per-project configuration](#per-project-configuration-code-reviewtoml)).
 - `--retries <N>` (default `0`, env `CODE_REVIEW_RETRIES`): extra attempts beyond the built-in single 2s transient retry, with exponential backoff (60s cap/wait). `N > 0` also enables rate-limit retries honoring `Retry-After` (clamped to 300s). See [Auto-retry behavior](#auto-retry-behavior).
 - `--output <path>`: also write the review (exact stdout content) to a file, UTF-8/LF — no `tee` gymnastics on Windows, and the natural way to save rounds for `--baseline`.
 - `--dry-run`: resolve config, gather the payload, build the prompts, print a report (provider/model/temperature, prompt sizes, estimated tokens, the Ollama window + its source, the codebase file list) — and exit **without calling the model**. Read-only subprocesses (git, `gh pr diff`) and the read-only Ollama `/api/ps` probe still run, so exit-12 behavior matches a live run exactly. The best way to debug `--include`/`--exclude`.
@@ -234,17 +235,24 @@ Runs the same review through several models (concurrently on cloud, capped at 4;
 
 ## Per-project configuration (`.code-review.toml`)
 
-Put a `.code-review.toml` in any repo you review (found by upward walk from the working directory, stopping at `.git`); it supplies project defaults for `provider`, `model`, `models`, `temperature`, `max_tokens`, `retries`, `min_severity`, `format`, `context`, `ollama_host`, `ollama_num_ctx`, `ollama_timeout`, `include`, `exclude`.
+Put a `.code-review.toml` in any repo you review (found by upward walk from the working directory, stopping at `.git`); it supplies project defaults for `provider`, `model`, `models`, `temperature`, `max_tokens`, `retries`, `min_severity`, `format`, `include`, `exclude`.
 
 ```toml
 # .code-review.toml — this project reviews with a pro+flash panel and skips generated code
 models = ["pro", "flash"]
 min_severity = "MEDIUM"
 exclude = ["generated/**", "**/*_pb2.py"]
-context = "This repo is a payments compliance service; sanctions/AML language is domain vocabulary."
 ```
 
-**Precedence: CLI flag > environment (with `.env` files merged in) > `.code-review.toml` > built-in default.** Bad values fail fast as typed `CONFIG` errors naming the layer they came from. Two security properties, because this file lives in the *reviewed* (possibly untrusted) repo: loading one is always announced on stderr (`[config] loaded <path>`), and **API keys are never read from it** — credentials come from the environment only. A pinned `ollama_num_ctx` here counts as user-specified, hard-enforcing the truncation guard just like `$OLLAMA_NUM_CTX`.
+**Precedence: CLI flag > environment (with `.env` files merged in) > `.code-review.toml` > built-in default.** Bad values fail fast as typed `CONFIG` errors naming the layer they came from.
+
+**Security posture** — this file lives in the *reviewed* (possibly untrusted) repo, e.g. a PR branch could add one, so its capabilities are deliberately capped:
+
+- Loading one is always announced on stderr (`[config] loaded <path>`).
+- **API keys are never read from it** — credentials come from the environment only.
+- **`context` is never read from it.** The safety context is injected as trusted operator framing *ahead* of the prompt-injection guard; accepting it from the repo under review would let that repo instruct its own reviewer. Set per-project context via `$CODE_REVIEW_CONTEXT` or `--context` instead.
+- **`ollama_host` / `ollama_num_ctx` / `ollama_timeout` are never read from it.** The full diff is POSTed to `ollama_host` — a hostile value would exfiltrate the code under review — and the rest are machine-local hardware facts. Configure them via env or CLI.
+- `--no-project-config` skips the file entirely — recommended when auditing untrusted checkouts, since even `exclude` can hide a file from a `--codebase` review.
 
 ## Output format
 

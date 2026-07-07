@@ -9,6 +9,7 @@ four HTTP call sites.
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import httpx
 import pytest
@@ -44,7 +45,7 @@ def _json_response(
 
 
 def _openrouter(**kwargs) -> CallResult:
-    defaults = dict(
+    defaults: dict[str, Any] = dict(
         system_prompt="s",
         user_prompt="u",
         model="m",
@@ -59,7 +60,7 @@ def _openrouter(**kwargs) -> CallResult:
 
 
 def _gemini(**kwargs) -> CallResult:
-    defaults = dict(
+    defaults: dict[str, Any] = dict(
         system_prompt="s",
         user_prompt="u",
         model="m",
@@ -72,7 +73,7 @@ def _gemini(**kwargs) -> CallResult:
 
 
 def _ollama(**kwargs) -> CallResult:
-    defaults = dict(
+    defaults: dict[str, Any] = dict(
         system_prompt="s",
         user_prompt="u",
         model="m",
