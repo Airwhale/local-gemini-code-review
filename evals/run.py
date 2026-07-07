@@ -64,14 +64,20 @@ def run_review(fixture: Path, model: str, temperature: float) -> dict:
         "--temperature",
         str(temperature),
     ]
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        cwd=REPO_ROOT,
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=REPO_ROOT,
+            # Backstop above the runner's own HTTP timeouts: a hung
+            # provider must become an ERR row, not a hung harness.
+            timeout=900,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"review timed out after 900s for {fixture.name}") from exc
     if result.returncode != 0:
         raise RuntimeError(
             f"review exited {result.returncode} for {fixture.name}:\n"

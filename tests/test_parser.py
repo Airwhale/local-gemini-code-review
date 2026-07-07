@@ -502,6 +502,20 @@ class TestBaseline:
         assert statuses == ["new"]
         assert len(resolved) == 1
 
+    def test_non_list_findings_in_baseline_is_config_error(self, tmp_path):
+        # A hand-mangled findings value would TypeError deep inside
+        # diff_against_baseline -> UNKNOWN; must be typed CONFIG before
+        # any tokens are spent.
+        import json as _json
+
+        bad = tmp_path / "baseline.json"
+        bad.write_text(
+            _json.dumps({"schema_version": 1, "findings": 5}), encoding="utf-8"
+        )
+        with pytest.raises(ConfigError) as exc_info:
+            load_baseline(str(bad))
+        assert "non-list" in str(exc_info.value)
+
     def test_lineless_finding_still_persists_via_fingerprint(self):
         # Pass 1 (fingerprint) remains the path for line-less findings:
         # same file+severity+title matches regardless of missing lines.

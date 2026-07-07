@@ -387,6 +387,26 @@ class TestSettingsPrecedence:
             "anthropic/claude-sonnet-4.5",
         )
 
+    def test_config_model_non_string_is_config_error(self):
+        # Silently falling through to the provider default would hide
+        # the misconfig; bad types fail typed like every other value.
+        with pytest.raises(ConfigError) as exc_info:
+            _resolve_settings(_args(), {"model": 123})
+        assert "'model' must be a string" in str(exc_info.value)
+
+    def test_string_tunables_tolerate_whitespace(self, monkeypatch: pytest.MonkeyPatch):
+        # Quoted .env values pick up stray spaces easily; they must not
+        # fail validation over invisible characters.
+        monkeypatch.setenv("CODE_REVIEW_PROVIDER", " openrouter ")
+        monkeypatch.setenv("CODE_REVIEW_FORMAT", " json ")
+        monkeypatch.setenv("CODE_REVIEW_MIN_SEVERITY", " high ")
+        monkeypatch.setenv("OPENROUTER_MODEL", " flash ")
+        settings = _resolve_settings(_args())
+        assert settings.provider == "openrouter"
+        assert settings.format == "json"
+        assert settings.min_severity == "HIGH"
+        assert settings.model == "google/gemini-2.5-flash"  # alias resolved
+
     def test_cli_model_overrides_config_panel(self):
         # Documented precedence: CLI > project config. A --model flag
         # must win over a config-defined panel, not crash as "mutually

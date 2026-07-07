@@ -2299,11 +2299,20 @@ def _resolve_model(args: argparse.Namespace, project_config: dict | None = None)
         name = args.model
     elif os.getenv(env_by_provider.get(args.provider, "")):
         name = os.environ[env_by_provider[args.provider]]
-    elif isinstance(config.get("model"), str):
-        name = config["model"]
+    elif "model" in config:
+        config_model = config["model"]
+        if not isinstance(config_model, str):
+            # Silently falling through to the provider default would
+            # hide the misconfig; fail typed like every other bad
+            # config value.
+            raise ConfigError(f"{_PROJECT_CONFIG_NAME} key 'model' must be a string.")
+        name = config_model
     else:
         name = DEFAULT_MODEL_BY_PROVIDER[args.provider]
-    return _resolve_model_name(name, args.provider)
+    # strip(): quoted .env values and TOML strings pick up stray spaces
+    # easily, and " flash" would miss the alias table and reach the
+    # provider as a bogus slug.
+    return _resolve_model_name(name.strip(), args.provider)
 
 
 # ---------------------------------------------------------------------------
@@ -2696,6 +2705,15 @@ def load_baseline(path: str) -> dict:
         raise ConfigError(
             f"--baseline file {path!r} is not a schema_version=1 review "
             "envelope (expected the output of a --format json run)."
+        )
+    findings = doc.get("findings")
+    if findings is not None and not isinstance(findings, list):
+        # A hand-mangled findings value would TypeError deep inside
+        # diff_against_baseline -> UNKNOWN; catch it here, pre-spend.
+        raise ConfigError(
+            f"--baseline file {path!r} has a non-list `findings` value "
+            f"({type(findings).__name__}); expected the findings array "
+            "of a --format json envelope."
         )
     return doc
 
@@ -3634,6 +3652,11 @@ def _resolve_settings(
     provider_raw, provider_source = _layered(
         args.provider, "CODE_REVIEW_PROVIDER", "provider", config
     )
+    # strip(): quoted .env values pick up stray whitespace easily, and
+    # " ollama" failing validation over an invisible space is hostile.
+    # Same treatment for the other validated string tunables below.
+    if isinstance(provider_raw, str):
+        provider_raw = provider_raw.strip()
     provider = provider_raw if provider_raw is not None else DEFAULT_PROVIDER
     if provider not in PROVIDERS:
         raise ConfigError(
@@ -3754,7 +3777,9 @@ def _resolve_settings(
     severity_raw, severity_source = _layered(
         args.min_severity, "CODE_REVIEW_MIN_SEVERITY", "min_severity", config
     )
-    min_severity = str(severity_raw).upper() if severity_raw is not None else "LOW"
+    min_severity = (
+        str(severity_raw).strip().upper() if severity_raw is not None else "LOW"
+    )
     if min_severity not in SEVERITY_LEVELS:
         raise ConfigError(
             f"min_severity {severity_raw!r} (from {severity_source}) is "
@@ -3765,6 +3790,8 @@ def _resolve_settings(
     format_raw, format_source = _layered(
         args.format, "CODE_REVIEW_FORMAT", "format", config
     )
+    if isinstance(format_raw, str):
+        format_raw = format_raw.strip()
     output_format = format_raw if format_raw is not None else "markdown"
     if output_format not in ("markdown", "json"):
         raise ConfigError(
