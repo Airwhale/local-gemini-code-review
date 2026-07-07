@@ -613,10 +613,13 @@ def _prompt_root() -> Traversable:
     override = os.getenv("CODE_REVIEW_PROMPT_DIR")
     if override:
         root = Path(override)
-        if not (root / "skills").is_dir():
-            raise ConfigError(
-                f"$CODE_REVIEW_PROMPT_DIR={override!r} has no skills/ directory."
-            )
+        for sub in ("skills", "commands"):
+            if not (root / sub).is_dir():
+                raise ConfigError(
+                    f"$CODE_REVIEW_PROMPT_DIR={override!r} has no {sub}/ "
+                    "directory. The override must mirror the repo layout: "
+                    "both skills/ and commands/."
+                )
         return root
     package = resources.files("code_review")
     if (package / "skills").is_dir():
@@ -640,18 +643,49 @@ def load_skill(name: str = "code-review-commons") -> str:
     of the upstream skill's hardcoded "only lines beginning with +/-"
     rule that's correct for diff review but forbids all comments on
     whole-file input.
+
+    A missing or unreadable asset is a typed ConfigError, not a raw
+    FileNotFoundError: ``_prompt_root`` validates directories, but a
+    root can pass that check while still missing an individual file
+    (partial override dir, corrupted install), and the failure must
+    surface as CONFIG [exit 2], not UNKNOWN.
     """
-    return (
-        _prompt_root().joinpath("skills", name, "SKILL.md").read_text(encoding="utf-8")
-    )
+    asset = _prompt_root().joinpath("skills", name, "SKILL.md")
+    try:
+        return asset.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(
+            f"Prompt asset missing or unreadable: {asset}. If "
+            "$CODE_REVIEW_PROMPT_DIR is set it must contain the full "
+            "skills/ tree; otherwise reinstall the package.",
+            detail=str(exc),
+        ) from exc
 
 
 def load_command_prompt(name: str) -> str:
-    """Load `commands/<name>.toml` and return the `prompt` field verbatim."""
-    text = (
-        _prompt_root().joinpath("commands", f"{name}.toml").read_text(encoding="utf-8")
-    )
-    return tomllib.loads(text)["prompt"]
+    """Load `commands/<name>.toml` and return the `prompt` field verbatim.
+
+    Same typed-error contract as ``load_skill``: a missing file or a
+    file that isn't valid command TOML is CONFIG, not UNKNOWN.
+    """
+    asset = _prompt_root().joinpath("commands", f"{name}.toml")
+    try:
+        text = asset.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(
+            f"Prompt asset missing or unreadable: {asset}. If "
+            "$CODE_REVIEW_PROMPT_DIR is set it must contain the full "
+            "commands/ tree; otherwise reinstall the package.",
+            detail=str(exc),
+        ) from exc
+    try:
+        return tomllib.loads(text)["prompt"]
+    except (tomllib.TOMLDecodeError, KeyError) as exc:
+        raise ConfigError(
+            f"Prompt asset {asset} is not a valid command file: expected "
+            "TOML with a top-level `prompt` key.",
+            detail=str(exc),
+        ) from exc
 
 
 def _user_config_dir() -> Path:
@@ -903,6 +937,66 @@ def pr_changed_files(pr_number: int) -> list[Path]:
             detail=exc.stderr.strip(),
         ) from exc
     return [Path(line) for line in result.stdout.splitlines() if line]
+
+
+def pr_head_sha(pr_number: int) -> str:
+    """The PR's current head commit SHA via ``gh pr view``."""
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(pr_number),
+                "--json",
+                "headRefOid",
+                "--jq",
+                ".headRefOid",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError as exc:
+        raise ConfigError(
+            "`gh` not found on PATH. Install GitHub CLI to use --pr.",
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        raise ConfigError(
+            f"`gh pr view {pr_number}` failed (exit {exc.returncode})",
+            detail=exc.stderr.strip(),
+        ) from exc
+    return result.stdout.strip()
+
+
+def _guard_pr_full_files(pr_number: int) -> None:
+    """Refuse ``--full-files`` with ``--pr`` unless HEAD is the PR head.
+
+    The PR diff comes from GitHub, but ``--full-files`` reads reference
+    file bodies from the LOCAL checkout. When the checkout isn't at the
+    PR head, the model silently receives file content unrelated to the
+    diff it is reviewing -- worse than no reference at all, because the
+    mismatch is invisible in the output. A matching-but-dirty tree only
+    gets a WARN: uncommitted edits are the user's own visible state, and
+    hard-failing on them would break the fix-and-re-review loop.
+    """
+    head = pr_head_sha(pr_number)
+    local = _run_git(["git", "rev-parse", "HEAD"]).strip()
+    if local != head:
+        raise ConfigError(
+            "--full-files with --pr reads file content from the local "
+            f"checkout, but HEAD ({local[:12]}) is not the head of PR "
+            f"#{pr_number} ({head[:12]}) -- the reference files would not "
+            f"match the diff. Run `gh pr checkout {pr_number}` first, or "
+            "drop --full-files."
+        )
+    if _run_git(["git", "status", "--porcelain", "--untracked-files=no"]).strip():
+        sys.stderr.write(
+            "WARN: working tree has uncommitted changes; --full-files "
+            "reference content may differ from the PR head.\n"
+        )
 
 
 def changed_file_paths(args: argparse.Namespace) -> list[Path]:
@@ -1213,10 +1307,12 @@ def _classify_http_error(
     a generic ``ReviewError`` which surfaces as exit 1 with the response
     body in ``detail`` so a caller can decide.
 
-    Order matters: the 5xx check runs BEFORE the substring match so a
-    provider-side failure page that happens to contain a phrase like
-    "too long" or "token limit" stays a retryable TRANSPORT error
-    instead of being misclassified as a do-not-retry CONTEXT_OVERFLOW.
+    Order matters: the 5xx and 401/403 checks run BEFORE the substring
+    match so a provider-side failure page or auth-rejection body that
+    happens to contain a phrase like "too long" or "token limit" keeps
+    its status-derived classification (retryable TRANSPORT / fix-the-key
+    CONFIG) instead of being misclassified as a do-not-retry
+    CONTEXT_OVERFLOW.
     """
     body_lower = body.lower()
     if status == 429:
@@ -1241,6 +1337,32 @@ def _classify_http_error(
     if 500 <= status < 600:
         return TransportError(
             f"{provider} returned HTTP {status} (provider-side failure)",
+            detail=body[:1000],
+            model=model,
+            provider=provider,
+        )
+    if status in (401, 403):
+        # Auth failures are a fix-your-key problem, so they belong in the
+        # CONFIG lane (exit 2, never retried) rather than falling through
+        # to the generic UNKNOWN bucket. One carve-out: OpenRouter uses
+        # 403 when its moderation layer flags the INPUT -- a content
+        # decision, not a credentials problem -- which stays in the
+        # SAFETY_REFUSAL lane so the exit code steers the caller to the
+        # safety-context docs instead of key rotation.
+        if status == 403 and ("moderation" in body_lower or "flagged" in body_lower):
+            return SafetyRefusal(
+                f"{provider} returned HTTP 403 (input flagged by moderation)",
+                detail=body[:1000],
+                model=model,
+                provider=provider,
+            )
+        key_hint = {
+            "openrouter": " Check OPENROUTER_API_KEY.",
+            "gemini": " Check GEMINI_API_KEY.",
+        }.get(provider, "")
+        return ConfigError(
+            f"{provider} returned HTTP {status} (authentication/authorization "
+            f"failed).{key_hint}",
             detail=body[:1000],
             model=model,
             provider=provider,
@@ -3641,11 +3763,7 @@ def _build_request(args: argparse.Namespace, settings: Settings) -> ReviewReques
         reference = ""
         if args.full_files:
             if args.pr:
-                sys.stderr.write(
-                    "WARN: --full-files with --pr reads file content from "
-                    "the LOCAL working tree; it matches the PR only if "
-                    "that branch is checked out.\n"
-                )
+                _guard_pr_full_files(args.pr)
             ref_paths = _filter_reviewable(changed_file_paths(args))
             reference = build_reference_section(ref_paths)
             if len(diff) + len(reference) > MAX_BUNDLE_CHARS:

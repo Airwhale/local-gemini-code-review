@@ -247,7 +247,7 @@ Chain rounds with `--output round1.json` then `--baseline round1.json`: findings
 
 ## Scaling scope (`--full-files`, `--chunk`)
 
-**Reach for `--full-files` when hunk context isn't enough.** Diff review sees ±5 lines around each change; `--full-files` adds the changed files' complete content as reference so the model can catch changes that are locally fine but wrong against code elsewhere in the file.
+**Reach for `--full-files` when hunk context isn't enough.** Diff review sees ±5 lines around each change; `--full-files` adds the changed files' complete content as reference so the model can catch changes that are locally fine but wrong against code elsewhere in the file. With `--pr`, the reference content comes from the local checkout, so the runner refuses (typed `CONFIG` error) unless HEAD is the PR head — run `gh pr checkout N` first.
 
 **Reach for `--chunk` when the payload can't fit** (huge diffs, whole codebases through a small local window): sequential per-chunk reviews at file granularity, fail-fast (exit 0 only if every chunk succeeded), at the documented cost of cross-chunk blindness — cross-file findings don't survive chunk boundaries, so prefer a bigger window or narrower scope when you can.
 

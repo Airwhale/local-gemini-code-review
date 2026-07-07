@@ -158,6 +158,55 @@ class TestChangedFilePaths:
         assert calls == [["git", "diff", "--name-only", "--merge-base", "origin/HEAD"]]
 
 
+class TestGuardPrFullFiles:
+    """--full-files with --pr must not silently pair a GitHub-sourced
+    diff with file bodies from an unrelated local checkout."""
+
+    HEAD = "a" * 40
+    OTHER = "b" * 40
+
+    def _patch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        pr_head: str,
+        local_head: str,
+        dirty: bool = False,
+    ) -> None:
+        monkeypatch.setattr(review, "pr_head_sha", lambda pr: pr_head)
+
+        def fake_run_git(args: list[str]) -> str:
+            if args[:3] == ["git", "rev-parse", "HEAD"]:
+                return local_head + "\n"
+            if args[:3] == ["git", "status", "--porcelain"]:
+                return " M code_review/cli.py\n" if dirty else ""
+            raise AssertionError(f"unexpected git call: {args}")
+
+        monkeypatch.setattr(review, "_run_git", fake_run_git)
+
+    def test_head_mismatch_is_config_error(self, monkeypatch: pytest.MonkeyPatch):
+        self._patch(monkeypatch, pr_head=self.HEAD, local_head=self.OTHER)
+        with pytest.raises(ConfigError) as exc_info:
+            review._guard_pr_full_files(3)
+        assert "gh pr checkout 3" in str(exc_info.value)
+
+    def test_matching_clean_tree_passes_silently(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ):
+        self._patch(monkeypatch, pr_head=self.HEAD, local_head=self.HEAD)
+        review._guard_pr_full_files(3)
+        assert capsys.readouterr().err == ""
+
+    def test_matching_dirty_tree_warns(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ):
+        self._patch(monkeypatch, pr_head=self.HEAD, local_head=self.HEAD, dirty=True)
+        review._guard_pr_full_files(3)
+        err = capsys.readouterr().err
+        assert err.startswith("WARN:")
+        assert "uncommitted changes" in err
+
+
 def _combo_args(**overrides) -> argparse.Namespace:
     base = dict(
         chunk=False,

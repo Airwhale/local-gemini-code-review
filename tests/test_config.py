@@ -52,6 +52,7 @@ class TestPromptRoot:
 
     def test_env_override(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         (tmp_path / "skills").mkdir()
+        (tmp_path / "commands").mkdir()
         monkeypatch.setenv("CODE_REVIEW_PROMPT_DIR", str(tmp_path))
         assert str(_prompt_root()) == str(tmp_path)
 
@@ -59,12 +60,63 @@ class TestPromptRoot:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         monkeypatch.setenv("CODE_REVIEW_PROMPT_DIR", str(tmp_path))
-        with pytest.raises(ConfigError):
+        with pytest.raises(ConfigError) as exc_info:
             _prompt_root()
+        assert "skills/" in str(exc_info.value)
+
+    def test_env_override_without_commands_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # skills/ alone must not pass validation: load_command_prompt
+        # would later hit a FileNotFoundError -> untyped UNKNOWN exit.
+        (tmp_path / "skills").mkdir()
+        monkeypatch.setenv("CODE_REVIEW_PROMPT_DIR", str(tmp_path))
+        with pytest.raises(ConfigError) as exc_info:
+            _prompt_root()
+        assert "commands/" in str(exc_info.value)
 
     def test_loaders_read_real_assets(self):
         assert "Code Review" in load_skill("code-review-commons")
         assert "<OUTPUT>" in load_command_prompt("code-review")
+
+    def test_missing_skill_file_is_config_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # Directories pass _prompt_root validation but the individual
+        # asset is absent -- must be typed CONFIG, not FileNotFoundError.
+        (tmp_path / "skills").mkdir()
+        (tmp_path / "commands").mkdir()
+        monkeypatch.setenv("CODE_REVIEW_PROMPT_DIR", str(tmp_path))
+        with pytest.raises(ConfigError):
+            load_skill("code-review-commons")
+
+    def test_missing_command_file_is_config_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        (tmp_path / "skills").mkdir()
+        (tmp_path / "commands").mkdir()
+        monkeypatch.setenv("CODE_REVIEW_PROMPT_DIR", str(tmp_path))
+        with pytest.raises(ConfigError):
+            load_command_prompt("code-review")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "not [ valid toml",  # TOMLDecodeError
+            'other = "field"',  # valid TOML, no `prompt` key
+        ],
+    )
+    def test_bad_command_toml_is_config_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: str
+    ):
+        (tmp_path / "skills").mkdir()
+        (tmp_path / "commands").mkdir()
+        (tmp_path / "commands" / "code-review.toml").write_text(
+            content, encoding="utf-8"
+        )
+        monkeypatch.setenv("CODE_REVIEW_PROMPT_DIR", str(tmp_path))
+        with pytest.raises(ConfigError):
+            load_command_prompt("code-review")
 
 
 class TestUserConfigDir:

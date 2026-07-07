@@ -203,7 +203,7 @@ Matching is a two-pass heuristic — exact fingerprint (file + severity + normal
 
 ### Big inputs: `--full-files` and `--chunk`
 
-**`--full-files`** (git-backed diff modes only): the model normally sees only ±5-line hunk windows — it can't judge a change against code 40 lines away. This sends the **full current content of every changed file** as a `<REFERENCE_FILES>` block (line-numbered, size-capped, noise-filtered), while the review target stays the diff. Budgeted against the same 700K-char cap. With `--pr`, content comes from your *local* tree (a WARN reminds you it matches the PR only if that branch is checked out).
+**`--full-files`** (git-backed diff modes only): the model normally sees only ±5-line hunk windows — it can't judge a change against code 40 lines away. This sends the **full current content of every changed file** as a `<REFERENCE_FILES>` block (line-numbered, size-capped, noise-filtered), while the review target stays the diff. Budgeted against the same 700K-char cap. With `--pr`, content comes from your *local* checkout, so the runner requires HEAD to be the PR head (a typed `CONFIG` error tells you to `gh pr checkout N` first — otherwise the model would silently pair the PR diff with unrelated file bodies); a matching-but-dirty tree gets a WARN.
 
 **`--chunk`** (opt-in): when the payload exceeds the budget — 700K chars for cloud, or the Ollama window — the runner splits **at file boundaries** into sequential chunk reviews instead of erroring:
 
@@ -325,8 +325,8 @@ If you're calling this tool in a loop, here's the contract.
 | Exit | Category | Cause | Suggested LLM action |
 |---|---|---|---|
 | **0** | OK | Review succeeded (markdown or JSON on stdout) — or nothing to review (empty stdout + `No diff found…` / `No files matched…` on stderr) | Parse and use the output; treat empty-scope as a no-op |
-| **2** | CONFIG | Missing API key or invalid CLI / env / config value | **Do not retry without fixing.** Read stderr, correct config, re-run. |
-| **10** | SAFETY_REFUSAL | Model refused (content filter fired) | Retry with `--model claude` (least refusal-prone on security/policy code). If refused across models, escalate to a human. |
+| **2** | CONFIG | Missing or rejected API key (HTTP 401/403), invalid CLI / env / config value, or `--full-files --pr` with a checkout that isn't at the PR head | **Do not retry without fixing.** Read stderr, correct config, re-run. |
+| **10** | SAFETY_REFUSAL | Model refused (content filter or provider moderation fired) | Retry with `--model claude` (least refusal-prone on security/policy code). If refused across models, escalate to a human. |
 | **11** | RATE_LIMIT | HTTP 429 from the provider | Wait 30–60s (or the `Retry-After` echoed in the message), then retry — or pass `--retries N` and let the runner do it. Per-key daily limits: switch `--provider` or `--model`. |
 | **12** | CONTEXT_OVERFLOW | Payload exceeded the model's budget, the 700K-char bundle cap, or the Ollama window guard/post-verify | Narrow scope (`--include`/`--exclude`, smaller `--base`) or use `--chunk`. **Do not retry unchanged.** Exceptions: max_tokens hit before any content (reasoning models thinking) → raise `--max-tokens`; Ollama guard → raise `$OLLAMA_NUM_CTX` (requested per call, RAM permitting). |
 | **13** | PROVIDER_HICCUP | Null content with no clear cause, or a non-JSON / malformed provider response | The runner already auto-retried once. Wait a few seconds and retry; if persistent, switch provider. |

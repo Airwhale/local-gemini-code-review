@@ -96,8 +96,38 @@ class TestClassifyHttpError:
         err = self._classify(400, f"error: input {phrase} for this model")
         assert isinstance(err, ContextOverflow)
 
-    def test_unrecognized_4xx_falls_through_to_generic(self):
+    def test_401_is_config_error(self):
         err = self._classify(401, "invalid api key")
+        assert isinstance(err, ConfigError)
+
+    def test_401_names_the_key_env_var(self):
+        err = _classify_http_error(
+            401, "User not found.", model="m", provider="openrouter"
+        )
+        assert isinstance(err, ConfigError)
+        assert "OPENROUTER_API_KEY" in str(err)
+
+    def test_403_is_config_error(self):
+        err = _classify_http_error(
+            403, "PERMISSION_DENIED", model="m", provider="gemini"
+        )
+        assert isinstance(err, ConfigError)
+        assert "GEMINI_API_KEY" in str(err)
+
+    def test_403_moderation_flag_is_safety_refusal(self):
+        # OpenRouter returns 403 when its moderation layer flags the
+        # input -- a content decision, not a credentials problem.
+        err = self._classify(403, "Your input was flagged by the moderation system")
+        assert isinstance(err, SafetyRefusal)
+
+    def test_401_with_overflow_phrase_stays_config(self):
+        # An auth-rejection body mentioning "token limit" (quota pages
+        # do) must not be misclassified as CONTEXT_OVERFLOW.
+        err = self._classify(401, "invalid key: token limit plan required")
+        assert isinstance(err, ConfigError)
+
+    def test_unrecognized_4xx_falls_through_to_generic(self):
+        err = self._classify(418, "short and stout")
         assert type(err) is ReviewError
         assert err.exit_code == 1
 

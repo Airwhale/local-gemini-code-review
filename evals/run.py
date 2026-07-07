@@ -181,6 +181,13 @@ def main() -> None:
     if bugs_total:
         print(f"\noverall recall: {caught_total}/{bugs_total}")
 
+    # A failed runner invocation must fail the harness (and the manual
+    # Evals workflow gating on it) -- an all-ERR table exiting 0 would
+    # read as a green run that scored nothing.
+    errored = sum(1 for r in rows if r[3] == "ERR")
+    if errored:
+        sys.exit(f"{errored} of {len(rows)} run(s) errored (marked ERR above)")
+
 
 if __name__ == "__main__":
     main()

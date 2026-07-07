@@ -166,6 +166,21 @@ class TestOpenRouterWire:
             _openrouter()
         assert exc_info.value.retry_after_seconds == 30.0
 
+    def test_401_is_config_error_naming_the_key(self, monkeypatch):
+        # Reproduced live: an invalid OpenRouter key returns 401, which
+        # used to fall through to UNKNOWN [exit 1]. It's a fix-your-key
+        # problem -> CONFIG [exit 2] with the env var named.
+        _mock(
+            monkeypatch,
+            lambda req: _json_response(
+                {"error": {"message": "User not found.", "code": 401}},
+                status=401,
+            ),
+        )
+        with pytest.raises(ConfigError) as exc_info:
+            _openrouter()
+        assert "OPENROUTER_API_KEY" in str(exc_info.value)
+
     def test_5xx_with_overflow_phrase_stays_transport(self, monkeypatch):
         _mock(
             monkeypatch,
