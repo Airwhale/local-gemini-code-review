@@ -78,7 +78,7 @@ from email.utils import parsedate_to_datetime
 from importlib import resources
 from importlib.resources.abc import Traversable
 from pathlib import Path
-from typing import Callable, TypeVar
+from typing import Any, Callable, TypeVar
 from urllib.parse import urlparse
 
 import httpx
@@ -2287,7 +2287,7 @@ def _extract_suggestion(body_lines: list[str]) -> tuple[str, str | None]:
         scan = found[1] + 1
     if span is not None:
         open_idx, close_idx, info = span
-        trailing = all(not l.strip() for l in body_lines[close_idx + 1 :])
+        trailing = all(not line.strip() for line in body_lines[close_idx + 1 :])
         if info in {"suggestion", "diff"} and trailing:
             suggestion = "\n".join(body_lines[open_idx + 1 : close_idx])
             remainder = body_lines[:open_idx]
@@ -3117,7 +3117,7 @@ def _layered(
     env_name: str | None,
     toml_key: str,
     project_config: dict,
-) -> tuple[object, str]:
+) -> tuple[Any, str]:
     """One lookup through the precedence layers: CLI > env > project
     config. Returns ``(value, source)``; ``(None, "default")`` when no
     layer provided a value (the caller applies its built-in default).
@@ -3372,9 +3372,7 @@ def _resolve_settings(
         args.temperature, "CODE_REVIEW_TEMPERATURE", "temperature", config
     )
     try:
-        temperature = (
-            float(temp_raw) if temp_raw is not None else DEFAULT_TEMPERATURE  # type: ignore[arg-type]
-        )
+        temperature = float(temp_raw) if temp_raw is not None else DEFAULT_TEMPERATURE
     except (TypeError, ValueError) as exc:
         raise ConfigError(
             f"temperature {temp_raw!r} (from {temp_source}) is not a valid float."
@@ -3395,7 +3393,7 @@ def _resolve_settings(
         args.max_tokens, "CODE_REVIEW_MAX_TOKENS", "max_tokens", config
     )
     try:
-        max_tokens = int(max_raw) if max_raw is not None else DEFAULT_MAX_TOKENS  # type: ignore[arg-type]
+        max_tokens = int(max_raw) if max_raw is not None else DEFAULT_MAX_TOKENS
     except (TypeError, ValueError) as exc:
         raise ConfigError(
             f"max_tokens {max_raw!r} (from {max_source}) is not a valid integer."
@@ -3410,7 +3408,7 @@ def _resolve_settings(
         args.retries, "CODE_REVIEW_RETRIES", "retries", config
     )
     try:
-        retries = int(retries_raw) if retries_raw is not None else 0  # type: ignore[arg-type]
+        retries = int(retries_raw) if retries_raw is not None else 0
     except (TypeError, ValueError) as exc:
         raise ConfigError(
             f"retries {retries_raw!r} (from {retries_source}) is not a valid integer."
@@ -3507,7 +3505,7 @@ def _resolve_settings(
         )
         if num_ctx_raw is not None:
             try:
-                ollama_num_ctx_env = int(num_ctx_raw)  # type: ignore[arg-type]
+                ollama_num_ctx_env = int(num_ctx_raw)
             except (TypeError, ValueError) as exc:
                 raise ConfigError(
                     f"ollama_num_ctx {num_ctx_raw!r} (from {num_ctx_source}) "
@@ -3525,7 +3523,7 @@ def _resolve_settings(
         )
         try:
             ollama_timeout = (
-                float(timeout_raw)  # type: ignore[arg-type]
+                float(timeout_raw)
                 if timeout_raw is not None
                 else DEFAULT_OLLAMA_TIMEOUT
             )
@@ -3855,19 +3853,24 @@ def _execute_call(
     guard runs -- per model, per call, so multi-model panels (M3) get a
     fresh probe for each sequentially loaded model.
     """
+    # Bind narrowed locals before the lambdas: assert-narrowing on
+    # ``settings.x`` doesn't survive into a closure for mypy, and the
+    # non-None guarantees come from _resolve_settings' config checks.
     if settings.provider == "openrouter":
-        # mypy: non-None enforced by _resolve_settings' config checks.
-        assert settings.api_key is not None
-        assert settings.referer is not None
-        assert settings.title is not None
+        api_key = settings.api_key
+        referer = settings.referer
+        title = settings.title
+        assert api_key is not None
+        assert referer is not None
+        assert title is not None
         return _call_with_retries(
             lambda: call_openrouter(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 model=model,
-                api_key=settings.api_key,
-                referer=settings.referer,
-                title=settings.title,
+                api_key=api_key,
+                referer=referer,
+                title=title,
                 temperature=settings.temperature,
                 max_tokens=settings.max_tokens,
             ),
@@ -3875,13 +3878,17 @@ def _execute_call(
             retries=settings.retries,
         )
     if settings.provider == "gemini":
-        assert settings.api_key is not None
+        # Separate local (not ``api_key``) so each branch's variable has
+        # a single assignment -- mypy refuses to narrow a captured
+        # variable that is reassigned anywhere in the function.
+        gemini_key = settings.api_key
+        assert gemini_key is not None
         return _call_with_retries(
             lambda: call_gemini(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 model=model,
-                api_key=settings.api_key,
+                api_key=gemini_key,
                 temperature=settings.temperature,
                 max_tokens=settings.max_tokens,
             ),
@@ -3889,10 +3896,12 @@ def _execute_call(
             retries=settings.retries,
         )
     # ollama
-    assert settings.ollama_host is not None
-    assert settings.ollama_timeout is not None
+    host = settings.ollama_host
+    timeout = settings.ollama_timeout
+    assert host is not None
+    assert timeout is not None
     num_ctx, enforced, _source = _resolve_ollama_window(
-        settings.ollama_host, model, settings.ollama_num_ctx_env
+        host, model, settings.ollama_num_ctx_env
     )
     # Pre-flight context-window guard: refuse (typed CONTEXT_OVERFLOW)
     # rather than let Ollama silently truncate the prompt and review a
@@ -3915,10 +3924,10 @@ def _execute_call(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             model=model,
-            host=settings.ollama_host,
+            host=host,
             temperature=settings.temperature,
             max_tokens=settings.max_tokens,
-            timeout=settings.ollama_timeout,
+            timeout=timeout,
             num_ctx=num_ctx_to_send,
         ),
         label="ollama",
@@ -4386,7 +4395,7 @@ def main() -> None:
                 # raising. Every model gets its own probe.
                 notes = []
                 for panel_model in settings.models:
-                    num_ctx, enforced, source = _resolve_ollama_window(
+                    num_ctx, enforced, window_source = _resolve_ollama_window(
                         settings.ollama_host,
                         panel_model,
                         settings.ollama_num_ctx_env,
@@ -4396,11 +4405,11 @@ def main() -> None:
                     )
                     suffix = " -- WOULD FAIL pre-flight" if would_fail else ""
                     notes.append(
-                        f"{panel_model}: {num_ctx:,} tokens ({source}){suffix}"
+                        f"{panel_model}: {num_ctx:,} tokens ({window_source}){suffix}"
                     )
                 ollama_window = "; ".join(notes)
             else:
-                num_ctx, enforced, source = _resolve_ollama_window(
+                num_ctx, enforced, window_source = _resolve_ollama_window(
                     settings.ollama_host,
                     settings.model,
                     settings.ollama_num_ctx_env,
@@ -4414,7 +4423,7 @@ def main() -> None:
                     model=settings.model,
                     enforced=enforced,
                 )
-                ollama_window = f"{num_ctx:,} tokens ({source})"
+                ollama_window = f"{num_ctx:,} tokens ({window_source})"
         print(_dry_run_report(settings, request, ollama_window=ollama_window))
         return
 
@@ -4555,12 +4564,12 @@ def _entrypoint() -> None:
         # even for unexpected bugs, so an LLM caller can classify the
         # failure without parsing a raw traceback. The traceback still
         # ships in the Detail line for humans debugging the runner.
-        err = ReviewError(
+        wrapped = ReviewError(
             f"unhandled {type(exc).__name__}: {exc}",
             detail=traceback.format_exc(),
         )
-        _print_error(err)
-        sys.exit(err.exit_code)
+        _print_error(wrapped)
+        sys.exit(wrapped.exit_code)
 
 
 if __name__ == "__main__":
