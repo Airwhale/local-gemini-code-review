@@ -245,6 +245,14 @@ class TestGuardPrFullFiles:
             review._guard_pr_full_files(3)
         assert "gh pr checkout 3" in str(exc_info.value)
 
+    def test_mismatch_hint_carries_the_repo_pin(self, monkeypatch: pytest.MonkeyPatch):
+        # A bare `gh pr checkout N` in the hint would re-create the
+        # wrong-repo footgun --repo exists to avoid.
+        self._patch(monkeypatch, pr_head=self.HEAD, local_head=self.OTHER)
+        with pytest.raises(ConfigError) as exc_info:
+            review._guard_pr_full_files(3, "owner/name")
+        assert "gh pr checkout 3 --repo owner/name" in str(exc_info.value)
+
     def test_matching_clean_tree_passes_silently(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
     ):

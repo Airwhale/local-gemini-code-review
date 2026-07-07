@@ -978,12 +978,17 @@ def _guard_pr_full_files(pr_number: int, repo: str | None = None) -> None:
     head = pr_head_sha(pr_number, repo)
     local = _run_git(["git", "rev-parse", "HEAD"]).strip()
     if local != head:
+        # Carry the --repo pin into the suggested command: bare
+        # `gh pr checkout N` resolves through gh's default repo, which
+        # is the exact wrong-repo footgun --repo exists to avoid.
+        checkout = f"gh pr checkout {pr_number}"
+        if repo:
+            checkout += f" --repo {repo}"
         raise ConfigError(
             "--full-files with --pr reads file content from the local "
             f"checkout, but HEAD ({local[:12]}) is not the head of PR "
             f"#{pr_number} ({head[:12]}) -- the reference files would not "
-            f"match the diff. Run `gh pr checkout {pr_number}` first, or "
-            "drop --full-files."
+            f"match the diff. Run `{checkout}` first, or drop --full-files."
         )
     if _run_git(["git", "status", "--porcelain", "--untracked-files=no"]).strip():
         sys.stderr.write(
@@ -1521,9 +1526,12 @@ def call_openrouter(
         )
 
     choices = data.get("choices") or []
-    if not choices:
+    # The isinstance guard covers a dict/string where the list should
+    # be: {"choices": {...}} is truthy, so the emptiness check alone
+    # would pass and choices[0] would raise KeyError -> UNKNOWN.
+    if not isinstance(choices, list) or not choices:
         raise ProviderHiccup(
-            "OpenRouter response had no choices",
+            "OpenRouter response had no choices list",
             detail=str(data)[:1000],
             model=model,
             provider="openrouter",
@@ -1692,9 +1700,11 @@ def call_gemini(
         )
 
     candidates = data.get("candidates") or []
-    if not candidates:
+    # isinstance: a dict/string here is truthy, so the emptiness check
+    # alone would pass and candidates[0] would raise KeyError -> UNKNOWN.
+    if not isinstance(candidates, list) or not candidates:
         raise ProviderHiccup(
-            "Gemini response had no candidates",
+            "Gemini response had no candidates list",
             detail=str(data)[:1000],
             model=model,
             provider="gemini",

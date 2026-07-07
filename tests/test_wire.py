@@ -170,6 +170,9 @@ class TestOpenRouterWire:
     @pytest.mark.parametrize(
         "payload",
         [
+            # dict where the LIST should be: truthy, so an emptiness
+            # check alone passes and [0] raises KeyError -> UNKNOWN
+            {"choices": {"message": {"content": "ok"}}},
             {"choices": ["not-an-object"]},  # non-dict choice
             {"choices": [{"message": ["not-an-object"]}]},  # non-dict message
             {"choices": [{"message": {"content": {"nested": "x"}}}]},  # non-str content
@@ -236,6 +239,8 @@ class TestGeminiWire:
     @pytest.mark.parametrize(
         "payload",
         [
+            # dict where the LIST should be (truthy -> [0] KeyError)
+            {"candidates": {"content": {"parts": []}}},
             {"candidates": ["not-an-object"]},  # non-dict candidate
             {"candidates": [{"content": "not-an-object"}]},  # non-dict content
             # Junk parts entries are skipped -> empty text -> typed
