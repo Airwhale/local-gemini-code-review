@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 from pathlib import Path
 from typing import Any
 
@@ -134,6 +135,10 @@ class TestChangedFilePaths:
         calls: list[list[str]] = []
 
         def fake_run_git(args: list[str]) -> str:
+            if args[:3] == ["git", "rev-parse", "--show-toplevel"]:
+                # Root == CWD: the rebase is a no-op (and not recorded,
+                # so the per-mode command assertions stay focused).
+                return str(Path.cwd()) + "\n"
             calls.append(args)
             return "one.py\ntwo.py\n"
 
@@ -157,6 +162,54 @@ class TestChangedFilePaths:
         args = argparse.Namespace(pr=None, staged=False, base=None)
         changed_file_paths(args)
         assert calls == [["git", "diff", "--name-only", "--merge-base", "origin/HEAD"]]
+
+
+class TestRebaseRepoRelative:
+    """git/gh emit repo-root-relative paths; invoked from a subdirectory
+    they must be re-based or every --full-files reference stat-fails and
+    is silently dropped."""
+
+    def test_noop_when_cwd_is_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(review, "_run_git", lambda a: str(tmp_path) + "\n")
+        paths = [Path("src/x.py")]
+        assert review._rebase_repo_relative(paths) == paths
+
+    def test_rebased_from_subdirectory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "x.py").write_text("x = 1\n", encoding="utf-8")
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        monkeypatch.chdir(sub)
+        monkeypatch.setattr(review, "_run_git", lambda a: str(tmp_path) + "\n")
+        [rebased] = review._rebase_repo_relative([Path("src/x.py")])
+        assert not rebased.is_absolute()
+        assert rebased.resolve() == (tmp_path / "src" / "x.py").resolve()
+        assert rebased.read_text(encoding="utf-8") == "x = 1\n"
+
+
+class TestDiffFileStdin:
+    class _TTY:
+        def isatty(self) -> bool:
+            return True
+
+    def test_tty_stdin_is_config_error(self, monkeypatch: pytest.MonkeyPatch):
+        # Reading a TTY would block forever waiting for input the user
+        # doesn't know to type.
+        monkeypatch.setattr(review.sys, "stdin", self._TTY())
+        args = argparse.Namespace(diff_file="-", pr=None)
+        with pytest.raises(ConfigError) as exc_info:
+            review._read_diff_source(args)
+        assert "stdin is a terminal" in str(exc_info.value)
+
+    def test_piped_stdin_reads(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(review.sys, "stdin", io.StringIO("diff x\n"))
+        args = argparse.Namespace(diff_file="-", pr=None)
+        assert review._read_diff_source(args) == "diff x\n"
 
 
 class TestGhRepoPin:
@@ -361,6 +414,28 @@ class TestChunkBudget:
             _chunk_budget(
                 _settings(provider="ollama", ollama_host="http://x", ollama_timeout=1.0)
             )
+
+    def test_codebase_chunks_measure_codebase_overhead(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        # The codebase skill/template is larger than the diff one --
+        # measuring diff overhead for --codebase chunks would oversize
+        # them and trip the post-call truncation verify.
+        monkeypatch.setattr(
+            review, "_resolve_ollama_window", lambda h, m, e: (8000, True, "env")
+        )
+        monkeypatch.setattr(
+            review, "build_diff_prompts", lambda payload, ctx: ("s" * 100, "u" * 100)
+        )
+        monkeypatch.setattr(
+            review,
+            "build_codebase_prompts",
+            lambda payload, ctx: ("s" * 500, "u" * 500),
+        )
+        s = _settings(provider="ollama", ollama_host="http://x", ollama_timeout=1.0)
+        diff_budget, _ = _chunk_budget(s)
+        codebase_budget, _ = _chunk_budget(s, is_codebase=True)
+        assert diff_budget - codebase_budget == 800  # the overhead delta
 
 
 class TestChunkedEnvelope:

@@ -297,6 +297,12 @@ class TestMatchLoadedContext:
         assert review._match_loaded_context({}, "m") is None
         assert review._match_loaded_context({"models": ["junk"]}, "m") is None
 
+    def test_non_list_models_returns_none(self):
+        # A non-list `models` value would TypeError on iteration; the
+        # probe must degrade to "unknown window", never raise.
+        assert review._match_loaded_context({"models": 5}, "m") is None
+        assert review._match_loaded_context({"models": True}, "m") is None
+
     @pytest.mark.parametrize("data", [None, [], "nope", 42])
     def test_top_level_non_dict_returns_none(self, data: object):
         # A misbehaving proxy can return a top-level list/string; the

@@ -340,6 +340,7 @@ def _args(**overrides) -> argparse.Namespace:
         format=None,
         baseline=None,
         dry_run=False,
+        chunk=False,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -385,6 +386,25 @@ class TestSettingsPrecedence:
             "google/gemini-2.5-pro",
             "anthropic/claude-sonnet-4.5",
         )
+
+    def test_cli_model_overrides_config_panel(self):
+        # Documented precedence: CLI > project config. A --model flag
+        # must win over a config-defined panel, not crash as "mutually
+        # exclusive" (that error is for two CLI flags).
+        settings = _resolve_settings(
+            _args(model="flash"), {"models": ["pro", "claude"]}
+        )
+        assert settings.models is None
+        assert settings.model == "google/gemini-2.5-flash"
+
+    def test_config_panel_rejected_with_chunk(self):
+        # _validate_flag_combos runs before config loads, so the
+        # chunk+panel exclusion must be re-checked for config-sourced
+        # panels -- otherwise the chunked run would silently use only
+        # the first panel model.
+        with pytest.raises(ConfigError) as exc_info:
+            _resolve_settings(_args(chunk=True), {"models": ["pro", "claude"]})
+        assert "--chunk" in str(exc_info.value)
 
     def test_defaults_without_config(self):
         settings = _resolve_settings(_args())

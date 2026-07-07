@@ -66,3 +66,10 @@ class TestScore:
         bug2 = {"file": "a.py", "line_range": [4, 8], "keywords": ["remainder"]}
         env = _envelope([_finding(line=5, body="drops the remainder")])
         assert score(env, {"bug": [BUG, bug2]}) == (1, 2, 0)
+
+    def test_none_title_body_do_not_match_none_keyword(self):
+        # A present-but-None title/body must not render as the string
+        # "None" and false-match a "none" keyword.
+        bug = {"file": "a.py", "keywords": ["none"]}
+        env = _envelope([{"file": "a.py", "line": 5, "title": None, "body": None}])
+        assert score(env, {"bug": [bug]}) == (0, 1, 1)

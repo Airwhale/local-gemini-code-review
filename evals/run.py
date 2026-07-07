@@ -77,7 +77,15 @@ def run_review(fixture: Path, model: str, temperature: float) -> dict:
             f"review exited {result.returncode} for {fixture.name}:\n"
             f"{result.stderr.strip()[-500:]}"
         )
-    return json.loads(result.stdout)
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        # Exit 0 with non-JSON stdout is a runner bug, but surface it as
+        # an ERR row with the payload tail instead of a raw traceback.
+        raise RuntimeError(
+            f"review exited 0 for {fixture.name} but stdout was not JSON "
+            f"({exc}); tail:\n{result.stdout.strip()[-500:]}"
+        ) from exc
 
 
 def score(envelope: dict, expected: dict) -> tuple[int, int, int]:
@@ -110,7 +118,11 @@ def score(envelope: dict, expected: dict) -> tuple[int, int, int]:
                 and not (line_range[0] <= line <= line_range[1])
             ):
                 continue
-            haystack = f"{finding.get('title', '')} {finding.get('body', '')}".lower()
+            # `or ""`: a present-but-None title/body would render as the
+            # string "None" and false-match a "none" keyword.
+            haystack = (
+                f"{finding.get('title') or ''} {finding.get('body') or ''}".lower()
+            )
             if any(keyword.lower() in haystack for keyword in bug["keywords"]):
                 caught += 1
                 matched_findings.add(idx)
@@ -199,13 +211,21 @@ def main() -> None:
 
     caught_total = sum(int(r[3].split("/")[0]) for r in rows if r[3] not in ("ERR",))
     bugs_total = sum(int(r[3].split("/")[1]) for r in rows if r[3] not in ("ERR",))
+    errored = sum(1 for r in rows if r[3] == "ERR")
     if bugs_total:
-        print(f"\noverall recall: {caught_total}/{bugs_total}")
+        # Say what the denominator covers: ERR rows never ran, so an
+        # unqualified "3/3" after a failed fixture would read as a
+        # perfect sweep it isn't.
+        qualifier = (
+            f" (completed runs only; {errored} errored run(s) excluded)"
+            if errored
+            else ""
+        )
+        print(f"\noverall recall: {caught_total}/{bugs_total}{qualifier}")
 
     # A failed runner invocation must fail the harness (and the manual
     # Evals workflow gating on it) -- an all-ERR table exiting 0 would
     # read as a green run that scored nothing.
-    errored = sum(1 for r in rows if r[3] == "ERR")
     if errored:
         sys.exit(f"{errored} of {len(rows)} run(s) errored (marked ERR above)")
 

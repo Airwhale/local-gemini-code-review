@@ -279,6 +279,31 @@ class TestGeminiWire:
         assert result.content == "review"
         assert (result.prompt_tokens, result.completion_tokens) == (20, 7)
 
+    def test_thinking_tokens_counted_in_completion(self, monkeypatch):
+        # Thinking models bill thoughtsTokenCount separately from the
+        # visible candidatesTokenCount -- the [usage] line must not
+        # understate cost by the (often large) reasoning budget.
+        _mock(
+            monkeypatch,
+            lambda req: _json_response(
+                {
+                    "candidates": [
+                        {
+                            "finishReason": "STOP",
+                            "content": {"parts": [{"text": "review"}]},
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 20,
+                        "candidatesTokenCount": 7,
+                        "thoughtsTokenCount": 700,
+                    },
+                }
+            ),
+        )
+        result = _gemini()
+        assert (result.prompt_tokens, result.completion_tokens) == (20, 707)
+
     def test_prompt_level_block(self, monkeypatch):
         _mock(
             monkeypatch,

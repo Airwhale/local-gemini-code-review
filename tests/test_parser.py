@@ -324,6 +324,24 @@ class TestFingerprints:
         )
 
 
+class TestSummaryOnlyOutput:
+    def test_summary_only_is_parse_failure(self):
+        # The template mandates findings or the literal clean phrase; a
+        # bare summary means the model drifted (bullets, truncation).
+        # parse_ok=True here would let --baseline resolve everything and
+        # agents treat the run as clean.
+        text = (
+            "# Change summary: Adds a retry policy.\n\n"
+            "Some prose about the change, but no finding headings and no "
+            "clean marker.\n"
+        )
+        parsed = parse_review_markdown(text)
+        assert parsed.findings == []
+        assert parsed.clean is False
+        assert parsed.parse_ok is False
+        assert any("no finding headings" in p for p in parsed.problems)
+
+
 class TestMinSeverityEnforcement:
     """The <SEVERITY_FILTER> prompt block is a request; JSON envelopes
     and panel reports enforce the floor post-parse via these helpers."""
@@ -472,6 +490,26 @@ class TestBaseline:
         statuses, resolved = diff_against_baseline([moved], doc)
         assert statuses == ["new"]
         assert len(resolved) == 1
+
+    def test_lineless_baseline_entry_does_not_wildcard_match(self):
+        # A line-less baseline entry must not vouch for an unrelated
+        # finding in the same file via the relaxed pass -- with title
+        # and severity already ignored there, a missing line matching
+        # anything would collapse the whole file into one bucket.
+        doc = self._doc([self._finding("Old general file-level concern", line=None)])
+        current = [self._finding("Completely different specific issue", line=10)]
+        statuses, resolved = diff_against_baseline(current, doc)
+        assert statuses == ["new"]
+        assert len(resolved) == 1
+
+    def test_lineless_finding_still_persists_via_fingerprint(self):
+        # Pass 1 (fingerprint) remains the path for line-less findings:
+        # same file+severity+title matches regardless of missing lines.
+        doc = self._doc([self._finding("The helper lacks a docstring", line=None)])
+        current = [self._finding("The helper lacks a docstring", line=None)]
+        statuses, resolved = diff_against_baseline(current, doc)
+        assert statuses == ["persisting"]
+        assert resolved == []
 
     def test_one_baseline_entry_vouches_once(self):
         doc = self._doc([self._finding("dup issue")])

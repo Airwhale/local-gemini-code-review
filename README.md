@@ -192,7 +192,7 @@ After each successful call, a `[usage] prompt=… completion=… total=… token
 }
 ```
 
-**`parse_ok: false` still exits 0** and embeds the full raw markdown as `raw` — exit codes describe transport/config outcomes, not model formatting; agents branch on the field. A parser failure never destroys a paid-for review.
+**`parse_ok: false` still exits 0** and embeds the full raw markdown as `raw` — exit codes describe transport/config outcomes, not model formatting; agents branch on the field. A parser failure never destroys a paid-for review. Summary-only output (a summary heading but no finding headings and no `No issues found.` marker) counts as a parse failure, not a confident zero-finding review — the template mandates one or the other, so a bare summary means the model drifted.
 
 `--baseline <prior.json>` compares current findings against a previous `--format json` run: each finding gets `status: "new" | "persisting"`, disappeared findings are listed under `resolved`, and a `[baseline] N finding(s): X new, Y persisting, Z resolved` line lands on stderr (markdown mode keeps stdout verbatim). The loop:
 
@@ -202,11 +202,11 @@ code-review --base main --format json --output round1.json
 code-review --base main --format json --baseline round1.json --output round2.json
 ```
 
-Matching is a two-pass heuristic — exact fingerprint (file + severity + normalized title, ±10 lines), then same-file location — because models reword titles and even re-rate severities between identical runs. Two *different* findings within 10 lines can cross-match; treat statuses as strong hints, not proofs.
+Matching is a two-pass heuristic — exact fingerprint (file + severity + normalized title, ±10 lines), then same-file location (both sides must carry real line numbers; line-less findings only match via fingerprint) — because models reword titles and even re-rate severities between identical runs. Two *different* findings within 10 lines can cross-match; treat statuses as strong hints, not proofs.
 
 ### Big inputs: `--full-files` and `--chunk`
 
-**`--full-files`** (git-backed diff modes only): the model normally sees only ±5-line hunk windows — it can't judge a change against code 40 lines away. This sends the **full current content of every changed file** as a `<REFERENCE_FILES>` block (line-numbered, size-capped, noise-filtered), while the review target stays the diff. Budgeted against the same 700K-char cap. With `--pr`, content comes from your *local* checkout, so the runner requires HEAD to be the PR head (a typed `CONFIG` error tells you to `gh pr checkout N` first — otherwise the model would silently pair the PR diff with unrelated file bodies); a matching-but-dirty tree gets a WARN.
+**`--full-files`** (git-backed diff modes only): the model normally sees only ±5-line hunk windows — it can't judge a change against code 40 lines away. This sends the **full current content of every changed file** as a `<REFERENCE_FILES>` block (line-numbered, size-capped, noise-filtered), while the review target stays the diff. Budgeted against the same 700K-char cap. Works from repo subdirectories too (git's root-relative paths are re-based onto your working directory). Two staleness guards: with `--pr`, the runner requires HEAD to be the PR head (a typed `CONFIG` error tells you to `gh pr checkout N` first — otherwise the model would silently pair the PR diff with unrelated file bodies), and a dirty tree gets a WARN — including with `--staged`, where the reference bodies come from the working tree while the reviewed diff is the index.
 
 **`--chunk`** (opt-in): when the payload exceeds the budget — 700K chars for cloud, or the Ollama window — the runner splits **at file boundaries** into sequential chunk reviews instead of erroring:
 

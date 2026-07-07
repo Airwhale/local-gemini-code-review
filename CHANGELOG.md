@@ -24,6 +24,9 @@ The M1–M7 roadmap: the single-file runner became an installable, testable, age
 ### Changed
 
 - **Ollama endpoint moved** from the OpenAI-compat path to native `/api/chat`; usage comes from `prompt_eval_count`/`eval_count`.
+- **Summary-only model output is now a parse failure** (`parse_ok: false` + raw embedded, still exit 0): the template mandates findings or the literal clean phrase, so a bare summary means the model drifted — reporting it as a confident zero-finding review let `--baseline` resolve everything and agents treat the run as clean.
+- **Baseline relaxed matching requires real line numbers on both sides** — a line-less baseline entry no longer vouches for any same-file finding (line-less findings still persist via the fingerprint pass).
+- Gemini usage now counts `thoughtsTokenCount` in completion tokens — thinking models bill reasoning separately, and the `[usage]` line was understating cost.
 - `--min-severity` is now **enforced post-parse** in JSON envelopes, panel reports, and chunked envelopes (it was prompt-level only, which the model could ignore). Verbatim markdown output remains best-effort.
 - HTTP 401/403 from providers are now typed `CONFIG` errors naming the key env var (previously fell through to `UNKNOWN [exit 1]`); OpenRouter moderation-flagged 403s map to `SAFETY_REFUSAL`.
 - `--full-files --pr` now **requires** the local HEAD to be the PR head (typed `CONFIG` error suggesting `gh pr checkout N`); previously a WARN allowed silently mismatched reference content.
@@ -36,6 +39,7 @@ The M1–M7 roadmap: the single-file runner became an installable, testable, age
 
 ### Fixed
 
+- CLI `--model` now overrides a `.code-review.toml` panel (documented CLI > config precedence) instead of crashing as "mutually exclusive"; config-sourced panels can no longer bypass the `--chunk` exclusion; `--full-files` works from repo subdirectories (git's root-relative paths are re-based onto CWD — previously every reference file silently stat-failed); `--staged --full-files` warns when unstaged edits make the working tree diverge from the reviewed index; `--chunk --codebase` budgets measure the codebase prompt overhead (not the smaller diff one); `--diff-file -` on a terminal fails fast instead of hanging on stdin; the `/api/ps` probe tolerates a non-list `models` value; eval scoring no longer renders None titles as `"None"`, wraps non-JSON stdout as an ERR row, and qualifies overall recall when runs errored.
 - Severity regex no longer matches substrings ("Below" → `LOW`); panel consensus no longer merges line-less findings by location; `$CODE_REVIEW_PROVIDER` values are validated like CLI ones; `Retry-After` parsing survives overflow/malformed headers; non-object provider JSON is typed `PROVIDER_HICCUP` — including *nested* malformed shapes (non-list `choices`/`candidates` containers, non-dict choice/message/candidate/content, non-string content), which previously escaped as raw `AttributeError`/`KeyError` → `UNKNOWN`; panel `--dry-run` probes every model's window; eval harness exits non-zero when any run errors and its scoring honors each fixture's `line_range` (right-file/right-keyword/wrong-location no longer counts as caught); missing/partial prompt-asset dirs and non-string command `prompt` values are typed `CONFIG` instead of raw tracebacks; BOM-prefixed config files parse on Windows.
 
 ## [0.1.0] — 2026-07-06 (PR #2)

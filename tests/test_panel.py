@@ -284,6 +284,7 @@ def _args(**overrides) -> argparse.Namespace:
         format=None,
         baseline=None,
         dry_run=False,
+        chunk=False,
     )
     base.update(overrides)
     return argparse.Namespace(**base)

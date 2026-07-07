@@ -997,6 +997,26 @@ def _guard_pr_full_files(pr_number: int, repo: str | None = None) -> None:
         )
 
 
+def _rebase_repo_relative(paths: list[Path]) -> list[Path]:
+    """Re-base repo-root-relative paths onto the current directory.
+
+    ``git diff --name-only`` and ``gh pr diff --name-only`` emit paths
+    relative to the REPO ROOT, but the runner may be invoked from a
+    subdirectory -- read as-is, every reference file would stat-fail
+    and be silently dropped from the --full-files set. From the root
+    (the common case) this is a no-op; from a subdirectory the paths
+    gain ``../`` prefixes, which read correctly and stay recognizable
+    in the reference delimiters.
+    """
+    top = _run_git(["git", "rev-parse", "--show-toplevel"]).strip()
+    if not top:
+        return paths
+    root = Path(top)
+    if root.resolve() == Path.cwd().resolve():
+        return paths
+    return [Path(os.path.relpath(root / p)) for p in paths]
+
+
 def changed_file_paths(args: argparse.Namespace) -> list[Path]:
     """The files touched by the active diff mode (for ``--full-files``).
 
@@ -1004,14 +1024,14 @@ def changed_file_paths(args: argparse.Namespace) -> list[Path]:
     reference set always matches the diff the model reviews.
     """
     if args.pr:
-        return pr_changed_files(args.pr, args.repo)
+        return _rebase_repo_relative(pr_changed_files(args.pr, args.repo))
     if args.staged:
         output = _run_git(["git", "diff", "--cached", "--name-only"])
     elif args.base:
         output = _run_git(["git", "diff", "--name-only", args.base])
     else:
         output = _run_git(["git", "diff", "--name-only", "--merge-base", "origin/HEAD"])
-    return [Path(line) for line in output.splitlines() if line]
+    return _rebase_repo_relative([Path(line) for line in output.splitlines() if line])
 
 
 def build_reference_section(paths: list[Path]) -> str:
@@ -1745,10 +1765,19 @@ def call_gemini(
     if text:
         truncated = finish_reason == "MAX_TOKENS"
         _warn_if_truncated(truncated, max_tokens, "gemini")
+        # Thinking models (gemini-2.5-pro et al.) bill thought tokens
+        # separately in ``thoughtsTokenCount``; candidatesTokenCount is
+        # only the visible output, so summing keeps the [usage] line an
+        # honest cost signal instead of understating by the (often
+        # large) reasoning budget.
+        completion = _usage_int(usage.get("candidatesTokenCount"))
+        thoughts = _usage_int(usage.get("thoughtsTokenCount"))
+        if thoughts:
+            completion = (completion or 0) + thoughts
         return CallResult(
             text,
             prompt_tokens=_usage_int(usage.get("promptTokenCount")),
-            completion_tokens=_usage_int(usage.get("candidatesTokenCount")),
+            completion_tokens=completion,
             truncated=truncated,
         )
 
@@ -1827,7 +1856,12 @@ def _match_loaded_context(ps_data: object, model: str) -> int | None:
         # mask it, but don't rely on that.
         return None
     wanted = {model} if ":" in model else {model, f"{model}:latest"}
-    for entry in ps_data.get("models") or []:
+    models_list = ps_data.get("models") or []
+    if not isinstance(models_list, list):
+        # A non-list `models` (int/bool/string) would TypeError below;
+        # the caller's blanket except would mask it, but be explicit.
+        return None
+    for entry in models_list:
         if not isinstance(entry, dict):
             continue
         if {entry.get("name"), entry.get("model")} & wanted:
@@ -2601,7 +2635,18 @@ def parse_review_markdown(text: str) -> ParsedReview:
         problems.append("no summary heading found")
 
     clean = not findings and bool(_CLEAN_RE.search(text))
-    parse_ok = clean or bool(findings) or (summary is not None and heading_count == 0)
+    # Summary-only output (no finding headings, no clean marker) is NOT
+    # parse_ok: the template mandates findings or the literal clean
+    # phrase, so a bare summary means the model drifted (bullets instead
+    # of ### headings, truncation before the first finding). Reporting
+    # it as a confident zero-finding review would let --baseline mark
+    # everything "resolved" and let agents treat the run as clean.
+    parse_ok = clean or bool(findings)
+    if summary is not None and heading_count == 0 and not clean and not findings:
+        problems.append(
+            "summary present but no finding headings and no clean marker; "
+            "the findings may be in an unparseable shape (see raw)"
+        )
     if any_unreadable:
         parse_ok = False
 
@@ -2680,7 +2725,8 @@ def diff_against_baseline(
 
     1. **Strong**: fingerprint (file+severity+normalized title) equal,
        lines within ±10.
-    2. **Relaxed**: same file, lines within ±10 -- title and severity
+    2. **Relaxed**: same file, lines within ±10, and BOTH sides must
+       carry a real line number -- title and severity
        ignored. Empirically required: on back-to-back identical runs at
        T=0.3 the model rewords every title ("add a comment explaining
        the default" vs "add a comment to clarify its purpose") and even
@@ -2721,10 +2767,18 @@ def diff_against_baseline(
                 break
 
     # Pass 2: relaxed location match for whatever pass 1 left over.
+    # Both sides must carry a REAL line here: _location_match treats a
+    # missing line as matching anything, which is right for the
+    # fingerprint-backed pass but would let one line-less baseline entry
+    # vouch for any unrelated finding in the same file when title and
+    # severity are already being ignored. Line-less findings can still
+    # persist via pass 1's fingerprint.
     for idx, finding in enumerate(current):
-        if statuses[idx] is not None:
+        if statuses[idx] is not None or finding.line is None:
             continue
         for entry_idx, entry in enumerate(unmatched):
+            if _entry_line(entry) is None:
+                continue
             if _location_match(
                 finding.file, finding.line, _entry_file(entry), _entry_line(entry)
             ):
@@ -3457,7 +3511,9 @@ class ReviewRequest:
     chunk_label: str | None = None  # --chunk mode: e.g. "3 file(s), 41,209 chars"
 
 
-def _chunk_budget(settings: Settings) -> tuple[int, str | None]:
+def _chunk_budget(
+    settings: Settings, *, is_codebase: bool = False
+) -> tuple[int, str | None]:
     """Per-chunk payload budget in chars, plus an optional WARN note.
 
     Cloud providers budget against the standard bundle cap. Ollama
@@ -3483,8 +3539,13 @@ def _chunk_budget(settings: Settings) -> tuple[int, str | None]:
             "window and cut the call count"
         )
     # Overhead: the prompts minus the payload (skill + command template +
-    # context wrapper + severity appendix). Measured, not estimated.
-    empty_system, empty_user = build_diff_prompts("", settings.context)
+    # context wrapper + severity appendix). Measured, not estimated --
+    # against the prompt set the chunks will actually use: the codebase
+    # skill/template is larger than the diff one, so measuring the diff
+    # overhead for --codebase chunks would oversize them and trip the
+    # post-call truncation verify.
+    build_prompts = build_codebase_prompts if is_codebase else build_diff_prompts
+    empty_system, empty_user = build_prompts("", settings.context)
     overhead = (
         len(empty_system)
         + len(empty_user)
@@ -3583,13 +3644,22 @@ def _resolve_settings(
     args.provider = provider
 
     # Panel model list: resolved pre-flight so alias errors exit 2
-    # before any network call. Exclusive with --model (manual check,
-    # same pattern as --context / --no-context).
+    # before any network call. --models and --model on the CLI together
+    # are genuinely ambiguous (manual check, same pattern as --context /
+    # --no-context) -- but a CLI --model OVERRIDES a project-config
+    # panel outright, per the documented CLI > project-config
+    # precedence: the config list only activates when the CLI didn't
+    # pick a single model.
     models: tuple[str, ...] | None = None
     names: list[str] | None = None
     if args.models is not None:
+        if args.model is not None:
+            raise ConfigError(
+                "--models and --model are mutually exclusive. Use "
+                "--models for a panel, --model for a single reviewer."
+            )
         names = [n.strip() for n in args.models.split(",") if n.strip()]
-    elif "models" in config:
+    elif "models" in config and args.model is None:
         config_models = config["models"]
         if not isinstance(config_models, list) or not all(
             isinstance(m, str) for m in config_models
@@ -3599,11 +3669,15 @@ def _resolve_settings(
             )
         names = [n.strip() for n in config_models if n.strip()]
     if names is not None:
-        if args.model is not None:
+        if args.chunk:
+            # _validate_flag_combos already rejects CLI --chunk+--models,
+            # but it runs before project config loads -- re-check here so
+            # a config-sourced panel can't slip into a chunked run (which
+            # would silently review with only the first model).
             raise ConfigError(
-                "--models (or a project-config models list) and --model "
-                "are mutually exclusive. Use models for a panel, --model "
-                "for a single reviewer."
+                "--chunk and a models panel are not supported together "
+                "(the panel here comes from .code-review.toml). Chunk "
+                "with a single --model, or panel an unchunked payload."
             )
         if len(names) < 2:
             raise ConfigError(
@@ -3894,6 +3968,19 @@ def _build_request(args: argparse.Namespace, settings: Settings) -> ReviewReques
         if args.full_files:
             if args.pr:
                 _guard_pr_full_files(args.pr, args.repo)
+            elif args.staged and _run_git(["git", "diff", "--name-only"]).strip():
+                # --staged reviews the INDEX; the reference bodies come
+                # from the working tree. Unstaged edits make those two
+                # diverge -- warn rather than fail, since the divergence
+                # is the user's own visible state (same policy as the
+                # --pr dirty-tree case). Reading staged blobs via
+                # `git show :path` would close the gap entirely but
+                # needs the bundler to accept non-filesystem content.
+                sys.stderr.write(
+                    "WARN: --staged reviews the index, but --full-files "
+                    "reads the working tree, which has unstaged edits -- "
+                    "reference content may not match the staged diff.\n"
+                )
             ref_paths = _filter_reviewable(changed_file_paths(args))
             reference = build_reference_section(ref_paths)
             if len(diff) + len(reference) > MAX_BUNDLE_CHARS:
@@ -3949,7 +4036,7 @@ def _build_requests(
     if not args.chunk:
         return [_build_request(args, settings)]
 
-    budget, note = _chunk_budget(settings)
+    budget, note = _chunk_budget(settings, is_codebase=args.codebase)
     if note is not None:
         sys.stderr.write(f"WARN: {note}\n")
     severity_appendix = _min_severity_instruction(settings.min_severity)
@@ -4005,6 +4092,14 @@ def _read_diff_source(args: argparse.Namespace) -> str:
     """Fetch the diff for the active diff mode (git, gh, file, or stdin)."""
     if args.diff_file is not None:
         if args.diff_file == "-":
+            if sys.stdin.isatty():
+                # Reading a TTY blocks forever waiting for input the
+                # user doesn't know to type -- fail fast with the fix.
+                raise ConfigError(
+                    "--diff-file - reads the diff from stdin, but stdin "
+                    "is a terminal. Pipe a diff in (e.g. `git diff | "
+                    "code-review --diff-file -`) or pass a file path."
+                )
             return sys.stdin.read()
         try:
             # utf-8-sig: tolerate Windows-editor BOMs like the other
