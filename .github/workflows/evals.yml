@@ -1,0 +1,29 @@
+name: Evals
+
+# Manual-dispatch only: eval runs cost real API tokens.
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Model slug/alias to evaluate"
+        default: "flash"
+        required: true
+      temperature:
+        description: "Sampling temperature"
+        default: "0.3"
+        required: true
+
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Run eval fixtures
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: >
+          uv run evals/run.py --yes
+          --model "${{ inputs.model }}"
+          --temperature "${{ inputs.temperature }}"

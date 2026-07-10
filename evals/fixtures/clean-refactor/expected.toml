@@ -1,0 +1,6 @@
+# Clean-diff control fixture: this refactor (extract two width
+# constants, add a docstring) plants NO bugs, so there are no [[bug]]
+# entries. Recall reads 0/0 and every finding the model reports counts
+# as noise -- the hallucination-on-clean-code rate the bug fixtures
+# can't measure. A reviewer that flags everything scores perfect recall
+# on the other fixtures; this is the counterweight.

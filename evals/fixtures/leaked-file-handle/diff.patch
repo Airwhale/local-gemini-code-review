@@ -1,0 +1,20 @@
+diff --git a/exporter.py b/exporter.py
+index 3333333..4444444 100644
+--- a/exporter.py
++++ b/exporter.py
+@@ -1,10 +1,16 @@
+ import json
+
+
+-def export_records(records, path):
+-    with open(path, "w", encoding="utf-8") as fh:
+-        json.dump(records, fh)
++def export_records(records, path, validate=True):
++    fh = open(path, "w", encoding="utf-8")
++    if validate:
++        for record in records:
++            if "id" not in record:
++                raise ValueError(f"record missing id: {record!r}")
++    json.dump(records, fh)
++    fh.close()
+     return path

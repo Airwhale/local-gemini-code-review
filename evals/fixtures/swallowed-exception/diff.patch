@@ -1,0 +1,22 @@
+diff --git a/sync.py b/sync.py
+index 5555555..6666666 100644
+--- a/sync.py
++++ b/sync.py
+@@ -1,13 +1,18 @@
+ import logging
+
+ logger = logging.getLogger(__name__)
+
+
+ def push_updates(client, updates):
+-    for update in updates:
+-        client.push(update)
+-    return len(updates)
++    pushed = 0
++    for update in updates:
++        try:
++            client.push(update)
++            pushed += 1
++        except Exception:
++            pass
++    return pushed

@@ -1,0 +1,24 @@
+diff --git a/src/report.py b/src/report.py
+index 3f1c2aa..b7d9e01 100644
+--- a/src/report.py
++++ b/src/report.py
+@@ -1,12 +1,18 @@
+ """Monthly usage report generation."""
+
++# Column widths for the fixed-width text layout. Shared by the header
++# and data rows so the columns always line up.
++NAME_WIDTH = 24
++COUNT_WIDTH = 8
++
+
+ def format_row(name: str, count: str) -> str:
+-    return name.ljust(24) + count.rjust(8)
++    """One fixed-width table row: left-aligned name, right-aligned count."""
++    return name.ljust(NAME_WIDTH) + count.rjust(COUNT_WIDTH)
+
+
+ def render(rows: list[tuple[str, int]]) -> str:
+     lines = [format_row("name", "count")]
+     for name, count in rows:
+         lines.append(format_row(name, str(count)))
+     return "\n".join(lines)

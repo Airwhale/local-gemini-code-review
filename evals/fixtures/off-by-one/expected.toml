@@ -1,0 +1,12 @@
+# Planted bug: integer floor-division drops the trailing partial page.
+# paginate([1,2,3], 2) now returns [[1,2]] -- the [3] page is lost, and
+# last_page returns the wrong page (or IndexError on len < page_size).
+
+[[bug]]
+file = "pagination.py"
+line_range = [4, 8]
+keywords = [
+    "partial page", "remainder", "floor division", "truncat", "drops",
+    "lost", "fewer than", "last page", "IndexError", "off-by-one",
+    "ceil", "//",
+]

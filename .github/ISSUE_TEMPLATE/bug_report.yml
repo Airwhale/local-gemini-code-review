@@ -1,0 +1,74 @@
+name: Bug report
+description: Something the runner does wrong — crashes, misclassified errors, wrong output
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Two quick checks first:
+
+        - The README's **Error model** section maps every `ERROR: <CATEGORY>` to its meaning and fix — `CONFIG [exit 2]` usually means a local setup issue, not a bug.
+        - **Redact everything sensitive**: never paste API keys, and trim diff/code content to the minimum that reproduces the problem.
+  - type: input
+    id: command
+    attributes:
+      label: Exact command line (redacted)
+      placeholder: code-review --pr 42 --format json --min-severity HIGH
+    validations:
+      required: true
+  - type: textarea
+    id: stderr
+    attributes:
+      label: stderr output
+      description: "Include the full `ERROR: <CATEGORY> [exit <N>]` block with its `Detail:` line if there is one, plus any `WARN:` / `[…]` lines leading up to it."
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: exit-code
+    attributes:
+      label: Exit code
+      description: "`echo $?` (bash) / `echo $LASTEXITCODE` (PowerShell) right after the failing run."
+      placeholder: "1"
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected vs. what happened
+    validations:
+      required: true
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      options:
+        - openrouter
+        - gemini
+        - ollama
+        - not provider-related
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `code-review --version` (or the commit SHA for a checkout).
+      placeholder: code-review 0.2.0
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Install method
+      options:
+        - uv tool install (installed command)
+        - repo checkout (uv run review.py)
+        - other
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: Windows 11 / Ubuntu 24.04 / macOS 15
+    validations:
+      required: true
