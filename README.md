@@ -231,6 +231,50 @@ More runtime knobs:
 
 After a successful call the runner prints a `[usage] prompt=… completion=… total=… tokens (provider/model)` line on stderr when the provider reports usage (never estimated).
 
+### Structured output (`--format json`) and round-over-round diffing (`--baseline`)
+
+`--format json` (env `CODE_REVIEW_FORMAT`) parses the model's markdown review into a structured envelope on stdout. **The prompts are unchanged** — parsing is local and deterministic, recovering structure from the rigid output format the templates mandate (and tolerating observed real-model drift like `### L+117:` diff-anchored headings and reworded suggestion lead-ins).
+
+```jsonc
+{
+  "schema_version": 1,
+  "mode": "diff",                    // or "codebase"
+  "provider": "openrouter",
+  "model": "google/gemini-2.5-pro",
+  "temperature": 0.3,
+  "summary": "One-sentence change summary from the model.",
+  "clean": false,
+  "findings": [
+    {
+      "file": "src/client.py",
+      "line": 42,                    // null when the model gave none
+      "severity": "HIGH",            // CRITICAL|HIGH|MEDIUM|LOW|UNKNOWN
+      "title": "Retry loop never sleeps between attempts.",
+      "body": "Explanation…",
+      "suggestion": "for attempt in …",  // null when none offered
+      "fingerprint": "a1b2c3d4e5f6",     // stable finding identity
+      "status": "new"                // only when --baseline was given
+    }
+  ],
+  "usage": {"prompt_tokens": 33616, "completion_tokens": 5242},  // null if unreported
+  "truncated": false,
+  "parse_ok": true,
+  "problems": []                     // tolerated parse defects, for debugging
+}
+```
+
+**`parse_ok: false` still exits 0** and embeds the full raw markdown as `raw` — exit codes describe transport/config outcomes, not model formatting; agents branch on the field. A parser failure never destroys a paid-for review.
+
+`--baseline <prior.json>` compares the current findings against a previous `--format json` run: each finding gets `status: "new" | "persisting"`, disappeared findings are listed under `resolved`, and a `[baseline] N finding(s): X new, Y persisting, Z resolved` line lands on stderr (in markdown mode too — stdout stays verbatim there). The round-over-round loop:
+
+```bash
+uv run review.py --base main --format json --output round1.json
+# …fix things…
+uv run review.py --base main --format json --baseline round1.json --output round2.json
+```
+
+Matching is a two-pass heuristic: exact fingerprint (file + severity + normalized title, lines within ±10) first, then same-file location (±10 lines) for the rest — necessary because models reword titles and even re-rate severities between otherwise identical runs. Two *different* findings within 10 lines of each other can cross-match; treat `persisting`/`resolved` as strong hints, not proofs.
+
 The temperature default has been retuned twice. **0.2** (original) was too conservative: 1–2 findings per round on diffs that plausibly contained more, 5–7 rounds to converge. **0.5** surfaced more findings per round (3–5 typical) but produced a clear hallucination during cross-model integration testing — `google/gemini-2.5-pro` returned a confidently-worded HIGH-severity finding that referenced a CLI flag and "help text" that did not exist in the code; the suggested fix would have crashed the runner. **0.3** (current) is the compromise: tight enough to cut hallucination, loose enough to keep "more findings than 0.2." Override per call with `--temperature` if your project benefits from a different setting; empirical re-tuning is encouraged.
 
 ### Whole-codebase mode (`--codebase`)
@@ -364,6 +408,7 @@ Non-error stderr lines use a fixed prefix vocabulary — **no informational line
 | `[usage] …` | Token usage reported by the provider after a successful call |
 | `[retry] …` | An automatic retry is about to happen (category, attempt, delay) |
 | `[ollama] …` | Ollama context-window detection notice (`/api/ps`) |
+| `[baseline] …` | Round-over-round finding counts when `--baseline` is given |
 | `skip …` | A file was dropped from the codebase bundle (size cap) |
 
 ### Auto-retry behavior

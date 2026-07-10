@@ -243,6 +243,8 @@ The runner **auto-retries once** on `PROVIDER_HICCUP` and `TRANSPORT` before exi
 
 Two agent-facing conveniences: `--dry-run` resolves everything and prints prompt sizes / est. tokens / the file list without spending tokens (read-only git/gh subprocesses and the Ollama `/api/ps` probe still run, so exit-12 parity holds), and `--output <path>` writes the review to a file alongside stdout. `--min-severity HIGH` narrows a round to the findings worth acting on first.
 
+**Prefer `--format json` when consuming findings programmatically.** It parses the markdown into `{summary, findings[{file, line, severity, title, body, suggestion, fingerprint}], parse_ok, …}` locally (prompts unchanged); on parse failure it exits 0 with `parse_ok: false` and the raw markdown embedded — branch on the field, not the exit code. Chain rounds with `--output round1.json` then `--baseline round1.json`: findings come back tagged `new`/`persisting` plus a `resolved` list, which replaces "re-read the whole review and remember what you declined" with set arithmetic. Matching is heuristic (location carries reworded titles; ±10-line window) — treat statuses as strong hints.
+
 ## Safety context
 
 The runner prepends a short framing prefix to every review request, wrapped in `<CONTEXT_FOR_REVIEWER>...</CONTEXT_FOR_REVIEWER>`, to reduce false-positive content-filter refusals on diffs that contain words like `attack`, `sanctions`, `prompt injection`, `tampering`, `redaction` (common in security testing, AML compliance, policy enforcement code).
