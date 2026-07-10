@@ -139,6 +139,8 @@ Two runtime knobs control how much the model says and how exploratory it is:
 |---|---|---|---|
 | `--temperature <float>` | `0.3` (env: `CODE_REVIEW_TEMPERATURE`) | Sampling randomness. Higher = more exploration, more findings per call, more hallucinations. Lower = tighter, more conservative, fewer findings. | Drop to `0.2` for security-critical PRs where decline-comment overhead is expensive. Raise to `0.5–0.7` for first-pass audits where you want maximum coverage and can afford the false-positive rate. |
 | `--max-tokens <int>` | `16000` (env: `CODE_REVIEW_MAX_TOKENS`) | Ceiling on output token count. Not a target — you pay only for what the model actually emits. Default ensures a thorough review isn't truncated mid-finding. | Rarely needs changing. Drop to `4000` if you genuinely want short, focused output (e.g. CI-step where only critical findings matter). Raise if you see truncated `Suggested change:` blocks in very large reviews. |
+| `--min-severity <LEVEL>` | `LOW` (no filter) | Prompt-level severity floor: `MEDIUM`/`HIGH`/`CRITICAL` drop lower-severity findings from the output entirely. | `HIGH` for fast pre-commit gates; leave at `LOW` for the thorough pre-PR pass. |
+| `--retries <N>` | `0` (env: `CODE_REVIEW_RETRIES`) | Extra retry attempts beyond the built-in single transient retry; `N > 0` also retries RATE_LIMIT honoring `Retry-After` (clamped 300s). | Set `2–3` for unattended runs; keep `0` when your agent loop manages its own backoff. |
 
 The temperature default has been retuned twice based on empirical observation:
 
@@ -235,9 +237,11 @@ The runner exits with **typed exit codes** so an LLM caller can react differentl
 | 14 | TRANSPORT | exponential backoff; escalate after 3 |
 | 1 | UNKNOWN | read stderr; escalate |
 
-Stderr always starts with a stable line `ERROR: <CATEGORY> [exit <N>]` followed by free-form human-readable detail. An agent can grep that prefix to extract the category without parsing.
+Stderr always starts with a stable line `ERROR: <CATEGORY> [exit <N>]` followed by free-form human-readable detail. An agent can grep that prefix to extract the category without parsing. Informational stderr lines never start with `ERROR:` — they use the fixed prefixes `Reviewing`, `WARN:`, `[usage]`, `[retry]`, `[ollama]`, and `skip` (full table in the README's "Stderr format" section).
 
-The runner **auto-retries once** on `PROVIDER_HICCUP` and `TRANSPORT` before exiting; other categories surface immediately because retrying without changes doesn't help.
+The runner **auto-retries once** on `PROVIDER_HICCUP` and `TRANSPORT` before exiting; other categories surface immediately because retrying without changes doesn't help. Pass `--retries N` (env `CODE_REVIEW_RETRIES`) to grant N additional attempts with exponential backoff — that also enables `RATE_LIMIT` retries honoring the provider's `Retry-After` (clamped to 300s). `CONFIG` / `SAFETY_REFUSAL` / `CONTEXT_OVERFLOW` are never retried. An agent that manages its own retry loop should keep `--retries 0` (the default) to stay in control of timing.
+
+Two agent-facing conveniences: `--dry-run` resolves everything and prints prompt sizes / est. tokens / the file list without spending tokens (read-only git/gh subprocesses and the Ollama `/api/ps` probe still run, so exit-12 parity holds), and `--output <path>` writes the review to a file alongside stdout. `--min-severity HIGH` narrows a round to the findings worth acting on first.
 
 ## Safety context
 
