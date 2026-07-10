@@ -1,0 +1,198 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Airwhale/local-gemini-code-review/blob/main/docs/schema/review-envelope.schema.json",
+  "title": "code-review --format json envelope (schema_version 1)",
+  "description": "The stdout document of a `code-review --format json` run. One shape covers all three run types: single-model (the default), panel (--models: `model` is null, `models`/`per_model`/per-finding `found_by` appear), and chunked (--chunk: `chunks`/`per_chunk`/per-finding `chunk` appear). Fields not listed here may be added within schema_version 1 without notice (validation is intentionally open); breaking changes bump schema_version and are always called out in CHANGELOG.md.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "mode",
+    "provider",
+    "model",
+    "temperature",
+    "summary",
+    "clean",
+    "findings",
+    "usage",
+    "truncated",
+    "parse_ok",
+    "problems"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "mode": { "enum": ["diff", "codebase"] },
+    "provider": { "type": "string" },
+    "model": {
+      "type": ["string", "null"],
+      "description": "The reviewing model slug; null for panel runs (see `models`)."
+    },
+    "models": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Panel runs only: the resolved model slugs in CLI order."
+    },
+    "temperature": { "type": "number" },
+    "summary": {
+      "type": ["string", "null"],
+      "description": "The model's change/codebase summary; null when absent or for panel/chunked documents (which have no single summary)."
+    },
+    "clean": {
+      "type": "boolean",
+      "description": "True when the model explicitly reported no issues. An empty `findings` list with clean=false means findings were filtered (--min-severity) or the parse failed -- check `parse_ok`."
+    },
+    "findings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/finding" }
+    },
+    "usage": {
+      "$ref": "#/$defs/usage",
+      "description": "Token usage; summed across models/chunks for panel/chunked runs. Null when the provider reported none."
+    },
+    "truncated": {
+      "type": "boolean",
+      "description": "True when output hit the max_tokens ceiling (any model/chunk for panel/chunked runs) -- the review may be incomplete."
+    },
+    "parse_ok": {
+      "type": "boolean",
+      "description": "False when the model's markdown could not be parsed into findings; the raw output is then embedded (top-level `raw`, or per model/chunk). Exit code stays 0 -- callers branch on this field."
+    },
+    "problems": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Non-fatal parse anomalies, prefixed with the model/chunk for panel/chunked runs."
+    },
+    "raw": {
+      "type": "string",
+      "description": "Single-model runs only, and only when parse_ok is false: the model's verbatim markdown."
+    },
+    "resolved": {
+      "type": "array",
+      "items": { "type": "object" },
+      "description": "--baseline runs only: baseline findings nothing in this round matched (prior-round finding objects, verbatim)."
+    },
+    "per_model": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/per_model_entry" },
+      "description": "Panel runs only: one entry per model in CLI order, including failed models."
+    },
+    "chunks": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Chunked runs only: how many chunks the payload split into."
+    },
+    "per_chunk": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/per_chunk_entry" },
+      "description": "Chunked runs only: one entry per chunk in execution order."
+    }
+  },
+  "$defs": {
+    "usage": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "properties": {
+            "prompt_tokens": { "type": ["integer", "null"] },
+            "completion_tokens": { "type": ["integer", "null"] }
+          },
+          "required": ["prompt_tokens", "completion_tokens"]
+        }
+      ]
+    },
+    "finding": {
+      "type": "object",
+      "required": ["file", "line", "severity", "title", "body", "suggestion", "fingerprint"],
+      "properties": {
+        "file": {
+          "type": ["string", "null"],
+          "description": "Forward-slash path; null when the finding appeared before any file heading."
+        },
+        "line": {
+          "type": ["integer", "null"],
+          "description": "1-indexed; null when the model omitted it (or wrote a 0, a diff-position artifact)."
+        },
+        "severity": {
+          "type": "string",
+          "description": "CRITICAL | HIGH | MEDIUM | LOW, or UNKNOWN when unparseable (UNKNOWN findings are never dropped by --min-severity)."
+        },
+        "title": { "type": "string" },
+        "body": { "type": "string" },
+        "suggestion": {
+          "type": ["string", "null"],
+          "description": "The proposed-fix code block, when the model supplied one. Review like any untrusted patch before applying."
+        },
+        "fingerprint": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{12}$",
+          "description": "sha1(file|severity|normalized_title)[:12] -- stable across line drift; used by --baseline matching."
+        },
+        "status": {
+          "enum": ["new", "persisting"],
+          "description": "--baseline runs only."
+        },
+        "found_by": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "description": "Panel runs only: which models reported this (consensus) finding. 1 is the empirical norm; >1 is a rare, high-precision signal."
+        },
+        "chunk": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Chunked runs only: which chunk produced this finding."
+        }
+      }
+    },
+    "per_model_entry": {
+      "type": "object",
+      "required": ["model", "error", "parse_ok", "clean", "summary", "findings_count", "usage", "truncated"],
+      "properties": {
+        "model": { "type": "string" },
+        "error": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "required": ["category", "exit_code", "message"],
+              "properties": {
+                "category": { "type": "string" },
+                "exit_code": { "type": "integer" },
+                "message": { "type": "string" }
+              }
+            }
+          ],
+          "description": "The typed error for a failed model (its fields mirror the ERROR: stderr contract); null on success."
+        },
+        "parse_ok": { "type": ["boolean", "null"] },
+        "clean": { "type": ["boolean", "null"] },
+        "summary": { "type": ["string", "null"] },
+        "findings_count": { "type": "integer" },
+        "usage": { "$ref": "#/$defs/usage" },
+        "truncated": { "type": ["boolean", "null"] },
+        "raw": {
+          "type": "string",
+          "description": "Only when this model's parse failed: its verbatim markdown."
+        }
+      }
+    },
+    "per_chunk_entry": {
+      "type": "object",
+      "required": ["chunk", "label", "parse_ok", "clean", "summary", "findings_count", "usage", "truncated"],
+      "properties": {
+        "chunk": { "type": "integer", "minimum": 1 },
+        "label": { "type": "string" },
+        "parse_ok": { "type": "boolean" },
+        "clean": { "type": "boolean" },
+        "summary": { "type": ["string", "null"] },
+        "findings_count": { "type": "integer" },
+        "usage": { "$ref": "#/$defs/usage" },
+        "truncated": { "type": "boolean" },
+        "raw": {
+          "type": "string",
+          "description": "Only when this chunk's parse failed: its verbatim markdown."
+        }
+      }
+    }
+  }
+}

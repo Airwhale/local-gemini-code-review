@@ -4,7 +4,7 @@
 >
 > Fork of the upstream extension (Apache-2.0). The upstream prompt files ship byte-identical; everything else is fork-added. Installed command: `code-review`. From a checkout: `uv run review.py` — the two are equivalent, and all examples below use the installed form.
 
-**Contents:** [Quick start](#quick-start) · [Providers](#providers) · [Model aliases](#model-aliases) · [Review modes](#review-modes) · [Everyday flags](#everyday-flags) · [Advanced](#advanced) · [Per-project configuration](#per-project-configuration-code-reviewtoml) · [Output format](#output-format) · [Safety context](#safety-context) · [Running in CI](#running-in-ci) · [For LLM coding agents](#for-llm-coding-agents) · [Error model](#error-model-for-llm-callers) · [Non-goals](#non-goals) · [Development](#development) · [Fork provenance](#fork-provenance)
+**Contents:** [Quick start](#quick-start) · [Providers](#providers) · [Model aliases](#model-aliases) · [Review modes](#review-modes) · [Everyday flags](#everyday-flags) · [Advanced](#advanced) · [Per-project configuration](#per-project-configuration-code-reviewtoml) · [Output format](#output-format) · [Safety context](#safety-context) · [Running in CI](#running-in-ci) · [For LLM coding agents](#for-llm-coding-agents) · [Error model](#error-model-for-llm-callers) · [Troubleshooting](#troubleshooting) · [Non-goals](#non-goals) · [Development](#development) · [Fork provenance](#fork-provenance)
 
 ## Quick start
 
@@ -28,9 +28,32 @@ code-review --provider ollama     # local model, no API key, code never leaves t
 code-review --version
 ```
 
+What comes back (markdown on stdout; `--format json` for the [structured envelope](#output-format)):
+
+````markdown
+# Change summary: Adds a retry policy to the HTTP client.
+
+## File: src/client.py
+
+### L42: [HIGH] Retry loop never sleeps between attempts.
+The loop calls the endpoint back-to-back, hammering a rate-limited API
+and defeating the purpose of the retry.
+
+Suggested change:
+```python
+for attempt in range(retries):
+    time.sleep(2 ** attempt)
+    response = call()
+```
+
+### L108: [MEDIUM] Timeout constant duplicated from config.py.
+Also defined at src/config.py L12 — drift between the two is a matter
+of time. Import it from one place.
+````
+
 The wheel ships the prompt assets inside the package, so the installed command is fully self-contained. (`$CODE_REVIEW_PROMPT_DIR` can override the prompt assets if you want to experiment with reworded skills without editing the install.)
 
-Upgrade later with `uv tool upgrade local-gemini-code-review` (re-resolves the same git source), and uninstall with `uv tool uninstall local-gemini-code-review`. What changed between versions is tracked in [CHANGELOG.md](./CHANGELOG.md).
+Upgrade later with `uv tool upgrade local-gemini-code-review` (re-resolves the same git source), and uninstall with `uv tool uninstall local-gemini-code-review`. For reproducible installs, pin a release tag once one matches the [CHANGELOG.md](./CHANGELOG.md) version you want: `uv tool install git+https://github.com/Airwhale/local-gemini-code-review@v0.2.0`.
 
 ### Running from a checkout
 
@@ -193,6 +216,8 @@ After each successful call, a `[usage] prompt=… completion=… total=… token
 ```
 
 **`parse_ok: false` still exits 0** and embeds the full raw markdown as `raw` — exit codes describe transport/config outcomes, not model formatting; agents branch on the field. A parser failure never destroys a paid-for review. Summary-only output (a summary heading but no finding headings and no `No issues found.` marker) counts as a parse failure, not a confident zero-finding review — the template mandates one or the other, so a bare summary means the model drifted.
+
+A formal [JSON Schema](./docs/schema/review-envelope.schema.json) describes the envelope — one shape covering single-model, panel, and chunked documents — and is pinned to the builders by tests, so it can't silently drift from what the tool actually emits.
 
 `--baseline <prior.json>` compares current findings against a previous `--format json` run: each finding gets `status: "new" | "persisting"`, disappeared findings are listed under `resolved`, and a `[baseline] N finding(s): X new, Y persisting, Z resolved` line lands on stderr (markdown mode keeps stdout verbatim). The loop:
 
@@ -462,6 +487,23 @@ code-review exited:
 └── 1   → read stderr; escalate
 ```
 
+## Troubleshooting
+
+The most common symptoms, routed to their fix. Deeper operational gotchas (with the war stories behind them) live in the [runbook](./docs/llm-code-review-runbook.md#known-gotchas).
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `ERROR: CONFIG [exit 2]` naming an API key | Key not set, or rejected by the provider (HTTP 401/403) | Set the env var for your provider ([Providers](#providers)); `.env` locations are in [Quick start](#quick-start) |
+| Immediate `RATE_LIMIT [exit 11]` on `--provider gemini` | Free-tier `gemini-2.5-pro` quota (zero per-day as of late 2025) | `--model gemini-2.5-flash`, or `--provider openrouter` |
+| `CONTEXT_OVERFLOW [exit 12]` on Ollama | Prompt won't fit the model's loaded window — the [truncation guard](#context-window-truncation-guard) refused to run a silently-partial review | Raise `$OLLAMA_NUM_CTX` (RAM permitting), narrow the scope, or use `--chunk` |
+| `CONFIG` error mentioning `ollama serve` / connection refused | Local server not running (or WSL VM idled out) | [Setting up the Ollama provider](#setting-up-the-ollama-provider) |
+| `--pr N` reviewed a different project's PR | gh's default repo points elsewhere (common on forks) | Check the `[gh] reviewing PR #N: <url>` stderr line; pin with `--repo owner/name` |
+| `No diff found. Nothing to review.` (exit 0) | Empty scope: wrong `--base`, or brand-new files aren't in the diff | Untracked files need `git add -N <paths>` first; check the base ref |
+| `SAFETY_REFUSAL [exit 10]` | Content filter fired on security/policy-adjacent code | Retry with `--model claude`; tune the [safety context](#safety-context) |
+| `"parse_ok": false` in JSON output | Model drifted from the output template | The verbatim output is embedded as `raw`; re-run or switch models |
+| Mojibake (`â€"`, `Â§`) in saved reviews on Windows | PowerShell `>` redirection re-encodes as UTF-16 | Use `--output <path>` instead of shell redirection |
+| `ERROR: UNKNOWN [exit 1]` | Unexpected runner exception (traceback in the `Detail:` line) | [File a bug](https://github.com/Airwhale/local-gemini-code-review/issues/new/choose) with the stderr block — the issue form asks for exactly what's needed |
+
 ## Non-goals
 
 Deliberate boundaries, so contributions and reviews don't relitigate them:
@@ -517,7 +559,7 @@ More for contributors:
 | `pyproject.toml` | **new** | Packaging (hatchling wheel, the `code-review` entry point), runtime deps, dev tooling config. |
 | `.env.example`, `.gitignore` | **new** | Config reference; secret/venv hygiene. |
 | `docs/llm-code-review-runbook.md` | **new** | The agent-facing operational manual. |
-| `docs/architecture.md`, `CHANGELOG.md`, `SECURITY.md` | **new** | Contributor map + design decisions; per-version changes; threat model + vulnerability reporting. |
+| `docs/architecture.md`, `CHANGELOG.md`, `SECURITY.md`, `docs/schema/` | **new** | Contributor map + design decisions; per-version changes; threat model + vulnerability reporting; the JSON envelope schema (test-pinned to the builders). |
 | `.github/ISSUE_TEMPLATE/`, `.github/PULL_REQUEST_TEMPLATE.md`, `.github/CODEOWNERS` | **new** | Issue forms keyed to the error-model contract; PR checklist mirroring the fork invariants. |
 | `README.md` | **modified** | This file. |
 | `skills/code-review-commons/SKILL.md`, `commands/code-review.toml`, `commands/pr-code-review.toml` | unchanged | Upstream prompts, loaded verbatim. |

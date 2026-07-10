@@ -19,7 +19,8 @@ The M1–M7 roadmap: the single-file runner became an installable, testable, age
 - Per-project `.code-review.toml` (upward walk, announced on load, unknown keys dropped with a WARN).
 - Ollama native `/api/chat` with a context-window truncation guard: 3-tier window resolution (`$OLLAMA_NUM_CTX` → `/api/ps` detection → advisory), per-request `num_ctx`, and a post-call `prompt_eval_count` verify that caught a real silent truncation in live testing.
 - Quality infra: an offline test suite (several hundred tests: `httpx.MockTransport` wire tests, frozen real-model parser fixtures, contract pins); ruff + mypy (source *and* tests/evals) gating CI on ubuntu + windows; wheel-content verification; an eval harness with planted-bug fixtures **and a clean-diff control** scoring recall and hallucination noise.
-- Docs: rewritten README (contract tables for agent callers), operations runbook, architecture overview, SECURITY.md threat model, issue/PR templates.
+- A formal JSON Schema for the `--format json` envelope (`docs/schema/review-envelope.schema.json`) covering single-model, panel, and chunked documents — pinned to the envelope builders by tests so it can't drift from what the tool emits.
+- Docs: rewritten README (contract tables for agent callers, a sample-output teaser in Quick start, a Troubleshooting symptom table), operations runbook, architecture overview, SECURITY.md threat model, issue/PR templates, and a documented release/tagging procedure for reproducible pinned installs.
 
 ### Changed
 

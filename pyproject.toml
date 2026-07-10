@@ -31,6 +31,8 @@ dev = [
     "pytest>=8",
     "ruff>=0.6",
     "mypy>=1.10",
+    "jsonschema>=4",  # pins docs/schema/review-envelope.schema.json to the builders
+    "types-jsonschema>=4",  # mypy stubs for the above
 ]
 
 [tool.pytest.ini_options]

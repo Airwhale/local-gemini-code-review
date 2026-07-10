@@ -31,6 +31,15 @@
 > decisions, and code layout; user-facing changes get a line in
 > [CHANGELOG.md](../CHANGELOG.md); security-relevant boundaries are
 > documented in [SECURITY.md](../SECURITY.md).
+>
+> **Cutting a release:** when a CHANGELOG version ships to `main`, move
+> its entry from "unreleased" to dated, bump `version` in
+> `pyproject.toml` for the *next* cycle, and tag the merge commit
+> (`git tag v0.2.0 && git push origin v0.2.0`) so
+> `uv tool install git+…@v0.2.0` is reproducible. The envelope schema
+> (`docs/schema/review-envelope.schema.json`) is part of the public
+> contract — breaking changes to it bump `schema_version` and must be
+> called out in the CHANGELOG.
 
 We would love to accept your patches and contributions to this project.
 
