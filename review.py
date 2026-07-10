@@ -69,6 +69,7 @@ import sys
 import time
 import tomllib
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -1636,9 +1637,8 @@ def _call_with_retries(call: Callable[[], T], *, label: str, retries: int = 0) -
             time.sleep(delay)
 
 
-def _resolve_model(args: argparse.Namespace) -> str:
-    """Resolve the final model slug from CLI flag, env var, alias table,
-    or provider default.
+def _resolve_model_name(name: str, provider: str) -> str:
+    """Resolve one model name or alias for ``provider``.
 
     Aliases are scoped per provider (see ``MODEL_ALIASES_BY_PROVIDER``):
     OpenRouter aliases like ``claude`` resolve only with --provider
@@ -1646,40 +1646,43 @@ def _resolve_model(args: argparse.Namespace) -> str:
     --provider ollama. Using an alias from the wrong table raises a
     typed ``ConfigError`` pointing the caller at the correct
     ``--provider`` instead of silently sending an invalid slug to the
-    upstream API.
+    upstream API. Panel mode maps this over every ``--models`` entry
+    pre-flight, so alias mistakes exit 2 before any network call.
     """
-    if args.model is not None:
-        model = args.model
-    elif args.provider == "openrouter":
-        model = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL_BY_PROVIDER["openrouter"])
-    elif args.provider == "gemini":
-        model = os.getenv("GEMINI_MODEL", DEFAULT_MODEL_BY_PROVIDER["gemini"])
-    else:  # ollama
-        model = os.getenv("OLLAMA_MODEL", DEFAULT_MODEL_BY_PROVIDER["ollama"])
-
-    # Resolve via this provider's alias table.
-    provider_aliases = MODEL_ALIASES_BY_PROVIDER.get(args.provider, {})
-    if model in provider_aliases:
-        return provider_aliases[model]
+    provider_aliases = MODEL_ALIASES_BY_PROVIDER.get(provider, {})
+    if name in provider_aliases:
+        return provider_aliases[name]
 
     # If the model name matches an alias for a DIFFERENT provider, the
     # user almost certainly meant to switch providers. Surface that with
     # a typed ConfigError naming the right --provider, so an LLM caller
     # parsing stderr can self-correct instead of hammering the wrong
-    # endpoint. The compound condition (other_provider != args.provider
-    # AND model in other_aliases) is equivalent to the previous
-    # ``continue``-based skip, kept compact at the reviewer's suggestion.
+    # endpoint.
     for other_provider, other_aliases in MODEL_ALIASES_BY_PROVIDER.items():
-        if other_provider != args.provider and model in other_aliases:
+        if other_provider != provider and name in other_aliases:
             raise ConfigError(
-                f"Model alias `{model}` is only valid with "
+                f"Model alias `{name}` is only valid with "
                 f"--provider {other_provider} (currently --provider "
-                f"{args.provider}). Either switch with "
+                f"{provider}). Either switch with "
                 f"--provider {other_provider}, or pass an actual model "
-                f"name supported by --provider {args.provider}."
+                f"name supported by --provider {provider}."
             )
 
-    return model
+    return name
+
+
+def _resolve_model(args: argparse.Namespace) -> str:
+    """Resolve the single-model slug from CLI flag, env var, alias table,
+    or provider default (see ``_resolve_model_name`` for alias rules)."""
+    if args.model is not None:
+        name = args.model
+    elif args.provider == "openrouter":
+        name = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL_BY_PROVIDER["openrouter"])
+    elif args.provider == "gemini":
+        name = os.getenv("GEMINI_MODEL", DEFAULT_MODEL_BY_PROVIDER["gemini"])
+    else:  # ollama
+        name = os.getenv("OLLAMA_MODEL", DEFAULT_MODEL_BY_PROVIDER["ollama"])
+    return _resolve_model_name(name, args.provider)
 
 
 # ---------------------------------------------------------------------------
@@ -2189,6 +2192,287 @@ def build_json_envelope(
     return envelope
 
 
+# ---------------------------------------------------------------------------
+# Multi-model panel (--models)
+# ---------------------------------------------------------------------------
+#
+# Runs the same prompt through several models and merges the parsed
+# findings into one consensus-annotated report. Motivated by the PR #2
+# dogfood run: on the same real diff one model returned clean, one
+# returned only hallucinations, and one had a single real bug in 28
+# findings -- cross-model agreement is the strongest cheap filter for
+# plausible-but-wrong findings. Empirically ``found_by`` of 1 is the
+# norm; consensus (>1) is a rare, high-precision signal.
+
+# Severity rank for merged-finding ordering; UNKNOWN sorts below LOW.
+_SEVERITY_RANK = {level: idx for idx, level in enumerate(SEVERITY_LEVELS)}
+
+# All-models-failed exit precedence: non-retryable, caller-actionable
+# categories dominate retryable ones so an agent pattern-matching the
+# single ERROR: block fixes the config/scope problem instead of
+# blind-retrying. Documented in README as part of the error model; ties
+# break by CLI model order (min() is stable).
+_CATEGORY_PRECEDENCE = (
+    "CONFIG",
+    "SAFETY_REFUSAL",
+    "CONTEXT_OVERFLOW",
+    "RATE_LIMIT",
+    "PROVIDER_HICCUP",
+    "TRANSPORT",
+    "UNKNOWN",
+)
+
+
+@dataclasses.dataclass
+class MergedFinding:
+    """One panel cluster: the representative finding + who reported it."""
+
+    finding: Finding
+    found_by: list[str]
+
+
+def panel_findings_match(a: Finding, b: Finding) -> bool:
+    """Do two findings from DIFFERENT models describe the same issue?
+
+    Strong fingerprint match, or same location AND same severity. The
+    location tier is tighter than the baseline matcher's (which ignores
+    severity): consensus is sold as a high-precision signal, and merging
+    two different same-hunk findings from different models would
+    manufacture false confidence. Under-merging just leaves found_by=1,
+    which is the empirical norm anyway.
+    """
+    if findings_match(a, b):
+        return True
+    return a.severity == b.severity and _location_match(
+        a.file, a.line, b.file, b.line
+    )
+
+
+def merge_panel_findings(
+    parsed_by_model: dict[str, ParsedReview],
+) -> list[MergedFinding]:
+    """Greedily cluster findings across models (dict order = CLI order).
+
+    The first model to report an issue provides the representative
+    finding (title/body/suggestion); later matches only append to
+    ``found_by``. Ordering: consensus first, then severity, then
+    location -- the read order a human wants.
+    """
+    clusters: list[MergedFinding] = []
+    for model, parsed in parsed_by_model.items():
+        for finding in parsed.findings:
+            for cluster in clusters:
+                if model not in cluster.found_by and panel_findings_match(
+                    cluster.finding, finding
+                ):
+                    cluster.found_by.append(model)
+                    break
+            else:
+                clusters.append(MergedFinding(finding=finding, found_by=[model]))
+    clusters.sort(
+        key=lambda c: (
+            -len(c.found_by),
+            -_SEVERITY_RANK.get(c.finding.severity, -1),
+            c.finding.file or "",
+            c.finding.line if c.finding.line is not None else 10**9,
+        )
+    )
+    return clusters
+
+
+def _panel_max_workers(provider: str, n_models: int) -> int:
+    """Concurrency for a panel: cloud providers run in parallel (capped);
+    ollama runs strictly sequentially -- two local models can't share
+    RAM, and interleaved requests just thrash model swaps."""
+    if provider == "ollama":
+        return 1
+    return min(n_models, 4)
+
+
+def _panel_exit_error(failures: list[tuple[str, ReviewError]]) -> ReviewError:
+    """Pick the one typed error to exit with when ALL panel models failed.
+
+    Fixed category precedence (see ``_CATEGORY_PRECEDENCE``); ties break
+    by CLI model order because ``min`` is stable.
+    """
+    def rank(item: tuple[str, ReviewError]) -> int:
+        category = item[1].category
+        return (
+            _CATEGORY_PRECEDENCE.index(category)
+            if category in _CATEGORY_PRECEDENCE
+            else len(_CATEGORY_PRECEDENCE)
+        )
+
+    return min(failures, key=rank)[1]
+
+
+def render_panel_markdown(
+    merged: list[MergedFinding],
+    parsed_by_model: dict[str, ParsedReview],
+    raw_by_model: dict[str, str],
+    failures: list[tuple[str, ReviewError]],
+    n_models: int,
+) -> str:
+    """Fork-generated markdown report for a panel run.
+
+    Merged findings first (consensus-ordered, each with a ``Found by:``
+    line), then every model's raw output verbatim in an appendix --
+    nothing the models said is lost to the merge.
+    """
+    lines: list[str] = [f"# Panel review ({len(parsed_by_model)}/{n_models} models)", ""]
+
+    lines.append("Per-model results:")
+    for model, parsed in parsed_by_model.items():
+        if parsed.clean:
+            note = "clean -- no issues found"
+        elif parsed.parse_ok:
+            note = f"{len(parsed.findings)} finding(s): {parsed.summary or '(no summary)'}"
+        else:
+            note = "output could not be parsed (see appendix)"
+        lines.append(f"- `{model}`: {note}")
+    for model, err in failures:
+        lines.append(f"- `{model}`: FAILED -- {err.category}: {err}")
+    lines.append("")
+
+    if merged:
+        lines.append("## Merged findings")
+        lines.append("")
+        for cluster in merged:
+            finding = cluster.finding
+            location = finding.file or "(no file)"
+            if finding.line is not None:
+                location += f" L{finding.line}"
+            lines.append(f"### {location}: [{finding.severity}] {finding.title}")
+            lines.append(f"Found by: {', '.join(cluster.found_by)}")
+            if finding.body:
+                lines.append("")
+                lines.append(finding.body)
+            if finding.suggestion:
+                lines.append("")
+                lines.append("Suggested change:")
+                lines.append("```")
+                lines.append(finding.suggestion)
+                lines.append("```")
+            lines.append("")
+    else:
+        lines.append("No findings from any model.")
+        lines.append("")
+
+    for model, raw in raw_by_model.items():
+        lines.append(f"## Appendix: {model}")
+        lines.append("")
+        lines.append(raw.rstrip("\n"))
+        lines.append("")
+
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def build_panel_envelope(
+    *,
+    mode: str,
+    provider: str,
+    temperature: float,
+    models: tuple[str, ...],
+    merged: list[MergedFinding],
+    parsed_by_model: dict[str, ParsedReview],
+    results_by_model: dict[str, CallResult],
+    raw_by_model: dict[str, str],
+    failures: list[tuple[str, ReviewError]],
+) -> dict:
+    """Assemble the ``--format json`` document for a panel run.
+
+    Same schema_version as the single-model envelope; ``model`` is null
+    and ``models`` / ``found_by`` / ``per_model`` carry the panel shape.
+    Raw output for a model is embedded in its per_model entry only when
+    its parse failed.
+    """
+    findings_out = []
+    for cluster in merged:
+        entry = dataclasses.asdict(cluster.finding)
+        entry["fingerprint"] = finding_fingerprint(cluster.finding)
+        entry["found_by"] = list(cluster.found_by)
+        findings_out.append(entry)
+
+    per_model = []
+    prompt_total: int | None = None
+    completion_total: int | None = None
+    for model in models:
+        if model in parsed_by_model:
+            parsed = parsed_by_model[model]
+            result = results_by_model[model]
+            entry = {
+                "model": model,
+                "error": None,
+                "parse_ok": parsed.parse_ok,
+                "clean": parsed.clean,
+                "summary": parsed.summary,
+                "findings_count": len(parsed.findings),
+                "usage": (
+                    {
+                        "prompt_tokens": result.prompt_tokens,
+                        "completion_tokens": result.completion_tokens,
+                    }
+                    if result.prompt_tokens is not None
+                    or result.completion_tokens is not None
+                    else None
+                ),
+                "truncated": result.truncated,
+            }
+            if not parsed.parse_ok:
+                entry["raw"] = raw_by_model[model]
+            if result.prompt_tokens is not None:
+                prompt_total = (prompt_total or 0) + result.prompt_tokens
+            if result.completion_tokens is not None:
+                completion_total = (completion_total or 0) + result.completion_tokens
+        else:
+            err = next(e for m, e in failures if m == model)
+            entry = {
+                "model": model,
+                "error": {
+                    "category": err.category,
+                    "exit_code": err.exit_code,
+                    "message": str(err),
+                },
+                "parse_ok": None,
+                "clean": None,
+                "summary": None,
+                "findings_count": 0,
+                "usage": None,
+                "truncated": None,
+            }
+        per_model.append(entry)
+
+    return {
+        "schema_version": 1,
+        "mode": mode,
+        "provider": provider,
+        "model": None,
+        "models": list(models),
+        "temperature": temperature,
+        "summary": None,
+        "clean": bool(parsed_by_model)
+        and all(p.clean for p in parsed_by_model.values()),
+        "findings": findings_out,
+        "usage": (
+            {
+                "prompt_tokens": prompt_total,
+                "completion_tokens": completion_total,
+            }
+            if prompt_total is not None or completion_total is not None
+            else None
+        ),
+        "truncated": any(r.truncated for r in results_by_model.values()),
+        "parse_ok": bool(parsed_by_model)
+        and all(p.parse_ok for p in parsed_by_model.values()),
+        "problems": [
+            f"{model}: {problem}"
+            for model, parsed in parsed_by_model.items()
+            for problem in parsed.problems
+        ],
+        "per_model": per_model,
+    }
+
+
 def _min_severity_instruction(level: str) -> str:
     """Fork-owned prompt appendix implementing ``--min-severity``.
 
@@ -2290,6 +2574,7 @@ class Settings:
     output: str | None
     format: str = "markdown"
     baseline: str | None = None
+    models: tuple[str, ...] | None = None  # panel mode (--models)
     api_key: str | None = None
     referer: str | None = None
     title: str | None = None
@@ -2368,7 +2653,38 @@ def _resolve_settings(args: argparse.Namespace) -> Settings:
     M6 replaces this with a 4-layer ``_layered`` resolver when the
     project-config file arrives.
     """
-    model = _resolve_model(args)
+    # Panel model list: resolved pre-flight so alias errors exit 2
+    # before any network call. Exclusive with --model (manual check,
+    # same pattern as --context / --no-context).
+    models: tuple[str, ...] | None = None
+    if args.models is not None:
+        if args.model is not None:
+            raise ConfigError(
+                "--models and --model are mutually exclusive. Use --models "
+                "for a panel, --model for a single reviewer."
+            )
+        names = [n.strip() for n in args.models.split(",") if n.strip()]
+        if len(names) < 2:
+            raise ConfigError(
+                "--models needs at least two comma-separated entries "
+                "(use --model for a single reviewer)."
+            )
+        resolved = [_resolve_model_name(n, args.provider) for n in names]
+        dupes = {m for m in resolved if resolved.count(m) > 1}
+        if dupes:
+            raise ConfigError(
+                f"--models resolves to duplicate entries: {sorted(dupes)}. "
+                "Aliases and slugs for the same model count as one."
+            )
+        models = tuple(resolved)
+        if args.baseline is not None:
+            raise ConfigError(
+                "--baseline is not supported with --models yet; run the "
+                "panel with --format json and diff rounds externally, or "
+                "baseline a single-model run."
+            )
+
+    model = models[0] if models else _resolve_model(args)
 
     # Temperature: explicit CLI flag wins, then env, then default.
     if args.temperature is not None:
@@ -2539,6 +2855,7 @@ def _resolve_settings(args: argparse.Namespace) -> Settings:
         output=args.output,
         format=output_format,
         baseline=args.baseline,
+        models=models,
         api_key=api_key,
         referer=referer,
         title=title,
@@ -2642,10 +2959,14 @@ def _dry_run_report(
     globs without paying for a review.
     """
     prompt_chars = len(request.system_prompt) + len(request.user_prompt)
+    if settings.models is not None:
+        model_line = f"models:            {', '.join(settings.models)} (panel)"
+    else:
+        model_line = f"model:             {settings.model}"
     lines = [
         "DRY RUN -- no model call made, no tokens spent.",
         f"provider:          {settings.provider}",
-        f"model:             {settings.model}",
+        model_line,
         f"mode:              {request.mode}",
         f"temperature:       {settings.temperature}",
         f"max_tokens:        {settings.max_tokens}",
@@ -2749,6 +3070,59 @@ def _execute_call(
     )
 
 
+def _run_panel(
+    settings: Settings, request: ReviewRequest
+) -> tuple[dict[str, CallResult], list[tuple[str, ReviewError]]]:
+    """Run the panel: one ``_execute_call`` per model, concurrently for
+    cloud providers, sequentially for ollama (see ``_panel_max_workers``).
+
+    Returns ``(results_by_model, failures)`` -- results keyed in CLI
+    order; each failure is that model's typed error, collected rather
+    than raised so one bad model doesn't kill the panel. Threading is
+    safe: every ``call_*`` builds its own ``httpx.Client``, and the
+    Ollama window probe runs inside ``_execute_call`` per model, so each
+    sequentially loaded model gets a fresh /api/ps read. Stderr lines
+    are single ``write()`` calls to limit interleaving.
+    """
+    assert settings.models is not None
+    workers = _panel_max_workers(settings.provider, len(settings.models))
+    if settings.provider == "ollama" and len(settings.models) > 1:
+        sys.stderr.write(
+            "[panel] ollama models run sequentially (model-swap "
+            "thrashing / RAM pressure)\n"
+        )
+
+    def _one(model: str) -> tuple[str, CallResult | ReviewError]:
+        sys.stderr.write(f"[panel {model}] starting...\n")
+        try:
+            result = _execute_call(
+                settings, request.system_prompt, request.user_prompt, model
+            )
+        except ReviewError as err:
+            return model, err
+        usage_line = _format_usage_line(result, settings.provider, model)
+        if usage_line is not None:
+            sys.stderr.write(f"[panel {model}] done. {usage_line}\n")
+        else:
+            sys.stderr.write(f"[panel {model}] done.\n")
+        return model, result
+
+    outcomes: dict[str, CallResult | ReviewError] = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for model, outcome in pool.map(_one, settings.models):
+            outcomes[model] = outcome
+
+    results_by_model: dict[str, CallResult] = {}
+    failures: list[tuple[str, ReviewError]] = []
+    for model in settings.models:
+        outcome = outcomes[model]
+        if isinstance(outcome, ReviewError):
+            failures.append((model, outcome))
+        else:
+            results_by_model[model] = outcome
+    return results_by_model, failures
+
+
 def main() -> None:
     _ensure_utf8_stdout()
     # Load env from this script's directory so `.env` is configured once at
@@ -2838,6 +3212,20 @@ def main() -> None:
             "claude-opus/gpt/gpt-mini/deepseek (openrouter); "
             "local/local-pro (ollama). ``gemini-2.5-flash`` / "
             "``flash`` is ~3x faster with some quality loss."
+        ),
+    )
+    parser.add_argument(
+        "--models",
+        default=None,
+        metavar="CSV",
+        help=(
+            "Comma-separated model slugs/aliases for a multi-model "
+            "panel (e.g. ``pro,claude,deepseek``). Each model reviews "
+            "the same payload; findings are merged with consensus "
+            "annotations (Found by: ...). Exit 0 if at least one model "
+            "succeeds. Mutually exclusive with --model. Panels shine "
+            "with --provider openrouter (one key, many vendors); "
+            "ollama panels run sequentially."
         ),
     )
     parser.add_argument(
@@ -3019,20 +3407,70 @@ def main() -> None:
         print(_dry_run_report(settings, request, ollama_window=ollama_window))
         return
 
+    reviewer = (
+        ", ".join(settings.models) if settings.models is not None else settings.model
+    )
     if request.mode == "codebase":
         assert request.files is not None
         sys.stderr.write(
             f"Reviewing {len(request.files)} file(s) "
-            f"({request.payload_chars:,} chars) with `{settings.model}` "
+            f"({request.payload_chars:,} chars) with `{reviewer}` "
             f"via {settings.provider} (T={settings.temperature}, "
             f"max_tokens={settings.max_tokens})...\n"
         )
     else:
         sys.stderr.write(
             f"Reviewing {request.payload_chars:,}-char diff with "
-            f"`{settings.model}` via {settings.provider} "
+            f"`{reviewer}` via {settings.provider} "
             f"(T={settings.temperature}, max_tokens={settings.max_tokens})...\n"
         )
+
+    if settings.models is not None:
+        results_by_model, failures = _run_panel(settings, request)
+        for model, err in failures:
+            # Never starts with "ERROR:" -- that prefix is reserved for
+            # the single terminal error block.
+            sys.stderr.write(
+                f"WARN: [panel] {model} failed: {err.category} "
+                f"[exit {err.exit_code}] -- {err}\n"
+            )
+        if not results_by_model:
+            # All models failed: exit with one typed error, chosen by
+            # the documented category precedence.
+            raise _panel_exit_error(failures)
+        raw_by_model = {m: r.content for m, r in results_by_model.items()}
+        parsed_by_model = {
+            m: parse_review_markdown_safe(raw) for m, raw in raw_by_model.items()
+        }
+        merged = merge_panel_findings(parsed_by_model)
+        if settings.format == "json":
+            stdout_text = json.dumps(
+                build_panel_envelope(
+                    mode=request.mode,
+                    provider=settings.provider,
+                    temperature=settings.temperature,
+                    models=settings.models,
+                    merged=merged,
+                    parsed_by_model=parsed_by_model,
+                    results_by_model=results_by_model,
+                    raw_by_model=raw_by_model,
+                    failures=failures,
+                ),
+                indent=2,
+                ensure_ascii=False,
+            )
+        else:
+            stdout_text = render_panel_markdown(
+                merged,
+                parsed_by_model,
+                raw_by_model,
+                failures,
+                len(settings.models),
+            )
+        print(stdout_text)
+        if settings.output is not None:
+            _write_output_file(stdout_text, settings.output)
+        return
 
     result = _execute_call(
         settings, request.system_prompt, request.user_prompt, settings.model
