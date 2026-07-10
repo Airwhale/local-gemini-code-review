@@ -120,7 +120,7 @@ uv run review.py --provider ollama      # local Ollama server (no API key)
 |---|---|---|---|---|
 | `openrouter` (default) | `openrouter.ai/api/v1/chat/completions` | `OPENROUTER_API_KEY` | `google/gemini-2.5-pro` | OpenAI-compatible chat-completions wire format. One bill for many providers. |
 | `gemini` | `generativelanguage.googleapis.com/v1beta/models/...` | `GEMINI_API_KEY` | `gemini-2.5-pro` | Google AI Studio's `generateContent` endpoint. Slightly lower latency (one less hop). |
-| `ollama` | `{OLLAMA_HOST}/v1/chat/completions` (default `http://localhost:11434`) | none — local server | `qwen3-coder:30b` | Local LLM via [Ollama](https://ollama.com). OpenAI-compatible endpoint. No API key, no token costs, code never leaves the machine. CPU inference is slower than cloud (1–5 min/review typical). |
+| `ollama` | `{OLLAMA_HOST}/api/chat` (default `http://localhost:11434`) | none — local server | `qwen3-coder:30b` | Local LLM via [Ollama](https://ollama.com). Native endpoint (per-request `num_ctx`, `prompt_eval_count` truncation detection). No API key, no token costs, code never leaves the machine. CPU inference is slower than cloud (1–5 min/review typical). |
 
 **Known gotcha for the Gemini API path:** the free tier has zero per-day quota for `gemini-2.5-pro` as of the time of writing. You'll see HTTP 429 immediately. Workarounds:
 
@@ -154,7 +154,7 @@ Practical workflow: cloud first for the structured triage pass; local as a sanit
    - `OLLAMA_HOST=http://localhost:11434` — server URL. Override if Ollama is on a non-default port, another machine, or a WSL distro without localhost mirroring. Scheme-less `host:port` values (Ollama's own `OLLAMA_HOST` convention, e.g. `0.0.0.0:11434`) are accepted — the runner prepends `http://`.
    - `OLLAMA_MODEL=qwen3-coder:30b` — default model when `--provider ollama` is selected.
    - `OLLAMA_TIMEOUT=1800` — HTTP timeout in seconds. Default 30 minutes accommodates CPU cold-starts (10–60 s model load) plus thorough reviews; lower it if you'd rather fail fast.
-   - `OLLAMA_NUM_CTX=32768` — the context window (tokens) your server loads models with. Usually unnecessary: the runner reads the real window from a loaded model automatically. See the truncation guard below.
+   - `OLLAMA_NUM_CTX=32768` — the context window (tokens) to request per call. Usually unnecessary: the runner reads a loaded model's real window automatically and requests that. See the truncation guard below.
 4. Run:
 
     ```bash
@@ -163,21 +163,16 @@ Practical workflow: cloud first for the structured triage pass; local as a sanit
 
 The runner's error messages are tailored for Ollama-specific failure modes — "server unreachable" suggests `ollama serve` and `--ollama-host`; "model not pulled" gives you the exact `ollama pull <model>` command to run.
 
-**Context-window truncation guard.** Unlike the cloud providers, which return an error when a prompt exceeds the model's context, Ollama **silently truncates** prompts that don't fit the loaded context window (`num_ctx`) and generates from whatever survived. For code review that's the worst failure mode: the model reviews a fragment of your diff and returns a plausible-looking "few issues found" with exit 0. The runner estimates the prompt size pre-flight and compares it against the window, resolved in this order:
+**Context-window truncation guard.** Unlike the cloud providers, which return an error when a prompt exceeds the model's context, Ollama **silently truncates** prompts that don't fit the loaded context window (`num_ctx`) and generates from whatever survived. For code review that's the worst failure mode: the model reviews a fragment of your diff and returns a plausible-looking "few issues found" with exit 0. The runner uses the native `/api/chat` endpoint, resolves the window per call, and **requests it via `options.num_ctx`**:
 
-1. **`$OLLAMA_NUM_CTX` set** → treated as authoritative; a likely overflow is a hard `CONTEXT_OVERFLOW` (exit 12).
-2. **Model already loaded** → the runner reads the model's *actual* window from `GET /api/ps` (`[ollama] detected context window …` on stderr) and enforces that. In an iterative review loop this covers every round after the first.
-3. **Window unknown** (first-ever call, model not loaded) → the runner assumes the smallest stock tier (4096) but only **warns** on a likely overflow, because stock Ollama sizes the window by VRAM ([docs](https://docs.ollama.com/context-length): 4K under 24 GiB, 32K for 24–48 GiB, 256K above) and a hard error would reject valid runs on bigger machines.
+1. **`$OLLAMA_NUM_CTX` set** → sent as the requested window; a likely overflow is a hard `CONTEXT_OVERFLOW` (exit 12) *before* the call. No server restart needed to change it — but the KV cache scales with the window, so stay within your RAM/VRAM.
+2. **Model already loaded** → the runner reads the model's *actual* window from `GET /api/ps` (`[ollama] detected context window …` on stderr), requests the same value (no model reload), and enforces it pre-flight. In an iterative review loop this covers every round after the first.
+3. **Window unknown** (first-ever call, model not loaded) → `num_ctx` is **omitted** so the server keeps its own VRAM-tier default ([docs](https://docs.ollama.com/context-length): 4K under 24 GiB, 32K for 24–48 GiB, 256K above) — requesting the conservative 4096 here would *shrink* a bigger window and cause the very truncation being guarded against. The pre-flight guard only warns; instead, the runner **verifies after the call**: if the response's `prompt_eval_count` sits at the window (re-probed from `/api/ps`, now that the model is loaded), the output is discarded with a hard `CONTEXT_OVERFLOW` rather than returned as a bogus exit-0 review.
 
-If you see the warning (or a `CONTEXT_OVERFLOW`), either narrow the review scope or raise the window server-side and pin it for the runner:
-
-```bash
-# server side (pick a window your VRAM can hold):
-OLLAMA_CONTEXT_LENGTH=32768 ollama serve
-```
+If you hit the warning or a `CONTEXT_OVERFLOW`, either narrow the review scope or set the window for the runner (RAM permitting):
 
 ```dotenv
-# runner side (.env) — must match the server:
+# .env — requested per call via options.num_ctx; no server restart needed:
 OLLAMA_NUM_CTX=32768
 ```
 
@@ -387,7 +382,7 @@ If you're an LLM agent calling this tool in a loop, here's the contract.
 | **2** | CONFIG | Missing API key or invalid CLI / env arg | **Do not retry without fixing.** Read stderr, correct config, then re-run. |
 | **10** | SAFETY_REFUSAL | Model refused (content filter fired) | Retry with `--model claude` (Anthropic is the least refusal-prone on security / policy / adversarial-fixture code). If refused across models, the content may need human review. |
 | **11** | RATE_LIMIT | HTTP 429 from the provider | Wait 30–60s (or the `Retry-After` value echoed in the message), then retry — or pass `--retries N` and let the runner do it. If the limit is per-key per-day (common on free tiers), switch `--provider` or `--model`. |
-| **12** | CONTEXT_OVERFLOW | Diff exceeded the model's token budget, the runner's 700K-char bundle cap, or the Ollama context-window guard | Narrow scope: `--include` / `--exclude` in codebase mode, or a smaller `--base` ref in diff mode. **Do not retry without reducing scope.** Exception: if the message says max_tokens was hit before any content appeared (reasoning models can spend the whole budget thinking), raise `--max-tokens` instead. For the Ollama guard, raise the server's `OLLAMA_CONTEXT_LENGTH` and set `$OLLAMA_NUM_CTX` to match. |
+| **12** | CONTEXT_OVERFLOW | Diff exceeded the model's token budget, the runner's 700K-char bundle cap, or the Ollama context-window guard | Narrow scope: `--include` / `--exclude` in codebase mode, or a smaller `--base` ref in diff mode. **Do not retry without reducing scope.** Exception: if the message says max_tokens was hit before any content appeared (reasoning models can spend the whole budget thinking), raise `--max-tokens` instead. For the Ollama guard/post-verify, raise `$OLLAMA_NUM_CTX` — the runner requests the window per call (RAM permitting; no server restart). |
 | **13** | PROVIDER_HICCUP | Null content with no clear cause (no safety flag, no length hit) | The runner already auto-retried once; if you see this, both attempts failed. Wait a few seconds and retry; if still hicupped, switch provider. |
 | **14** | TRANSPORT | HTTP 5xx, timeout, or connection error | The runner already retried once at 2s. Retry with exponential backoff (4s, 8s); escalate if 3 retries fail. |
 | **1** | UNKNOWN | Catchall (unexpected exception, non-JSON response, etc.) | Read stderr for the surviving exception; escalate if unclear. |

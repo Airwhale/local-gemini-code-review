@@ -195,7 +195,9 @@ class TestOllamaPromptGuard:
         # 100K chars ~ 25K tokens >> a 4096-token window.
         with pytest.raises(ContextOverflow) as exc_info:
             _ollama_prompt_guard(100_000, 4096, model="m")
-        assert "OLLAMA_CONTEXT_LENGTH" in str(exc_info.value)
+        # The runner requests the window per call now; the fix is the
+        # env var, not a server restart.
+        assert "$OLLAMA_NUM_CTX" in str(exc_info.value)
 
     def test_boundary_just_under_window_passes(self):
         # 4095 tokens' worth of chars against a 4096 window.
@@ -246,6 +248,48 @@ class TestMatchLoadedContext:
     def test_empty_or_malformed_data_returns_none(self):
         assert review._match_loaded_context({}, "m") is None
         assert review._match_loaded_context({"models": ["junk"]}, "m") is None
+
+    @pytest.mark.parametrize("data", [None, [], "nope", 42])
+    def test_top_level_non_dict_returns_none(self, data: object):
+        # A misbehaving proxy can return a top-level list/string; the
+        # probe must degrade to None, not AttributeError.
+        assert review._match_loaded_context(data, "m") is None
+
+
+class TestOllamaPostVerify:
+    HOST = "http://localhost:11434"
+
+    def test_no_usage_field_skips_silently(self, capsys: pytest.CaptureFixture):
+        review._ollama_post_verify(None, 4096, host=self.HOST, model="m")
+        assert capsys.readouterr().err == ""
+
+    def test_below_margin_passes(self):
+        review._ollama_post_verify(4000, 4096, host=self.HOST, model="m")
+
+    def test_at_margin_raises(self):
+        with pytest.raises(ContextOverflow) as exc_info:
+            review._ollama_post_verify(4014, 4096, host=self.HOST, model="m")
+        assert "truncated server-side" in str(exc_info.value)
+
+    def test_unknown_window_reprobes(self, monkeypatch: pytest.MonkeyPatch):
+        # Window wasn't sent (tier 3); the model is loaded post-call, so
+        # /api/ps supplies the real window for verification.
+        monkeypatch.setattr(
+            review, "_detect_ollama_num_ctx", lambda host, model: 4096
+        )
+        with pytest.raises(ContextOverflow):
+            review._ollama_post_verify(4090, None, host=self.HOST, model="m")
+
+    def test_unknown_window_reprobe_fails_warns_and_skips(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ):
+        monkeypatch.setattr(
+            review, "_detect_ollama_num_ctx", lambda host, model: None
+        )
+        review._ollama_post_verify(50_000, None, host=self.HOST, model="m")
+        err = capsys.readouterr().err
+        assert err.startswith("WARN:")
+        assert "OLLAMA_NUM_CTX" in err
 
 
 # ---------------------------------------------------------------------------

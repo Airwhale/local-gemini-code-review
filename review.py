@@ -19,13 +19,16 @@ providers selectable at the command line:
       same key the GitHub bot uses on the backend.
 
   --provider ollama
-      POSTs to a local Ollama server's OpenAI-compatible endpoint
-      (http://localhost:11434/v1/chat/completions by default). No API key
-      required -- the server runs on your machine (or in WSL). Override the
-      URL with `--ollama-host` or `$OLLAMA_HOST` if Ollama listens elsewhere
-      (different port, different machine, WSL with non-default networking).
-      Best for offline / private / cost-free review; trade-off is quality
-      and speed depending on local model size and CPU/GPU.
+      POSTs to a local Ollama server's native chat endpoint
+      (http://localhost:11434/api/chat by default) -- native rather than
+      OpenAI-compat because it accepts per-request ``options.num_ctx``
+      and reports ``prompt_eval_count`` for truncation detection. No API
+      key required -- the server runs on your machine (or in WSL).
+      Override the URL with `--ollama-host` or `$OLLAMA_HOST` if Ollama
+      listens elsewhere (different port, different machine, WSL with
+      non-default networking). Best for offline / private / cost-free
+      review; trade-off is quality and speed depending on local model
+      size and CPU/GPU.
 
 Provider defaults: openrouter -> ``google/gemini-2.5-pro``, gemini ->
 ``gemini-2.5-pro``, ollama -> ``qwen3-coder:30b`` (the MoE coder model
@@ -318,11 +321,14 @@ GEMINI_URL_TEMPLATE = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 )
 # Ollama exposes both its native API (``/api/chat``) and an OpenAI-compatible
-# endpoint (``/v1/chat/completions``). We use the latter because the request/
-# response shape mirrors OpenRouter, which lets us reuse the same
-# finish-reason classification and error-handling patterns.
+# endpoint (``/v1/chat/completions``). We use the NATIVE endpoint: it accepts
+# per-request ``options.num_ctx`` (so the runner can request the context
+# window instead of guessing what the server loaded) and reports
+# ``prompt_eval_count``, which lets ``_ollama_post_verify`` detect silent
+# prompt truncation after the fact. The OpenAI-compat endpoint offers
+# neither.
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
-OLLAMA_CHAT_PATH = "/v1/chat/completions"
+OLLAMA_CHAT_PATH = "/api/chat"
 HTTP_TIMEOUT = 300.0  # Gemini 2.5 Pro on a ~5K-line diff lands ~30-60s; pad
                      # generously for very large diffs and whole-codebase
                      # bundles.
@@ -340,30 +346,43 @@ DEFAULT_OLLAMA_TIMEOUT = 1800.0  # 30 minutes
 # (``num_ctx``) and generates from whatever survived. For a code review
 # that's the worst failure mode: the model reviews a fragment of the
 # diff, returns exit 0, and the output looks like a legitimate "few
-# issues found" review. The OpenAI-compatible endpoint has no way to
-# pass ``num_ctx`` per request, so the runner can't widen the window
-# itself; instead it refuses pre-flight (typed CONTEXT_OVERFLOW) when
-# the prompt likely exceeds the window.
+# issues found" review. The native endpoint accepts a per-request
+# ``options.num_ctx``, so the runner requests the window when it knows
+# it, refuses pre-flight (typed CONTEXT_OVERFLOW) when the prompt
+# exceeds a known window, and verifies ``prompt_eval_count`` post-call
+# as the backstop for the unknown case.
 #
 # Stock Ollama picks the window from available VRAM (per
 # docs.ollama.com/context-length: <24 GiB -> 4K, 24-48 GiB -> 32K,
 # >=48 GiB -> 256K), and ``OLLAMA_CONTEXT_LENGTH`` / the app settings /
-# a Modelfile ``num_ctx`` can override it -- so the runner cannot know
-# the window statically. Resolution order for the guard:
+# a Modelfile ``num_ctx`` can override it. The runner resolves the
+# window per model per call and REQUESTS it via the native endpoint's
+# ``options.num_ctx``:
 #
-#   1. ``$OLLAMA_NUM_CTX`` set -> authoritative; guard is a hard error.
-#   2. Model currently loaded -> read its actual ``context_length`` from
-#      ``GET /api/ps`` (see ``_detect_ollama_num_ctx``); hard error.
+#   1. ``$OLLAMA_NUM_CTX`` set -> sent as num_ctx; guard is a hard
+#      pre-flight error. (RAM warning: the KV cache scales with the
+#      window; a huge value can OOM/swap the server.)
+#   2. Model currently loaded -> its actual ``context_length`` from
+#      ``GET /api/ps`` (see ``_detect_ollama_num_ctx``) is sent back as
+#      num_ctx (same value = no model reload); hard pre-flight error.
 #      Covers every round after the first in an iterative review loop.
-#   3. Unknown -> assume the smallest VRAM tier (4096) but only WARN on
-#      a likely overflow, since a bigger machine may have a 32K/256K
-#      window and a hard error would reject a perfectly valid run.
+#   3. Unknown -> ``num_ctx`` is OMITTED from the request so the server
+#      keeps its own VRAM-tier default (sending the 4096 advisory value
+#      would actively SHRINK a 32K/256K window and cause the very
+#      truncation the guard exists to prevent). The pre-flight guard
+#      only WARNs against the smallest-tier estimate, and
+#      ``_ollama_post_verify`` backstops with a hard error after the
+#      call if ``prompt_eval_count`` shows the prompt filled the window.
 #
 # Token estimate is the standard ~4 chars/token.
 DEFAULT_OLLAMA_NUM_CTX = 4096
 OLLAMA_CHARS_PER_TOKEN = 4
 OLLAMA_PS_TIMEOUT = 5.0  # /api/ps probe is local and fast; never let a
                          # hung probe delay the actual review call long.
+# Post-call truncation check: prompt_eval_count at or above this
+# fraction of the effective window means the prompt almost certainly
+# filled (and overflowed) it.
+OLLAMA_POST_VERIFY_MARGIN = 0.98
 
 # Sampling temperature for the model. History of this constant:
 #
@@ -1007,6 +1026,17 @@ def _warn_if_truncated(hit_token_ceiling: bool, max_tokens: int, provider: str) 
         )
 
 
+def _make_client(timeout: httpx.Timeout | float) -> httpx.Client:
+    """Single construction point for HTTP clients.
+
+    Every wire call (all three providers plus the /api/ps probe) builds
+    its client here, so wire tests can monkeypatch one function with an
+    ``httpx.MockTransport``-backed factory and cover the full HTTP
+    surface offline.
+    """
+    return httpx.Client(timeout=timeout)
+
+
 def _usage_int(value: object) -> int | None:
     """Coerce a provider usage field to int; anything else -> None.
 
@@ -1064,7 +1094,7 @@ def call_openrouter(
     }
 
     try:
-        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+        with _make_client(HTTP_TIMEOUT) as client:
             response = client.post(OPENROUTER_URL, headers=headers, json=payload)
     except httpx.RequestError as exc:
         # Network-level failure: DNS, TCP, timeout, connection reset.
@@ -1191,7 +1221,7 @@ def call_gemini(
     url = GEMINI_URL_TEMPLATE.format(model=model)
 
     try:
-        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+        with _make_client(HTTP_TIMEOUT) as client:
             response = client.post(url, headers=headers, json=payload)
     except httpx.RequestError as exc:
         raise TransportError(
@@ -1316,7 +1346,7 @@ def _normalize_ollama_host(host: str) -> str:
     return host.rstrip("/")
 
 
-def _match_loaded_context(ps_data: dict, model: str) -> int | None:
+def _match_loaded_context(ps_data: object, model: str) -> int | None:
     """Extract the loaded ``model``'s ``context_length`` from ``/api/ps`` data.
 
     Pure so it's unit-testable without a server. Ollama normalizes
@@ -1325,6 +1355,11 @@ def _match_loaded_context(ps_data: dict, model: str) -> int | None:
     when the model isn't in the loaded list or the server predates the
     ``context_length`` field.
     """
+    if not isinstance(ps_data, dict):
+        # A top-level list/string/None from a misbehaving proxy would
+        # otherwise AttributeError; the caller's blanket except would
+        # mask it, but don't rely on that.
+        return None
     wanted = {model} if ":" in model else {model, f"{model}:latest"}
     for entry in ps_data.get("models") or []:
         if not isinstance(entry, dict):
@@ -1349,7 +1384,7 @@ def _detect_ollama_num_ctx(host: str, model: str) -> int | None:
     subsequent round gets an exact window instead of an estimate.
     """
     try:
-        with httpx.Client(timeout=OLLAMA_PS_TIMEOUT) as client:
+        with _make_client(OLLAMA_PS_TIMEOUT) as client:
             response = client.get(host.rstrip("/") + "/api/ps")
         if response.status_code != 200:
             return None
@@ -1363,20 +1398,23 @@ def _detect_ollama_num_ctx(host: str, model: str) -> int | None:
 def _ollama_prompt_guard(
     prompt_chars: int, num_ctx: int, *, model: str, enforced: bool = True
 ) -> None:
-    """Guard against Ollama's silent prompt truncation.
+    """Pre-flight guard against Ollama's silent prompt truncation.
 
     Ollama silently truncates prompts that don't fit ``num_ctx`` and
     generates from the fragment that survived -- no error, exit 0, and a
-    plausible-looking review of a fraction of the code. The
-    OpenAI-compatible endpoint offers no per-request ``num_ctx`` control,
-    so this pre-flight check is the defense.
+    plausible-looking review of a fraction of the code. The runner
+    requests the window per call via the native endpoint (see
+    ``DEFAULT_OLLAMA_NUM_CTX`` for the tier policy); this check catches
+    known-too-small windows before tokens are spent, and
+    ``_ollama_post_verify`` backstops after the call.
 
     ``enforced=True`` (window known: $OLLAMA_NUM_CTX set, or read from
-    ``/api/ps``) -> likely overflow raises a typed ``ContextOverflow``.
-    ``enforced=False`` (window unknown; ``num_ctx`` is the smallest
-    stock VRAM tier) -> likely overflow only WARNs, because the actual
-    window on a >=24 GiB machine is 32K/256K and a hard error would
-    reject a valid run. See ``DEFAULT_OLLAMA_NUM_CTX`` for the tiers.
+    ``/api/ps``; that value is what gets sent as num_ctx) -> likely
+    overflow raises a typed ``ContextOverflow``. ``enforced=False``
+    (window unknown; ``num_ctx`` here is only the smallest stock VRAM
+    tier and is NOT sent -- the server keeps its own default) -> likely
+    overflow only WARNs, because the actual window on a >=24 GiB machine
+    is 32K/256K and a hard error would reject a valid run.
     """
     approx_tokens = prompt_chars // OLLAMA_CHARS_PER_TOKEN
     if approx_tokens < num_ctx:
@@ -1388,21 +1426,72 @@ def _ollama_prompt_guard(
             "Ollama silently truncates oversized prompts, which would "
             "produce a review of only a fragment of the code. Either "
             "narrow the scope (--include / --exclude / smaller --base), "
-            "or raise the window: increase the server's context length "
-            "(OLLAMA_CONTEXT_LENGTH=<tokens>, or the Ollama app settings) "
-            "and set $OLLAMA_NUM_CTX to match.",
+            "or raise $OLLAMA_NUM_CTX -- the runner requests the window "
+            "per call, no server restart needed, but the KV cache scales "
+            "with it, so stay within your RAM/VRAM.",
             model=model,
             provider="ollama",
         )
     sys.stderr.write(
         f"WARN: prompt is ~{approx_tokens:,} tokens but the Ollama context "
-        f"window could not be determined (model `{model}` not loaded yet; "
-        "$OLLAMA_NUM_CTX unset). Stock windows are VRAM-dependent "
-        f"(4K/32K/256K); if yours is smaller than the prompt, Ollama will "
-        "silently truncate it and review only a fragment. Set "
-        "$OLLAMA_NUM_CTX to your actual window to make this a hard "
-        "pre-flight check.\n"
+        f"window is unknown (model `{model}` not loaded yet; "
+        "$OLLAMA_NUM_CTX unset), so no num_ctx is requested and the "
+        "server's VRAM-tier default (4K/32K/256K) applies. If the prompt "
+        "exceeds it, Ollama truncates silently -- the runner verifies "
+        "prompt_eval_count after the call and hard-fails if truncation "
+        "is likely. Set $OLLAMA_NUM_CTX to your actual window for a hard "
+        "pre-flight check instead.\n"
     )
+
+
+def _ollama_post_verify(
+    prompt_eval_count: int | None,
+    num_ctx_sent: int | None,
+    *,
+    host: str,
+    model: str,
+) -> None:
+    """Post-call truncation backstop using the native API's usage counts.
+
+    ``prompt_eval_count`` at or above ``OLLAMA_POST_VERIFY_MARGIN`` of
+    the effective window means the prompt filled it -- with our review
+    prompts that means server-side truncation, and the output must be
+    discarded (hard ContextOverflow, never a warn: an exit-0 partial
+    review poisons agent loops). The effective window is the num_ctx we
+    sent; when none was sent (unknown tier), the model is loaded by now,
+    so ``/api/ps`` is re-probed for its actual window. If that still
+    fails, verification is skipped with a WARN rather than guessed.
+
+    Known limitation (do not "fix" by lowering the margin): KV-cache
+    reuse makes ``prompt_eval_count`` an UNDERCOUNT on repeated
+    identical prefixes, so this check can false-negative but not
+    false-positive.
+    """
+    if prompt_eval_count is None:
+        return  # pre-usage-fields Ollama; nothing to verify against
+    window = num_ctx_sent
+    source = "requested"
+    if window is None:
+        window = _detect_ollama_num_ctx(host, model)
+        source = "detected post-call"
+        if window is None:
+            sys.stderr.write(
+                "WARN: could not verify the prompt fit the Ollama context "
+                "window (window unknown even after the call); if findings "
+                "look sparse, set $OLLAMA_NUM_CTX and re-run.\n"
+            )
+            return
+    if prompt_eval_count >= int(window * OLLAMA_POST_VERIFY_MARGIN):
+        raise ContextOverflow(
+            f"prompt_eval_count={prompt_eval_count:,} is at the context "
+            f"window ({window:,} tokens, {source}) -- the prompt was "
+            "almost certainly truncated server-side and the review covers "
+            "only a fragment, so the output was discarded. Narrow the "
+            "scope (--include / --exclude / smaller --base) or raise "
+            "$OLLAMA_NUM_CTX (RAM permitting).",
+            model=model,
+            provider="ollama",
+        )
 
 
 def call_ollama(
@@ -1414,12 +1503,18 @@ def call_ollama(
     temperature: float,
     max_tokens: int,
     timeout: float,
+    num_ctx: int | None = None,
 ) -> CallResult:
-    """POST to a local Ollama server via its OpenAI-compatible chat-completions
-    endpoint and return a ``CallResult``. No API key required (local). Caller
-    builds the prompts (same as ``call_openrouter`` and ``call_gemini``) so
-    the wire path is mode-agnostic. Raises typed ``ReviewError`` subclasses;
+    """POST to a local Ollama server via its NATIVE ``/api/chat`` endpoint
+    and return a ``CallResult``. No API key required (local). Caller builds
+    the prompts (same as ``call_openrouter`` and ``call_gemini``) so the
+    wire path is mode-agnostic. Raises typed ``ReviewError`` subclasses;
     see README "Error model".
+
+    ``num_ctx`` is the context window to request: the env-set or
+    /api/ps-detected value, or ``None`` to omit it so the server keeps
+    its own VRAM-tier default (see ``DEFAULT_OLLAMA_NUM_CTX`` -- never
+    pass the advisory constant here; it would shrink a larger window).
 
     Differences from cloud providers:
 
@@ -1437,18 +1532,27 @@ def call_ollama(
       ConfigError pointing at the right ``ollama pull`` command.
     - **No content filter / safety mode.** Ollama doesn't refuse output
       on safety grounds, so the empty-content classifier checks only
-      length / max-tokens / generic hiccup -- no SafetyRefusal branch.
+      length / generic hiccup -- no SafetyRefusal branch.
+    - **Silent truncation is checked post-call**: the native response's
+      ``prompt_eval_count`` feeds ``_ollama_post_verify``, which raises
+      a hard ContextOverflow when the prompt filled the window.
     """
+    options: dict = {
+        "temperature": temperature,
+        # Native name for the output-token ceiling (max_tokens
+        # elsewhere). Always sent explicitly -- the server default
+        # differs from the cloud providers'.
+        "num_predict": max_tokens,
+    }
+    if num_ctx is not None:
+        options["num_ctx"] = num_ctx
     payload = {
         "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        # Temperature and max_tokens use the same keys as OpenRouter
-        # (Ollama's OpenAI-compat endpoint mirrors that shape).
-        "temperature": temperature,
-        "max_tokens": max_tokens,
+        "options": options,
         # Force non-streaming so we get the whole response in one JSON
         # blob -- simpler to parse and matches how we handle the cloud
         # providers.
@@ -1473,7 +1577,7 @@ def call_ollama(
     timeout_config = httpx.Timeout(timeout, connect=10.0)
 
     try:
-        with httpx.Client(timeout=timeout_config) as client:
+        with _make_client(timeout_config) as client:
             response = client.post(url, headers=headers, json=payload)
     except httpx.ConnectError as exc:
         # Server unreachable. Most likely Ollama isn't running, or
@@ -1501,10 +1605,14 @@ def call_ollama(
         ) from exc
 
     # 404 from Ollama means the model isn't pulled. The response body
-    # typically includes the model name and a "try pulling first"
-    # message. Surface as a ConfigError with the exact pull command so
-    # the user can fix it in one step.
-    if response.status_code == 404:
+    # is JSON like {"error": "model 'x' not found, try pulling it
+    # first"} -- the "try pulling" substring doubles as a fallback in
+    # case a future Ollama version moves the status code. Surface as a
+    # ConfigError with the exact pull command so the user can fix it in
+    # one step.
+    if response.status_code == 404 or (
+        response.status_code >= 400 and "try pulling" in response.text.lower()
+    ):
         raise ConfigError(
             f"Model `{model}` not available on Ollama server at {host}. "
             f"Run `ollama pull {model}` (or `wsl -d Ubuntu -- ollama pull "
@@ -1533,44 +1641,42 @@ def call_ollama(
             provider="ollama",
         ) from exc
 
-    choices = data.get("choices") or []
-    if not choices:
-        raise ProviderHiccup(
-            "Ollama response had no choices",
-            detail=str(data)[:1000],
-            model=model,
-            provider="ollama",
-        )
-    choice = choices[0]
-    finish_reason = (choice.get("finish_reason") or "").lower()
-    message = choice.get("message") or {}
-    content = message.get("content")
-    usage = data.get("usage") or {}
+    # Native /api/chat shape: top-level message/done_reason plus
+    # prompt_eval_count / eval_count usage fields.
+    message = data.get("message") or {}
+    content = message.get("content") if isinstance(message, dict) else None
+    done_reason = (data.get("done_reason") or "").lower()
+    prompt_eval = _usage_int(data.get("prompt_eval_count"))
+    eval_count = _usage_int(data.get("eval_count"))
+
+    # Truncation backstop runs even when content came back: a review of
+    # a silently truncated prompt is worse than no review.
+    _ollama_post_verify(prompt_eval, num_ctx, host=host, model=model)
 
     if content:
-        truncated = finish_reason in {"length", "max_tokens"}
+        truncated = done_reason == "length"
         _warn_if_truncated(truncated, max_tokens, "ollama")
         return CallResult(
             content,
-            prompt_tokens=_usage_int(usage.get("prompt_tokens")),
-            completion_tokens=_usage_int(usage.get("completion_tokens")),
+            prompt_tokens=prompt_eval,
+            completion_tokens=eval_count,
             truncated=truncated,
         )
 
-    # Null / empty content. Ollama doesn't have content-filter / safety
+    # Empty content. Ollama doesn't have content-filter / safety
     # refusals, so the only diagnosable empty-content cause is hitting
-    # the max-token ceiling. Anything else falls through to a generic
+    # the output-token ceiling. Anything else falls through to a generic
     # ProviderHiccup which the caller can retry once.
-    if finish_reason in {"length", "max_tokens"}:
+    if done_reason == "length":
         raise ContextOverflow(
-            f"Hit max_tokens ({max_tokens}) before producing content "
-            f"(finish_reason={finish_reason!r})",
+            f"Hit num_predict ({max_tokens}) before producing content "
+            f"(done_reason={done_reason!r})",
             detail=str(data)[:1000],
             model=model,
             provider="ollama",
         )
     raise ProviderHiccup(
-        f"Ollama returned empty content with finish_reason={finish_reason!r}",
+        f"Ollama returned empty content with done_reason={done_reason!r}",
         detail=str(data)[:1000],
         model=model,
         provider="ollama",
@@ -3046,7 +3152,8 @@ def _execute_call(
     )
     # Pre-flight context-window guard: refuse (typed CONTEXT_OVERFLOW)
     # rather than let Ollama silently truncate the prompt and review a
-    # fragment; warn-only when the window couldn't be determined. Cloud
+    # fragment; warn-only when the window couldn't be determined (the
+    # post-call prompt_eval_count check backstops that case). Cloud
     # providers don't need this -- they 4xx on oversized prompts instead
     # of truncating.
     _ollama_prompt_guard(
@@ -3055,6 +3162,10 @@ def _execute_call(
         model=model,
         enforced=enforced,
     )
+    # Request the window only when it's authoritative (env or detected).
+    # When unknown, omit num_ctx entirely: sending the advisory 4096
+    # would actively shrink a VRAM-tier 32K/256K window.
+    num_ctx_to_send = num_ctx if enforced else None
     return _call_with_retries(
         lambda: call_ollama(
             system_prompt=system_prompt,
@@ -3064,6 +3175,7 @@ def _execute_call(
             temperature=settings.temperature,
             max_tokens=settings.max_tokens,
             timeout=settings.ollama_timeout,
+            num_ctx=num_ctx_to_send,
         ),
         label="ollama",
         retries=settings.retries,
@@ -3194,7 +3306,7 @@ def main() -> None:
             "OpenRouter's chat-completions endpoint and needs "
             "``OPENROUTER_API_KEY``. ``gemini`` calls Google AI Studio's "
             "generateContent endpoint directly and needs ``GEMINI_API_KEY``. "
-            "``ollama`` posts to a local Ollama server's OpenAI-compatible "
+            "``ollama`` posts to a local Ollama server's native chat "
             "endpoint (no API key; configure with ``--ollama-host`` / "
             "$OLLAMA_HOST / $OLLAMA_MODEL / $OLLAMA_TIMEOUT / "
             "$OLLAMA_NUM_CTX). Override with $CODE_REVIEW_PROVIDER."

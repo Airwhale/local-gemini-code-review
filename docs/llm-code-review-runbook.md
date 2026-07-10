@@ -27,7 +27,7 @@ Optional environment variables:
 - `OPENROUTER_MODEL` / `GEMINI_MODEL` / `OLLAMA_MODEL` — override the per-provider default model
 - `OLLAMA_HOST` — Ollama server URL (default `http://localhost:11434`). Override for non-default ports, remote Ollama, or WSL distros without localhost mirroring.
 - `OLLAMA_TIMEOUT` — HTTP timeout for Ollama calls in seconds (default `1800`, i.e. 30 minutes — accommodates CPU cold-starts and thorough reviews).
-- `OLLAMA_NUM_CTX` — the context window (tokens) the Ollama server loads models with. Usually unset: the runner reads the real window from a loaded model via `/api/ps` and hard-enforces it (`CONTEXT_OVERFLOW`, exit 12, because Ollama silently truncates oversized prompts instead of erroring). When the window can't be determined it assumes the smallest stock VRAM tier (4096) and only warns. Set explicitly to override detection and make the guard hard even before the model is first loaded.
+- `OLLAMA_NUM_CTX` — the context window (tokens) the runner REQUESTS per call via the native endpoint's `options.num_ctx`. Usually unset: the runner reads a loaded model's real window via `/api/ps`, requests that, and hard-enforces it pre-flight (`CONTEXT_OVERFLOW`, exit 12, because Ollama silently truncates oversized prompts instead of erroring). When the window is unknown, `num_ctx` is omitted (the server keeps its VRAM-tier default), the guard warns, and `prompt_eval_count` is verified after the call as a hard backstop. Set explicitly to pin the window everywhere — requested per call, no server restart, RAM permitting.
 
 ---
 
@@ -232,7 +232,7 @@ The runner exits with **typed exit codes** so an LLM caller can react differentl
 | 2 | CONFIG | fix env / CLI flag; don't retry |
 | 10 | SAFETY_REFUSAL | retry with `--model claude` |
 | 11 | RATE_LIMIT | wait 60s; switch provider if persistent |
-| 12 | CONTEXT_OVERFLOW | narrow scope; don't retry as-is (if max_tokens was hit before any content: raise `--max-tokens`; if the Ollama guard fired: raise `OLLAMA_CONTEXT_LENGTH` + `$OLLAMA_NUM_CTX`) |
+| 12 | CONTEXT_OVERFLOW | narrow scope; don't retry as-is (if max_tokens was hit before any content: raise `--max-tokens`; if the Ollama guard/post-verify fired: raise `$OLLAMA_NUM_CTX` — requested per call, RAM permitting) |
 | 13 | PROVIDER_HICCUP | retry; runner already auto-retried once |
 | 14 | TRANSPORT | exponential backoff; escalate after 3 |
 | 1 | UNKNOWN | read stderr; escalate |
@@ -278,7 +278,7 @@ See the README's "Safety context" section for the default phrasing.
 
 9. **Truncated-but-nonempty output warns on stderr.** If the model hits the `max_tokens` ceiling but still returned content, the runner prints the partial review (exit 0) plus a `WARN: ... truncated at max_tokens` line on stderr. If you're parsing findings programmatically, check stderr for that warning before treating the list as complete.
 
-10. **Ollama silently truncates oversized prompts — the runner guards against it.** Ollama generates from whatever fragment of the prompt fits `num_ctx` instead of erroring, which would yield a plausible-looking review of a fraction of the diff. The runner estimates prompt tokens pre-flight and compares against the window, resolved as: `$OLLAMA_NUM_CTX` if set (hard exit 12 on overflow) → the loaded model's actual window from `/api/ps` (hard exit 12; covers every round after the first in an iterative loop) → assume the smallest stock VRAM tier, 4096, and **warn only** (stock windows are VRAM-dependent: 4K/32K/256K, so a hard error could reject a valid run on a bigger machine). If you see the WARN, set `$OLLAMA_NUM_CTX` to your actual window; to enlarge the window itself, `OLLAMA_CONTEXT_LENGTH=32768 ollama serve` (or the app settings slider).
+10. **Ollama silently truncates oversized prompts — the runner guards against it twice.** Ollama generates from whatever fragment of the prompt fits `num_ctx` instead of erroring, which would yield a plausible-looking review of a fraction of the diff. The runner resolves the window per call and *requests* it via the native endpoint's `options.num_ctx`: `$OLLAMA_NUM_CTX` if set (hard pre-flight exit 12 on likely overflow) → the loaded model's actual window from `/api/ps`, requested back unchanged (hard pre-flight exit 12; covers every round after the first in an iterative loop) → window unknown: `num_ctx` omitted so the server keeps its VRAM-tier default (4K/32K/256K), the guard **warns only**, and after the call the runner checks `prompt_eval_count` against the (now-detectable) window — if the prompt filled it, the output is **discarded with a hard exit 12** rather than returned as a bogus review. Note the post-check can false-negative (KV-cache reuse undercounts `prompt_eval_count` on repeated prefixes) but not false-positive. If you see the WARN or exit 12, set `$OLLAMA_NUM_CTX` to your actual window (requested per call — no server restart, RAM permitting).
 
 11. **Ollama review depth is lower than cloud.** Local models, especially on CPU, tend to under-report findings versus a cloud reviewer on the same diff. This is the inverse of the cloud-hallucinates problem documented under "Local vs cloud." A clean "no issues" from Ollama is **not** equivalent in confidence to a clean review from `claude` or `pro` — treat it as a sanity check, not a final verdict, when stakes are high.
 
