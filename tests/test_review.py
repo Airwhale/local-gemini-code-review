@@ -406,6 +406,19 @@ class TestParseRetryAfter:
     def test_garbage_returns_none(self):
         assert _parse_retry_after("soon-ish") is None
 
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "Wed, 32 Dec 999999999999999999 07:28:00 GMT",  # OverflowError-shaped
+            "Wed,",  # truncated structure
+            ", , , ,",
+        ],
+    )
+    def test_pathological_dates_return_none_not_raise(self, value: str):
+        # codex finding: the email parser raises more than ValueError on
+        # pathological inputs; any escape would turn a 429 into UNKNOWN.
+        assert _parse_retry_after(value) is None
+
     def test_classify_sets_seconds_for_digits(self):
         err = _classify_http_error(
             429, "slow down", model="m", provider="p", retry_after="30"

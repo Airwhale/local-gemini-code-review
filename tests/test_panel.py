@@ -70,6 +70,19 @@ class TestPanelFindingsMatch:
             _finding("t"), _finding("t2", file="b.py")
         )
 
+    def test_line_less_finding_never_reaches_location_tier(self):
+        # codex finding: a line-less finding used to match ANY same-file
+        # finding via the location tier, manufacturing consensus.
+        vague = _finding("something feels off in this file", line=None)
+        specific = _finding("off-by-one in pagination", line=500)
+        assert not panel_findings_match(vague, specific)
+
+    def test_line_less_identical_title_still_matches_via_fingerprint(self):
+        # The strong tier (exact fingerprint) still handles None lines.
+        assert panel_findings_match(
+            _finding("same issue", line=None), _finding("same issue", line=500)
+        )
+
 
 class TestMergePanelFindings:
     def test_consensus_cluster(self):
@@ -266,3 +279,11 @@ class TestPanelSettings:
     def test_models_exclusive_with_baseline(self):
         with pytest.raises(ConfigError):
             _resolve_settings(_args(models="pro,claude", baseline="r.json"))
+
+    def test_bogus_env_provider_rejected(self):
+        # codex finding: argparse choices don't validate env-sourced
+        # defaults; CODE_REVIEW_PROVIDER=bogus used to fall into the
+        # ollama else-branch and "work".
+        with pytest.raises(ConfigError) as exc_info:
+            _resolve_settings(_args(provider="bogus"))
+        assert "CODE_REVIEW_PROVIDER" in str(exc_info.value)

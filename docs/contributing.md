@@ -1,5 +1,11 @@
 # How to Contribute
 
+> **Fork note:** this repository is a fork of
+> [gemini-cli-extensions/code-review](https://github.com/gemini-cli-extensions/code-review)
+> maintained by @Airwhale. The Google CLA process below applies to the
+> UPSTREAM project only — contributions to this fork just need a PR
+> against `main` here. The upstream text is kept intact for reference.
+
 We would love to accept your patches and contributions to this project.
 
 ## Before you begin

@@ -270,6 +270,23 @@ uv run review.py --base main --format json --baseline round1.json --output round
 
 Matching is a two-pass heuristic: exact fingerprint (file + severity + normalized title, lines within ±10) first, then same-file location (±10 lines) for the rest — necessary because models reword titles and even re-rate severities between otherwise identical runs. Two *different* findings within 10 lines of each other can cross-match; treat `persisting`/`resolved` as strong hints, not proofs.
 
+### Big inputs: `--full-files` and `--chunk`
+
+**`--full-files`** (diff modes only): the model normally sees only the diff's ±5-line hunk windows — it cannot judge a change against code 40 lines away. This flag additionally sends the **full current content of every changed file** as a fenced `<REFERENCE_FILES>` block (line-numbered, size-capped and noise-filtered like `--codebase`), while the review target stays the diff and comments must still anchor to `+`/`-` lines. Budgeted against the same 700K-char cap; with `--pr`, content comes from your *local* working tree (a WARN reminds you it matches the PR only if that branch is checked out).
+
+**`--chunk`** (opt-in): when the payload exceeds the budget — the 700K-char cap for cloud providers, or the Ollama context window — the runner splits it **at file boundaries** (whole per-file diffs, or whole files in codebase mode, packed in order) into sequential chunk reviews instead of erroring:
+
+```bash
+uv run review.py --codebase --chunk --provider ollama   # audit a repo through a small local window
+```
+
+- Markdown output streams per chunk under `# Review chunk i/n` banners; JSON produces one envelope with `chunks`, per-finding `chunk` indexes, and a `per_chunk[]` array.
+- **Fail-fast contract**: chunks are disjoint content, so a failed chunk means unreviewed files — the first typed error aborts the run with that error's exit code. **Exit 0 iff every chunk succeeded.**
+- Ollama chunk budgets use the *enforced* window (env-set or detected) at 85% fill — the 4-chars/token estimate runs denser on real tokenizers, and chunks sized to 100% of the window get truncated and discarded by the post-call verify (observed live). When the window is unknown, sizing assumes the smallest stock tier with a WARN: safety over efficiency.
+- A single file bigger than the budget is a typed `CONTEXT_OVERFLOW` naming the file — chunking at file granularity cannot help there.
+- **Tradeoff (why it's opt-in)**: the model cannot see importer/importee relationships across chunk boundaries, and cross-file findings are where real bugs often live. Prefer a bigger window or narrower scope when you can.
+- Not combinable with `--models`, `--full-files`, or `--baseline` (typed `CONFIG` errors explain the workarounds).
+
 ### Multi-model panels (`--models`)
 
 ```bash
@@ -419,6 +436,7 @@ Non-error stderr lines use a fixed prefix vocabulary — **no informational line
 | `[ollama] …` | Ollama context-window detection notice (`/api/ps`) |
 | `[baseline] …` | Round-over-round finding counts when `--baseline` is given |
 | `[panel …] …` | Per-model progress in `--models` panels; `WARN: [panel] <model> failed: …` for per-model failures |
+| `[chunk …] …` | Per-chunk progress in `--chunk` runs; `WARN: [chunk] …` when a chunk fails (run aborts) |
 | `skip …` | A file was dropped from the codebase bundle (size cap) |
 
 ### Auto-retry behavior
@@ -435,7 +453,6 @@ Never retried, regardless of `--retries`:
 - `SAFETY_REFUSAL` — a second call with the same model + prompt almost always reproduces the refusal; better to switch model than burn tokens
 - `CONTEXT_OVERFLOW` — the scope is wrong, not the call
 - `CONFIG` — fix the configuration first
-- `CONFIG` — fix the config
 
 ### Decision tree for LLM callers
 
