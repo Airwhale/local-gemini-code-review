@@ -5,6 +5,7 @@ resolution rules."""
 from __future__ import annotations
 
 import argparse
+from typing import Any
 
 import pytest
 
@@ -35,15 +36,22 @@ def _finding(
     severity: str = "HIGH",
 ) -> Finding:
     return Finding(
-        file=file, line=line, severity=severity,
-        title=title, body=f"body of {title}", suggestion=None,
+        file=file,
+        line=line,
+        severity=severity,
+        title=title,
+        body=f"body of {title}",
+        suggestion=None,
     )
 
 
-def _parsed(findings: list[Finding], summary: str = "s") -> ParsedReview:
+def _parsed(findings: list[Finding], summary: str | None = "s") -> ParsedReview:
     return ParsedReview(
-        summary=summary, findings=findings, clean=not findings,
-        parse_ok=True, problems=[],
+        summary=summary,
+        findings=findings,
+        clean=not findings,
+        parse_ok=True,
+        problems=[],
     )
 
 
@@ -66,9 +74,7 @@ class TestPanelFindingsMatch:
         )
 
     def test_different_file_no_match(self):
-        assert not panel_findings_match(
-            _finding("t"), _finding("t2", file="b.py")
-        )
+        assert not panel_findings_match(_finding("t"), _finding("t2", file="b.py"))
 
     def test_line_less_finding_never_reaches_location_tier(self):
         # codex finding: a line-less finding used to match ANY same-file
@@ -86,39 +92,60 @@ class TestPanelFindingsMatch:
 
 class TestMergePanelFindings:
     def test_consensus_cluster(self):
-        merged = merge_panel_findings({
-            "model-a": _parsed([_finding("issue x")]),
-            "model-b": _parsed([_finding("issue x reworded", line=14)]),
-        })
+        merged = merge_panel_findings(
+            {
+                "model-a": _parsed([_finding("issue x")]),
+                "model-b": _parsed([_finding("issue x reworded", line=14)]),
+            }
+        )
         assert len(merged) == 1
         assert merged[0].found_by == ["model-a", "model-b"]
         # Representative comes from the first model in CLI order.
         assert merged[0].finding.title == "issue x"
 
     def test_disjoint_findings_stay_separate(self):
-        merged = merge_panel_findings({
-            "model-a": _parsed([_finding("issue x")]),
-            "model-b": _parsed([_finding("issue y", file="b.py")]),
-        })
+        merged = merge_panel_findings(
+            {
+                "model-a": _parsed([_finding("issue x")]),
+                "model-b": _parsed([_finding("issue y", file="b.py")]),
+            }
+        )
         assert len(merged) == 2
 
     def test_same_model_cannot_vouch_twice(self):
         # Two similar findings from ONE model must not merge into a
         # fake-consensus cluster.
-        merged = merge_panel_findings({
-            "model-a": _parsed([_finding("issue x"), _finding("issue x again", line=12)]),
-        })
+        merged = merge_panel_findings(
+            {
+                "model-a": _parsed(
+                    [_finding("issue x"), _finding("issue x again", line=12)]
+                ),
+            }
+        )
         assert all(c.found_by == ["model-a"] for c in merged)
         assert len(merged) == 2
 
     def test_ordering_consensus_then_severity(self):
-        merged = merge_panel_findings({
-            "a": _parsed([
-                _finding("lonely critical", file="z.py", severity="CRITICAL"),
-                _finding("shared medium", file="m.py", severity="MEDIUM"),
-            ]),
-            "b": _parsed([_finding("shared medium reworded", file="m.py", line=12, severity="MEDIUM")]),
-        })
+        merged = merge_panel_findings(
+            {
+                "a": _parsed(
+                    [
+                        _finding("lonely critical", file="z.py", severity="CRITICAL"),
+                        _finding("shared medium", file="m.py", severity="MEDIUM"),
+                    ]
+                ),
+                "b": _parsed(
+                    [
+                        _finding(
+                            "shared medium reworded",
+                            file="m.py",
+                            line=12,
+                            severity="MEDIUM",
+                        )
+                    ]
+                ),
+            }
+        )
         # Consensus (2 models) outranks severity (CRITICAL, 1 model).
         assert merged[0].found_by == ["a", "b"]
         assert merged[1].finding.severity == "CRITICAL"
@@ -214,7 +241,11 @@ class TestPanelRendering:
 
     def test_parse_failure_embeds_raw_in_per_model(self):
         bad = ParsedReview(
-            summary=None, findings=[], clean=False, parse_ok=False, problems=["x"],
+            summary=None,
+            findings=[],
+            clean=False,
+            parse_ok=False,
+            problems=["x"],
         )
         envelope = build_panel_envelope(
             mode="diff",
@@ -232,13 +263,28 @@ class TestPanelRendering:
 
 
 def _args(**overrides) -> argparse.Namespace:
-    base = dict(
-        base=None, pr=None, staged=False, codebase=False,
-        include=[], exclude=[],
-        provider="openrouter", model=None, models=None,
-        ollama_host=None, temperature=None, max_tokens=None,
-        retries=None, min_severity="LOW", context=None, no_context=False,
-        output=None, format=None, baseline=None, dry_run=False,
+    base: dict[str, Any] = dict(
+        base=None,
+        pr=None,
+        staged=False,
+        codebase=False,
+        include=[],
+        exclude=[],
+        provider="openrouter",
+        model=None,
+        models=None,
+        ollama_host=None,
+        temperature=None,
+        max_tokens=None,
+        retries=None,
+        min_severity="LOW",
+        context=None,
+        no_context=False,
+        output=None,
+        format=None,
+        baseline=None,
+        dry_run=False,
+        chunk=False,
     )
     base.update(overrides)
     return argparse.Namespace(**base)

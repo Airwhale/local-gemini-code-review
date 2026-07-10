@@ -6,6 +6,19 @@ on:
   pull_request:
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Ruff lint
+        run: uv run --group dev ruff check code_review tests evals review.py
+      - name: Ruff format check
+        run: uv run --group dev ruff format --check code_review tests evals review.py
+      - name: Mypy
+        run: uv run --group dev mypy
+
   test:
     strategy:
       matrix:

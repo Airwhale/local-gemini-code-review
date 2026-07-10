@@ -1,0 +1,10 @@
+# Planted bug: the bare except Exception: pass silently drops failed
+# updates -- data loss with no log line, no retry, no error surfaced.
+
+[[bug]]
+file = "sync.py"
+line_range = [7, 15]
+keywords = [
+    "swallow", "silently", "pass", "bare except", "broad except",
+    "ignored", "suppress", "log", "data loss", "dropped", "no indication",
+]

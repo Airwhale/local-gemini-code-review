@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -59,9 +60,7 @@ def _ns(provider: str, model: str | None = None) -> argparse.Namespace:
 
 class TestClassifyHttpError:
     def _classify(self, status: int, body: str, **kwargs) -> ReviewError:
-        return _classify_http_error(
-            status, body, model="m", provider="p", **kwargs
-        )
+        return _classify_http_error(status, body, model="m", provider="p", **kwargs)
 
     def test_429_is_rate_limit(self):
         assert isinstance(self._classify(429, "slow down"), RateLimit)
@@ -98,8 +97,38 @@ class TestClassifyHttpError:
         err = self._classify(400, f"error: input {phrase} for this model")
         assert isinstance(err, ContextOverflow)
 
-    def test_unrecognized_4xx_falls_through_to_generic(self):
+    def test_401_is_config_error(self):
         err = self._classify(401, "invalid api key")
+        assert isinstance(err, ConfigError)
+
+    def test_401_names_the_key_env_var(self):
+        err = _classify_http_error(
+            401, "User not found.", model="m", provider="openrouter"
+        )
+        assert isinstance(err, ConfigError)
+        assert "OPENROUTER_API_KEY" in str(err)
+
+    def test_403_is_config_error(self):
+        err = _classify_http_error(
+            403, "PERMISSION_DENIED", model="m", provider="gemini"
+        )
+        assert isinstance(err, ConfigError)
+        assert "GEMINI_API_KEY" in str(err)
+
+    def test_403_moderation_flag_is_safety_refusal(self):
+        # OpenRouter returns 403 when its moderation layer flags the
+        # input -- a content decision, not a credentials problem.
+        err = self._classify(403, "Your input was flagged by the moderation system")
+        assert isinstance(err, SafetyRefusal)
+
+    def test_401_with_overflow_phrase_stays_config(self):
+        # An auth-rejection body mentioning "token limit" (quota pages
+        # do) must not be misclassified as CONTEXT_OVERFLOW.
+        err = self._classify(401, "invalid key: token limit plan required")
+        assert isinstance(err, ConfigError)
+
+    def test_unrecognized_4xx_falls_through_to_generic(self):
+        err = self._classify(418, "short and stout")
         assert type(err) is ReviewError
         assert err.exit_code == 1
 
@@ -111,10 +140,15 @@ class TestClassifyHttpError:
 
 class TestResolveModel:
     def test_explicit_slug_passes_through(self):
-        assert _resolve_model(_ns("openrouter", "vendor/some-model")) == "vendor/some-model"
+        assert (
+            _resolve_model(_ns("openrouter", "vendor/some-model"))
+            == "vendor/some-model"
+        )
 
     def test_openrouter_alias_resolves(self):
-        assert _resolve_model(_ns("openrouter", "claude")) == "anthropic/claude-sonnet-4.5"
+        assert (
+            _resolve_model(_ns("openrouter", "claude")) == "anthropic/claude-sonnet-4.5"
+        )
 
     def test_ollama_alias_resolves(self):
         assert _resolve_model(_ns("ollama", "local")) == "qwen3-coder:30b"
@@ -152,13 +186,21 @@ class TestNormalizeOllamaHost:
         assert _normalize_ollama_host("0.0.0.0:11434") == "http://0.0.0.0:11434"
 
     def test_full_url_unchanged(self):
-        assert _normalize_ollama_host("http://localhost:11434") == "http://localhost:11434"
+        assert (
+            _normalize_ollama_host("http://localhost:11434") == "http://localhost:11434"
+        )
 
     def test_https_preserved(self):
-        assert _normalize_ollama_host("https://ollama.example.com") == "https://ollama.example.com"
+        assert (
+            _normalize_ollama_host("https://ollama.example.com")
+            == "https://ollama.example.com"
+        )
 
     def test_trailing_slash_stripped(self):
-        assert _normalize_ollama_host("http://localhost:11434/") == "http://localhost:11434"
+        assert (
+            _normalize_ollama_host("http://localhost:11434/")
+            == "http://localhost:11434"
+        )
 
     def test_whitespace_stripped(self):
         assert _normalize_ollama_host(" localhost:11434 ") == "http://localhost:11434"
@@ -215,9 +257,7 @@ class TestOllamaPromptGuard:
         assert "OLLAMA_NUM_CTX" in err
         assert "model `m`" in err
 
-    def test_unenforced_small_prompt_stays_silent(
-        self, capsys: pytest.CaptureFixture
-    ):
+    def test_unenforced_small_prompt_stays_silent(self, capsys: pytest.CaptureFixture):
         _ollama_prompt_guard(1000, 4096, model="m", enforced=False)
         assert capsys.readouterr().err == ""
 
@@ -225,8 +265,16 @@ class TestOllamaPromptGuard:
 class TestMatchLoadedContext:
     PS_DATA = {
         "models": [
-            {"name": "qwen3-coder:30b", "model": "qwen3-coder:30b", "context_length": 32768},
-            {"name": "qwen3-coder-next:latest", "model": "qwen3-coder-next:latest", "context_length": 262144},
+            {
+                "name": "qwen3-coder:30b",
+                "model": "qwen3-coder:30b",
+                "context_length": 32768,
+            },
+            {
+                "name": "qwen3-coder-next:latest",
+                "model": "qwen3-coder-next:latest",
+                "context_length": 262144,
+            },
         ]
     }
 
@@ -248,6 +296,12 @@ class TestMatchLoadedContext:
     def test_empty_or_malformed_data_returns_none(self):
         assert review._match_loaded_context({}, "m") is None
         assert review._match_loaded_context({"models": ["junk"]}, "m") is None
+
+    def test_non_list_models_returns_none(self):
+        # A non-list `models` value would TypeError on iteration; the
+        # probe must degrade to "unknown window", never raise.
+        assert review._match_loaded_context({"models": 5}, "m") is None
+        assert review._match_loaded_context({"models": True}, "m") is None
 
     @pytest.mark.parametrize("data", [None, [], "nope", 42])
     def test_top_level_non_dict_returns_none(self, data: object):
@@ -274,18 +328,14 @@ class TestOllamaPostVerify:
     def test_unknown_window_reprobes(self, monkeypatch: pytest.MonkeyPatch):
         # Window wasn't sent (tier 3); the model is loaded post-call, so
         # /api/ps supplies the real window for verification.
-        monkeypatch.setattr(
-            review, "_detect_ollama_num_ctx", lambda host, model: 4096
-        )
+        monkeypatch.setattr(review, "_detect_ollama_num_ctx", lambda host, model: 4096)
         with pytest.raises(ContextOverflow):
             review._ollama_post_verify(4090, None, host=self.HOST, model="m")
 
     def test_unknown_window_reprobe_fails_warns_and_skips(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
     ):
-        monkeypatch.setattr(
-            review, "_detect_ollama_num_ctx", lambda host, model: None
-        )
+        monkeypatch.setattr(review, "_detect_ollama_num_ctx", lambda host, model: None)
         review._ollama_post_verify(50_000, None, host=self.HOST, model="m")
         err = capsys.readouterr().err
         assert err.startswith("WARN:")
@@ -316,7 +366,9 @@ class TestGlobMatch:
 
     def test_lock_files_excluded(self):
         assert _glob_match(Path("uv.lock"), BUILTIN_CODEBASE_EXCLUDES)
-        assert _glob_match(Path("frontend/package-lock.json"), BUILTIN_CODEBASE_EXCLUDES)
+        assert _glob_match(
+            Path("frontend/package-lock.json"), BUILTIN_CODEBASE_EXCLUDES
+        )
 
     def test_source_files_not_excluded(self):
         assert not _glob_match(Path("src/main.py"), BUILTIN_CODEBASE_EXCLUDES)
@@ -350,7 +402,13 @@ class TestNumberLines:
 class TestFormatSize:
     @pytest.mark.parametrize(
         ("n", "expected"),
-        [(0, "0 B"), (999, "999 B"), (1000, "1 KB"), (100_000, "100 KB"), (1_500_000, "1.5 MB")],
+        [
+            (0, "0 B"),
+            (999, "999 B"),
+            (1000, "1 KB"),
+            (100_000, "100 KB"),
+            (1_500_000, "1.5 MB"),
+        ],
     )
     def test_units(self, n: int, expected: str):
         assert _format_size(n) == expected
@@ -488,7 +546,9 @@ class TestCallWithRetries:
         assert sleeps == []
 
     def test_extra_retries_backoff_sequence(self, sleeps: list[float]):
-        call = _FlakyCall([TransportError("a"), TransportError("b"), TransportError("c")])
+        call = _FlakyCall(
+            [TransportError("a"), TransportError("b"), TransportError("c")]
+        )
         assert _call_with_retries(call, label="t", retries=2) == "ok"
         assert call.calls == 4
         assert sleeps == [2.0, 4.0, 8.0]
@@ -578,9 +638,7 @@ class TestFormatUsageLine:
         assert _format_usage_line(CallResult("x"), "p", "m") is None
 
     def test_partial_usage_skips_total(self):
-        line = _format_usage_line(
-            CallResult("x", prompt_tokens=100), "p", "m"
-        )
+        line = _format_usage_line(CallResult("x", prompt_tokens=100), "p", "m")
         assert line is not None
         assert "completion=?" in line
         assert "total" not in line
@@ -614,7 +672,7 @@ class TestWriteOutputFile:
 
 
 def _settings(**overrides) -> Settings:
-    base = dict(
+    base: dict[str, Any] = dict(
         provider="openrouter",
         model="google/gemini-2.5-pro",
         temperature=0.3,
@@ -660,7 +718,8 @@ class TestDryRunReport:
     def test_ollama_window_line(self):
         request = ReviewRequest("S", "U", "diff", 1)
         report = _dry_run_report(
-            _settings(provider="ollama"), request,
+            _settings(provider="ollama"),
+            request,
             ollama_window="4,096 tokens (advisory-default)",
         )
         assert "ollama_window:     4,096 tokens (advisory-default)" in report

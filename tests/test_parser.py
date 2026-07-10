@@ -12,6 +12,7 @@ parser whose whole job is tolerating real-model drift.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -19,8 +20,11 @@ from code_review.cli import (
     CallResult,
     ConfigError,
     Finding,
+    ParsedReview,
     build_json_envelope,
     diff_against_baseline,
+    enforce_min_severity,
+    filter_baseline_findings,
     finding_fingerprint,
     findings_match,
     load_baseline,
@@ -205,15 +209,7 @@ class TestFences:
         assert finding.suggestion == "x = 2"
 
     def test_trailing_diff_fence_without_leadin_is_suggestion(self):
-        text = (
-            "## File: a.py\n"
-            "### L5: [HIGH] T.\n"
-            "Body.\n"
-            "```diff\n"
-            "-old\n"
-            "+new\n"
-            "```\n"
-        )
+        text = "## File: a.py\n### L5: [HIGH] T.\nBody.\n```diff\n-old\n+new\n```\n"
         finding = parse_review_markdown(text).findings[0]
         assert finding.suggestion == "-old\n+new"
 
@@ -295,9 +291,13 @@ class TestDogfoodFixtures:
 
 class TestFingerprints:
     def _finding(self, **overrides) -> Finding:
-        base = dict(
-            file="a.py", line=42, severity="HIGH",
-            title="Retry loop never sleeps.", body="", suggestion=None,
+        base: dict[str, Any] = dict(
+            file="a.py",
+            line=42,
+            severity="HIGH",
+            title="Retry loop never sleeps.",
+            body="",
+            suggestion=None,
         )
         base.update(overrides)
         return Finding(**base)
@@ -324,6 +324,96 @@ class TestFingerprints:
         )
 
 
+class TestSummaryOnlyOutput:
+    def test_summary_only_is_parse_failure(self):
+        # The template mandates findings or the literal clean phrase; a
+        # bare summary means the model drifted (bullets, truncation).
+        # parse_ok=True here would let --baseline resolve everything and
+        # agents treat the run as clean.
+        text = (
+            "# Change summary: Adds a retry policy.\n\n"
+            "Some prose about the change, but no finding headings and no "
+            "clean marker.\n"
+        )
+        parsed = parse_review_markdown(text)
+        assert parsed.findings == []
+        assert parsed.clean is False
+        assert parsed.parse_ok is False
+        assert any("no finding headings" in p for p in parsed.problems)
+
+
+class TestMinSeverityEnforcement:
+    """The <SEVERITY_FILTER> prompt block is a request; JSON envelopes
+    and panel reports enforce the floor post-parse via these helpers."""
+
+    def _finding(self, severity: str) -> Finding:
+        return Finding(
+            file="a.py",
+            line=10,
+            severity=severity,
+            title=f"{severity} finding",
+            body="",
+            suggestion=None,
+        )
+
+    def _parsed(self, severities: list[str]) -> ParsedReview:
+        return ParsedReview(
+            summary="s",
+            findings=[self._finding(s) for s in severities],
+            clean=False,
+            parse_ok=True,
+            problems=[],
+        )
+
+    def test_drops_below_floor(self):
+        parsed = self._parsed(["LOW", "MEDIUM", "HIGH", "CRITICAL"])
+        filtered = enforce_min_severity(parsed, "HIGH")
+        assert [f.severity for f in filtered.findings] == ["HIGH", "CRITICAL"]
+
+    def test_unknown_severity_always_kept(self):
+        # Hiding a finding the parser couldn't rate would be worse than
+        # showing it.
+        parsed = self._parsed(["LOW", "UNKNOWN"])
+        filtered = enforce_min_severity(parsed, "CRITICAL")
+        assert [f.severity for f in filtered.findings] == ["UNKNOWN"]
+
+    def test_low_floor_is_noop_same_object(self):
+        parsed = self._parsed(["LOW"])
+        assert enforce_min_severity(parsed, "LOW") is parsed
+
+    def test_nothing_dropped_returns_same_object(self):
+        parsed = self._parsed(["HIGH", "CRITICAL"])
+        assert enforce_min_severity(parsed, "HIGH") is parsed
+
+    def test_clean_and_parse_ok_untouched(self):
+        # `clean` reports what the model said; an all-filtered review is
+        # "not clean, but nothing at your floor", not "clean".
+        parsed = self._parsed(["LOW"])
+        filtered = enforce_min_severity(parsed, "HIGH")
+        assert filtered.findings == []
+        assert filtered.clean is False
+        assert filtered.parse_ok is True
+
+    def test_baseline_entries_filtered_too(self):
+        # Below-floor baseline entries must not surface as "resolved"
+        # when they were merely filtered, not fixed.
+        doc = {
+            "findings": [
+                {"severity": "LOW", "fingerprint": "abc", "file": "a.py"},
+                {"severity": "HIGH", "fingerprint": "def", "file": "a.py"},
+            ]
+        }
+        filtered = filter_baseline_findings(doc, "HIGH")
+        assert [e["severity"] for e in filtered["findings"]] == ["HIGH"]
+        # Original document is not mutated.
+        assert len(doc["findings"]) == 2
+
+    def test_baseline_malformed_entries_kept(self):
+        doc = {"findings": [{"fingerprint": "abc"}, "not-a-dict"]}
+        filtered = filter_baseline_findings(doc, "HIGH")
+        assert filtered["findings"] == [{"fingerprint": "abc"}, "not-a-dict"]
+
+
 class TestBaseline:
     def _doc(self, findings: list[Finding]) -> dict:
         return build_json_envelope(
@@ -332,8 +422,11 @@ class TestBaseline:
             model="m",
             temperature=0.3,
             parsed=parse_review_markdown_safe(WELL_FORMED).__class__(
-                summary="s", findings=findings, clean=False,
-                parse_ok=True, problems=[],
+                summary="s",
+                findings=findings,
+                clean=False,
+                parse_ok=True,
+                problems=[],
             ),
             result=CallResult("raw"),
             raw_markdown="raw",
@@ -341,8 +434,12 @@ class TestBaseline:
 
     def _finding(self, title: str, line: int | None = 10) -> Finding:
         return Finding(
-            file="a.py", line=line, severity="HIGH",
-            title=title, body="", suggestion=None,
+            file="a.py",
+            line=line,
+            severity="HIGH",
+            title=title,
+            body="",
+            suggestion=None,
         )
 
     def test_new_persisting_resolved(self):
@@ -358,9 +455,7 @@ class TestBaseline:
         # Empirical case from back-to-back flash runs: same file, same
         # line, same issue, completely reworded title. Pass 2 (location)
         # must carry the match that the fingerprint misses.
-        doc = self._doc(
-            [self._finding("Add a comment explaining the default value")]
-        )
+        doc = self._doc([self._finding("Add a comment explaining the default value")])
         current = [self._finding("Add a comment to clarify its purpose", line=12)]
         statuses, resolved = diff_against_baseline(current, doc)
         assert statuses == ["persisting"]
@@ -370,8 +465,12 @@ class TestBaseline:
         old = self._finding("The comment is misleading")
         doc = self._doc([old])
         rerated = Finding(
-            file=old.file, line=old.line, severity="MEDIUM",
-            title="The comment should be clarified", body="", suggestion=None,
+            file=old.file,
+            line=old.line,
+            severity="MEDIUM",
+            title="The comment should be clarified",
+            body="",
+            suggestion=None,
         )
         statuses, _resolved = diff_against_baseline([rerated], doc)
         assert statuses == ["persisting"]
@@ -379,14 +478,52 @@ class TestBaseline:
     def test_different_file_never_persists(self):
         doc = self._doc([self._finding("issue")])
         moved = Finding(
-            file="other.py", line=10, severity="HIGH",
-            title="issue", body="", suggestion=None,
+            file="other.py",
+            line=10,
+            severity="HIGH",
+            title="issue",
+            body="",
+            suggestion=None,
         )
         # Identical title but different file: strong pass fails on the
         # fingerprint (file is hashed), relaxed pass fails on location.
         statuses, resolved = diff_against_baseline([moved], doc)
         assert statuses == ["new"]
         assert len(resolved) == 1
+
+    def test_lineless_baseline_entry_does_not_wildcard_match(self):
+        # A line-less baseline entry must not vouch for an unrelated
+        # finding in the same file via the relaxed pass -- with title
+        # and severity already ignored there, a missing line matching
+        # anything would collapse the whole file into one bucket.
+        doc = self._doc([self._finding("Old general file-level concern", line=None)])
+        current = [self._finding("Completely different specific issue", line=10)]
+        statuses, resolved = diff_against_baseline(current, doc)
+        assert statuses == ["new"]
+        assert len(resolved) == 1
+
+    def test_non_list_findings_in_baseline_is_config_error(self, tmp_path):
+        # A hand-mangled findings value would TypeError deep inside
+        # diff_against_baseline -> UNKNOWN; must be typed CONFIG before
+        # any tokens are spent.
+        import json as _json
+
+        bad = tmp_path / "baseline.json"
+        bad.write_text(
+            _json.dumps({"schema_version": 1, "findings": 5}), encoding="utf-8"
+        )
+        with pytest.raises(ConfigError) as exc_info:
+            load_baseline(str(bad))
+        assert "non-list" in str(exc_info.value)
+
+    def test_lineless_finding_still_persists_via_fingerprint(self):
+        # Pass 1 (fingerprint) remains the path for line-less findings:
+        # same file+severity+title matches regardless of missing lines.
+        doc = self._doc([self._finding("The helper lacks a docstring", line=None)])
+        current = [self._finding("The helper lacks a docstring", line=None)]
+        statuses, resolved = diff_against_baseline(current, doc)
+        assert statuses == ["persisting"]
+        assert resolved == []
 
     def test_one_baseline_entry_vouches_once(self):
         doc = self._doc([self._finding("dup issue")])
@@ -461,6 +598,8 @@ class TestEnvelope:
             resolved=[],
         )
         assert [f["status"] for f in envelope["findings"]] == [
-            "new", "persisting", "new",
+            "new",
+            "persisting",
+            "new",
         ]
         assert envelope["resolved"] == []

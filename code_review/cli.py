@@ -38,24 +38,36 @@ and ``--provider ollama`` also accept named aliases (see
 ``MODEL_ALIASES_BY_PROVIDER`` below) so you can write ``--model claude``
 or ``--model local`` instead of the full slug.
 
+Install as a global command (the primary interface), or run from a checkout:
+
+    uv tool install git+https://github.com/Airwhale/local-gemini-code-review
+    code-review --base origin/main            # then, from any repo
+    uv run review.py --base origin/main       # equivalent, from a checkout
+
 Diff modes (default) review a git diff:
 
-    uv run review.py                          # diff current branch vs origin/HEAD merge-base
-    uv run review.py --base main              # diff vs an explicit base ref
-    uv run review.py --pr 6                   # review a GitHub PR (uses `gh pr diff`)
-    uv run review.py --staged                 # staged changes only
+    code-review                               # diff current branch vs origin/HEAD merge-base
+    code-review --base main                   # diff vs an explicit base ref
+    code-review --pr 6                        # review a GitHub PR (uses `gh pr diff`)
+    code-review --staged                      # staged changes only
+    code-review --diff-file changes.patch     # review a diff from a file (- = stdin)
 
 Whole-codebase mode reviews tracked files (filtered):
 
-    uv run review.py --codebase
-    uv run review.py --codebase --include 'backend/**/*.py'
-    uv run review.py --codebase --exclude '**/test_*'
+    code-review --codebase
+    code-review --codebase --include 'backend/**/*.py'
+    code-review --codebase --exclude '**/test_*'
 
-The .env loaded from this script's directory (not CWD) -- copy `.env.example`
-to `.env` once at the runner location and invoke from any project folder.
-Set whichever of `OPENROUTER_API_KEY` / `GEMINI_API_KEY` your chosen provider
-needs (Ollama doesn't need an API key -- just set `OLLAMA_HOST` if your
-server isn't at the default `http://localhost:11434`).
+See --help for the full flag set (panels, chunking, JSON output, ...).
+
+Env files load in layers, and real environment variables always win:
+$CODE_REVIEW_ENV file (if set), then the per-user config dir
+(%APPDATA%\\code-review\\.env on Windows, ~/.config/code-review/.env
+elsewhere -- the home for an installed tool), then a checkout's repo-root
+.env (see .env.example). Set whichever of `OPENROUTER_API_KEY` /
+`GEMINI_API_KEY` your chosen provider needs (Ollama needs no API key --
+just set `OLLAMA_HOST` if your server isn't at the default
+`http://localhost:11434`).
 """
 
 from __future__ import annotations
@@ -78,7 +90,7 @@ from email.utils import parsedate_to_datetime
 from importlib import resources
 from importlib.resources.abc import Traversable
 from pathlib import Path
-from typing import Callable, TypeVar
+from typing import Any, Callable, TypeVar
 from urllib.parse import urlparse
 
 import httpx
@@ -338,8 +350,8 @@ GEMINI_URL_TEMPLATE = (
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 OLLAMA_CHAT_PATH = "/api/chat"
 HTTP_TIMEOUT = 300.0  # Gemini 2.5 Pro on a ~5K-line diff lands ~30-60s; pad
-                     # generously for very large diffs and whole-codebase
-                     # bundles.
+# generously for very large diffs and whole-codebase
+# bundles.
 # Local CPU inference on a 30B MoE coder model takes ~10-25 tok/sec on
 # modern hardware, so a thorough review (1500-3000 output tokens) can run
 # 1-5 minutes; cold-start model load adds another 10-60s on the first
@@ -386,7 +398,7 @@ DEFAULT_OLLAMA_TIMEOUT = 1800.0  # 30 minutes
 DEFAULT_OLLAMA_NUM_CTX = 4096
 OLLAMA_CHARS_PER_TOKEN = 4
 OLLAMA_PS_TIMEOUT = 5.0  # /api/ps probe is local and fast; never let a
-                         # hung probe delay the actual review call long.
+# hung probe delay the actual review call long.
 # Post-call truncation check: prompt_eval_count at or above this
 # fraction of the effective window means the prompt almost certainly
 # filled (and overflowed) it.
@@ -559,10 +571,25 @@ BUILTIN_CODEBASE_EXCLUDES: tuple[str, ...] = (
     "*/dist/*",
     "*/build/*",
     # Binary / asset extensions: skip outright (model can't review).
-    "*.png", "*.jpg", "*.jpeg", "*.gif", "*.svg", "*.ico", "*.webp",
-    "*.woff", "*.woff2", "*.ttf", "*.eot",
-    "*.pdf", "*.zip", "*.tar", "*.gz",
-    "*.mp3", "*.mp4", "*.mov", "*.avi",
+    "*.png",
+    "*.jpg",
+    "*.jpeg",
+    "*.gif",
+    "*.svg",
+    "*.ico",
+    "*.webp",
+    "*.woff",
+    "*.woff2",
+    "*.ttf",
+    "*.eot",
+    "*.pdf",
+    "*.zip",
+    "*.tar",
+    "*.gz",
+    "*.mp3",
+    "*.mp4",
+    "*.mov",
+    "*.avi",
 )
 
 # Per-file delimiter for whole-codebase bundles. The shape is chosen so
@@ -586,11 +613,13 @@ def _prompt_root() -> Traversable:
     override = os.getenv("CODE_REVIEW_PROMPT_DIR")
     if override:
         root = Path(override)
-        if not (root / "skills").is_dir():
-            raise ConfigError(
-                f"$CODE_REVIEW_PROMPT_DIR={override!r} has no skills/ "
-                "directory."
-            )
+        for sub in ("skills", "commands"):
+            if not (root / sub).is_dir():
+                raise ConfigError(
+                    f"$CODE_REVIEW_PROMPT_DIR={override!r} has no {sub}/ "
+                    "directory. The override must mirror the repo layout: "
+                    "both skills/ and commands/."
+                )
         return root
     package = resources.files("code_review")
     if (package / "skills").is_dir():
@@ -614,20 +643,57 @@ def load_skill(name: str = "code-review-commons") -> str:
     of the upstream skill's hardcoded "only lines beginning with +/-"
     rule that's correct for diff review but forbids all comments on
     whole-file input.
+
+    A missing or unreadable asset is a typed ConfigError, not a raw
+    FileNotFoundError: ``_prompt_root`` validates directories, but a
+    root can pass that check while still missing an individual file
+    (partial override dir, corrupted install), and the failure must
+    surface as CONFIG [exit 2], not UNKNOWN.
     """
-    return (
-        _prompt_root()
-        .joinpath("skills", name, "SKILL.md")
-        .read_text(encoding="utf-8")
-    )
+    asset = _prompt_root().joinpath("skills", name, "SKILL.md")
+    try:
+        return asset.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(
+            f"Prompt asset missing or unreadable: {asset}. If "
+            "$CODE_REVIEW_PROMPT_DIR is set it must contain the full "
+            "skills/ tree; otherwise reinstall the package.",
+            detail=str(exc),
+        ) from exc
 
 
 def load_command_prompt(name: str) -> str:
-    """Load `commands/<name>.toml` and return the `prompt` field verbatim."""
-    text = _prompt_root().joinpath("commands", f"{name}.toml").read_text(
-        encoding="utf-8"
-    )
-    return tomllib.loads(text)["prompt"]
+    """Load `commands/<name>.toml` and return the `prompt` field verbatim.
+
+    Same typed-error contract as ``load_skill``: a missing file or a
+    file that isn't valid command TOML is CONFIG, not UNKNOWN.
+    """
+    asset = _prompt_root().joinpath("commands", f"{name}.toml")
+    try:
+        text = asset.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(
+            f"Prompt asset missing or unreadable: {asset}. If "
+            "$CODE_REVIEW_PROMPT_DIR is set it must contain the full "
+            "commands/ tree; otherwise reinstall the package.",
+            detail=str(exc),
+        ) from exc
+    try:
+        prompt = tomllib.loads(text)["prompt"]
+    except (tomllib.TOMLDecodeError, KeyError) as exc:
+        raise ConfigError(
+            f"Prompt asset {asset} is not a valid command file: expected "
+            "TOML with a top-level `prompt` key.",
+            detail=str(exc),
+        ) from exc
+    if not isinstance(prompt, str):
+        # `prompt = 123` parses fine but crashes later in template
+        # substitution -- fail at the asset boundary as typed CONFIG.
+        raise ConfigError(
+            f"Prompt asset {asset} has a non-string `prompt` value "
+            f"({type(prompt).__name__})."
+        )
+    return prompt
 
 
 def _user_config_dir() -> Path:
@@ -664,8 +730,7 @@ def _load_env_files() -> None:
         path = Path(explicit)
         if not path.is_file():
             raise ConfigError(
-                f"$CODE_REVIEW_ENV={explicit!r} does not exist or is not "
-                "a file."
+                f"$CODE_REVIEW_ENV={explicit!r} does not exist or is not a file."
             )
         load_dotenv(path, override=False)
     load_dotenv(_user_config_dir() / ".env", override=False)
@@ -827,17 +892,27 @@ def git_diff_local(base: str | None, staged: bool) -> str:
     return _run_git(["git", "diff", "-U5", "--merge-base", "origin/HEAD"])
 
 
-def pr_diff(pr_number: int) -> str:
-    """Pull a PR's diff via `gh`. Requires `gh auth login` to have run.
+def _run_gh(args: list[str], repo: str | None) -> str:
+    """Run a ``gh pr …`` command and return stdout.
+
+    ``repo`` pins the target repository (``--repo owner/name``). This
+    matters: bare ``gh pr N`` resolves through gh's own default-repo
+    logic (``gh repo set-default``), which on forks routinely points at
+    the UPSTREAM repo -- so ``--pr 3`` would silently review someone
+    else's PR #3. The runner also announces the resolved PR URL on
+    stderr (see ``_read_diff_source``) so the wrong target is visible
+    even without ``--repo``.
 
     Same Windows-locale concern as ``_run_git``: explicit
     ``encoding="utf-8"`` keeps PR diffs containing em-dashes, arrows,
     section signs, and other non-ASCII characters from being mangled
     into cp1252 mojibake before the model sees them.
     """
+    if repo:
+        args = [*args, "--repo", repo]
     try:
         result = subprocess.run(
-            ["gh", "pr", "diff", str(pr_number), "--patch"],
+            args,
             capture_output=True,
             text=True,
             check=True,
@@ -853,33 +928,93 @@ def pr_diff(pr_number: int) -> str:
         ) from exc
     except subprocess.CalledProcessError as exc:
         raise ConfigError(
-            f"`gh pr diff {pr_number}` failed (exit {exc.returncode})",
+            f"`{' '.join(args)}` failed (exit {exc.returncode})",
             detail=exc.stderr.strip(),
         ) from exc
     return result.stdout
 
 
-def pr_changed_files(pr_number: int) -> list[Path]:
+def pr_diff(pr_number: int, repo: str | None = None) -> str:
+    """Pull a PR's diff via `gh`. Requires `gh auth login` to have run."""
+    return _run_gh(["gh", "pr", "diff", str(pr_number), "--patch"], repo)
+
+
+def pr_changed_files(pr_number: int, repo: str | None = None) -> list[Path]:
     """List a PR's changed file paths via ``gh pr diff --name-only``."""
-    try:
-        result = subprocess.run(
-            ["gh", "pr", "diff", str(pr_number), "--name-only"],
-            capture_output=True,
-            text=True,
-            check=True,
-            encoding="utf-8",
-            errors="replace",
+    output = _run_gh(["gh", "pr", "diff", str(pr_number), "--name-only"], repo)
+    return [Path(line) for line in output.splitlines() if line]
+
+
+def _gh_pr_view_field(pr_number: int, field: str, repo: str | None) -> str:
+    """One field from ``gh pr view --json`` (e.g. headRefOid, url)."""
+    output = _run_gh(
+        ["gh", "pr", "view", str(pr_number), "--json", field, "--jq", f".{field}"],
+        repo,
+    )
+    return output.strip()
+
+
+def pr_head_sha(pr_number: int, repo: str | None = None) -> str:
+    """The PR's current head commit SHA via ``gh pr view``."""
+    return _gh_pr_view_field(pr_number, "headRefOid", repo)
+
+
+def pr_url(pr_number: int, repo: str | None = None) -> str:
+    """The PR's canonical URL -- names the owner/repo it resolved to."""
+    return _gh_pr_view_field(pr_number, "url", repo)
+
+
+def _guard_pr_full_files(pr_number: int, repo: str | None = None) -> None:
+    """Refuse ``--full-files`` with ``--pr`` unless HEAD is the PR head.
+
+    The PR diff comes from GitHub, but ``--full-files`` reads reference
+    file bodies from the LOCAL checkout. When the checkout isn't at the
+    PR head, the model silently receives file content unrelated to the
+    diff it is reviewing -- worse than no reference at all, because the
+    mismatch is invisible in the output. A matching-but-dirty tree only
+    gets a WARN: uncommitted edits are the user's own visible state, and
+    hard-failing on them would break the fix-and-re-review loop.
+    """
+    head = pr_head_sha(pr_number, repo)
+    local = _run_git(["git", "rev-parse", "HEAD"]).strip()
+    if local != head:
+        # Carry the --repo pin into the suggested command: bare
+        # `gh pr checkout N` resolves through gh's default repo, which
+        # is the exact wrong-repo footgun --repo exists to avoid.
+        checkout = f"gh pr checkout {pr_number}"
+        if repo:
+            checkout += f" --repo {repo}"
+        raise ConfigError(
+            "--full-files with --pr reads file content from the local "
+            f"checkout, but HEAD ({local[:12]}) is not the head of PR "
+            f"#{pr_number} ({head[:12]}) -- the reference files would not "
+            f"match the diff. Run `{checkout}` first, or drop --full-files."
         )
-    except FileNotFoundError as exc:
-        raise ConfigError(
-            "`gh` not found on PATH. Install GitHub CLI to use --pr.",
-        ) from exc
-    except subprocess.CalledProcessError as exc:
-        raise ConfigError(
-            f"`gh pr diff {pr_number} --name-only` failed (exit {exc.returncode})",
-            detail=exc.stderr.strip(),
-        ) from exc
-    return [Path(line) for line in result.stdout.splitlines() if line]
+    if _run_git(["git", "status", "--porcelain", "--untracked-files=no"]).strip():
+        sys.stderr.write(
+            "WARN: working tree has uncommitted changes; --full-files "
+            "reference content may differ from the PR head.\n"
+        )
+
+
+def _rebase_repo_relative(paths: list[Path]) -> list[Path]:
+    """Re-base repo-root-relative paths onto the current directory.
+
+    ``git diff --name-only`` and ``gh pr diff --name-only`` emit paths
+    relative to the REPO ROOT, but the runner may be invoked from a
+    subdirectory -- read as-is, every reference file would stat-fail
+    and be silently dropped from the --full-files set. From the root
+    (the common case) this is a no-op; from a subdirectory the paths
+    gain ``../`` prefixes, which read correctly and stay recognizable
+    in the reference delimiters.
+    """
+    top = _run_git(["git", "rev-parse", "--show-toplevel"]).strip()
+    if not top:
+        return paths
+    root = Path(top)
+    if root.resolve() == Path.cwd().resolve():
+        return paths
+    return [Path(os.path.relpath(root / p)) for p in paths]
 
 
 def changed_file_paths(args: argparse.Namespace) -> list[Path]:
@@ -889,16 +1024,14 @@ def changed_file_paths(args: argparse.Namespace) -> list[Path]:
     reference set always matches the diff the model reviews.
     """
     if args.pr:
-        return pr_changed_files(args.pr)
+        return _rebase_repo_relative(pr_changed_files(args.pr, args.repo))
     if args.staged:
         output = _run_git(["git", "diff", "--cached", "--name-only"])
     elif args.base:
         output = _run_git(["git", "diff", "--name-only", args.base])
     else:
-        output = _run_git(
-            ["git", "diff", "--name-only", "--merge-base", "origin/HEAD"]
-        )
-    return [Path(line) for line in output.splitlines() if line]
+        output = _run_git(["git", "diff", "--name-only", "--merge-base", "origin/HEAD"])
+    return _rebase_repo_relative([Path(line) for line in output.splitlines() if line])
 
 
 def build_reference_section(paths: list[Path]) -> str:
@@ -951,14 +1084,11 @@ def _glob_match(path: Path, patterns: tuple[str, ...] | list[str]) -> bool:
     posix = path.as_posix()
     name = path.name
     return any(
-        fnmatch.fnmatch(posix, pat) or fnmatch.fnmatch(name, pat)
-        for pat in patterns
+        fnmatch.fnmatch(posix, pat) or fnmatch.fnmatch(name, pat) for pat in patterns
     )
 
 
-def gather_codebase_files(
-    includes: list[str], excludes: list[str]
-) -> list[Path]:
+def gather_codebase_files(includes: list[str], excludes: list[str]) -> list[Path]:
     """Return the list of files to bundle for whole-codebase review.
 
     Pipeline (in order):
@@ -1044,8 +1174,7 @@ def _number_lines(content: str) -> str:
         return content
     width = max(6, len(str(len(lines))))
     numbered = "\n".join(
-        f"{index:>{width}d}: {line}"
-        for index, line in enumerate(lines, start=1)
+        f"{index:>{width}d}: {line}" for index, line in enumerate(lines, start=1)
     )
     return numbered + "\n" if had_trailing_newline else numbered
 
@@ -1196,10 +1325,12 @@ def _classify_http_error(
     a generic ``ReviewError`` which surfaces as exit 1 with the response
     body in ``detail`` so a caller can decide.
 
-    Order matters: the 5xx check runs BEFORE the substring match so a
-    provider-side failure page that happens to contain a phrase like
-    "too long" or "token limit" stays a retryable TRANSPORT error
-    instead of being misclassified as a do-not-retry CONTEXT_OVERFLOW.
+    Order matters: the 5xx and 401/403 checks run BEFORE the substring
+    match so a provider-side failure page or auth-rejection body that
+    happens to contain a phrase like "too long" or "token limit" keeps
+    its status-derived classification (retryable TRANSPORT / fix-the-key
+    CONFIG) instead of being misclassified as a do-not-retry
+    CONTEXT_OVERFLOW.
     """
     body_lower = body.lower()
     if status == 429:
@@ -1228,6 +1359,32 @@ def _classify_http_error(
             model=model,
             provider=provider,
         )
+    if status in (401, 403):
+        # Auth failures are a fix-your-key problem, so they belong in the
+        # CONFIG lane (exit 2, never retried) rather than falling through
+        # to the generic UNKNOWN bucket. One carve-out: OpenRouter uses
+        # 403 when its moderation layer flags the INPUT -- a content
+        # decision, not a credentials problem -- which stays in the
+        # SAFETY_REFUSAL lane so the exit code steers the caller to the
+        # safety-context docs instead of key rotation.
+        if status == 403 and ("moderation" in body_lower or "flagged" in body_lower):
+            return SafetyRefusal(
+                f"{provider} returned HTTP 403 (input flagged by moderation)",
+                detail=body[:1000],
+                model=model,
+                provider=provider,
+            )
+        key_hint = {
+            "openrouter": " Check OPENROUTER_API_KEY.",
+            "gemini": " Check GEMINI_API_KEY.",
+        }.get(provider, "")
+        return ConfigError(
+            f"{provider} returned HTTP {status} (authentication/authorization "
+            f"failed).{key_hint}",
+            detail=body[:1000],
+            model=model,
+            provider=provider,
+        )
     # 4xx only from here down. Match the family of provider phrases that
     # signal context-length overflow, kept as a tuple so adding a new
     # variant is a one-line edit. Each phrase was added based on an
@@ -1243,7 +1400,9 @@ def _classify_http_error(
         "input too large",
         "payload size",
     )
-    if status == 413 or any(phrase in body_lower for phrase in CONTEXT_OVERFLOW_PHRASES):
+    if status == 413 or any(
+        phrase in body_lower for phrase in CONTEXT_OVERFLOW_PHRASES
+    ):
         return ContextOverflow(
             f"{provider} returned HTTP {status} with context-length indication",
             detail=body[:1000],
@@ -1387,14 +1546,28 @@ def call_openrouter(
         )
 
     choices = data.get("choices") or []
-    if not choices:
+    # The isinstance guard covers a dict/string where the list should
+    # be: {"choices": {...}} is truthy, so the emptiness check alone
+    # would pass and choices[0] would raise KeyError -> UNKNOWN.
+    if not isinstance(choices, list) or not choices:
         raise ProviderHiccup(
-            "OpenRouter response had no choices",
+            "OpenRouter response had no choices list",
             detail=str(data)[:1000],
             model=model,
             provider="openrouter",
         )
     choice = choices[0]
+    # Same malformed-shape contract as the top-level check: nested
+    # non-object values (a string in choices[], a list for message)
+    # must surface as retryable PROVIDER_HICCUP, not as an
+    # AttributeError escaping to UNKNOWN.
+    if not isinstance(choice, dict):
+        raise ProviderHiccup(
+            "OpenRouter choices[0] is not an object",
+            detail=str(data)[:1000],
+            model=model,
+            provider="openrouter",
+        )
     # Inspect both ``finish_reason`` (OpenAI-standard normalized value)
     # and ``native_finish_reason`` (OpenRouter's pass-through of the
     # underlying provider's raw reason). They can disagree: a provider
@@ -1403,12 +1576,27 @@ def call_openrouter(
     # ``finish_reason="stop"`` -- preferring one over the other would
     # miss that signal. We classify by the UNION of both fields, so a
     # safety signal from either source wins over a generic "stop".
-    finish_reason = (choice.get("finish_reason") or "").lower()
-    native_finish_reason = (choice.get("native_finish_reason") or "").lower()
+    # str() coercion: a numeric/oddly-typed reason must not crash
+    # ``.lower()``.
+    finish_reason = str(choice.get("finish_reason") or "").lower()
+    native_finish_reason = str(choice.get("native_finish_reason") or "").lower()
     finish_reasons = {finish_reason, native_finish_reason} - {""}
     message = choice.get("message") or {}
+    if not isinstance(message, dict):
+        raise ProviderHiccup(
+            "OpenRouter message is not an object",
+            detail=str(data)[:1000],
+            model=model,
+            provider="openrouter",
+        )
     content = message.get("content")
+    if content is not None and not isinstance(content, str):
+        # Non-string content falls through to the empty-content
+        # classification below, which always ends in a typed raise.
+        content = None
     usage = data.get("usage") or {}
+    if not isinstance(usage, dict):
+        usage = {}  # optional metadata -- degrade, don't fail the review
 
     if content:
         truncated = bool(finish_reasons & {"length", "max_tokens"})
@@ -1520,6 +1708,8 @@ def call_gemini(
     # Gemini can refuse at the prompt level (before generation) by
     # returning ``promptFeedback.blockReason`` with no candidates.
     prompt_feedback = data.get("promptFeedback") or {}
+    if not isinstance(prompt_feedback, dict):
+        prompt_feedback = {}  # malformed feedback -> fall through to candidates
     block_reason = prompt_feedback.get("blockReason")
     if block_reason:
         raise SafetyRefusal(
@@ -1530,27 +1720,64 @@ def call_gemini(
         )
 
     candidates = data.get("candidates") or []
-    if not candidates:
+    # isinstance: a dict/string here is truthy, so the emptiness check
+    # alone would pass and candidates[0] would raise KeyError -> UNKNOWN.
+    if not isinstance(candidates, list) or not candidates:
         raise ProviderHiccup(
-            "Gemini response had no candidates",
+            "Gemini response had no candidates list",
             detail=str(data)[:1000],
             model=model,
             provider="gemini",
         )
     candidate = candidates[0]
-    finish_reason = (candidate.get("finishReason") or "").upper()
+    # Same malformed-shape contract as the top-level check: nested
+    # non-object values must surface as retryable PROVIDER_HICCUP, not
+    # as an AttributeError escaping to UNKNOWN. Non-dict parts entries
+    # and non-string texts are skipped rather than fatal -- an empty
+    # result then flows into the empty-content classification below,
+    # which always ends in a typed raise.
+    if not isinstance(candidate, dict):
+        raise ProviderHiccup(
+            "Gemini candidates[0] is not an object",
+            detail=str(data)[:1000],
+            model=model,
+            provider="gemini",
+        )
+    finish_reason = str(candidate.get("finishReason") or "").upper()
     content_block = candidate.get("content") or {}
+    if not isinstance(content_block, dict):
+        raise ProviderHiccup(
+            "Gemini candidate content is not an object",
+            detail=str(data)[:1000],
+            model=model,
+            provider="gemini",
+        )
     parts = content_block.get("parts") or []
-    text = "".join(part.get("text", "") for part in parts)
+    text = "".join(
+        part_text
+        for part in parts
+        if isinstance(part, dict) and isinstance(part_text := part.get("text"), str)
+    )
     usage = data.get("usageMetadata") or {}
+    if not isinstance(usage, dict):
+        usage = {}  # optional metadata -- degrade, don't fail the review
 
     if text:
         truncated = finish_reason == "MAX_TOKENS"
         _warn_if_truncated(truncated, max_tokens, "gemini")
+        # Thinking models (gemini-2.5-pro et al.) bill thought tokens
+        # separately in ``thoughtsTokenCount``; candidatesTokenCount is
+        # only the visible output, so summing keeps the [usage] line an
+        # honest cost signal instead of understating by the (often
+        # large) reasoning budget.
+        completion = _usage_int(usage.get("candidatesTokenCount"))
+        thoughts = _usage_int(usage.get("thoughtsTokenCount"))
+        if thoughts:
+            completion = (completion or 0) + thoughts
         return CallResult(
             text,
             prompt_tokens=_usage_int(usage.get("promptTokenCount")),
-            completion_tokens=_usage_int(usage.get("candidatesTokenCount")),
+            completion_tokens=completion,
             truncated=truncated,
         )
 
@@ -1629,7 +1856,12 @@ def _match_loaded_context(ps_data: object, model: str) -> int | None:
         # mask it, but don't rely on that.
         return None
     wanted = {model} if ":" in model else {model, f"{model}:latest"}
-    for entry in ps_data.get("models") or []:
+    models_list = ps_data.get("models") or []
+    if not isinstance(models_list, list):
+        # A non-list `models` (int/bool/string) would TypeError below;
+        # the caller's blanket except would mask it, but be explicit.
+        return None
+    for entry in models_list:
         if not isinstance(entry, dict):
             continue
         if {entry.get("name"), entry.get("model")} & wanted:
@@ -1920,7 +2152,9 @@ def call_ollama(
     # prompt_eval_count / eval_count usage fields.
     message = data.get("message") or {}
     content = message.get("content") if isinstance(message, dict) else None
-    done_reason = (data.get("done_reason") or "").lower()
+    if content is not None and not isinstance(content, str):
+        content = None  # non-string content -> typed empty-content path
+    done_reason = str(data.get("done_reason") or "").lower()
     prompt_eval = _usage_int(data.get("prompt_eval_count"))
     eval_count = _usage_int(data.get("eval_count"))
 
@@ -1989,7 +2223,7 @@ def _call_with_retries(call: Callable[[], T], *, label: str, retries: int = 0) -
             transient_used += 1
             if transient_used > transient_budget:
                 raise
-            delay = min(2.0 ** transient_used, 60.0)
+            delay = min(2.0**transient_used, 60.0)
             sys.stderr.write(
                 f"[retry] {exc.category} on attempt {transient_used} "
                 f"({label}); retrying in {delay:.0f}s...\n"
@@ -2000,9 +2234,7 @@ def _call_with_retries(call: Callable[[], T], *, label: str, retries: int = 0) -
             if ratelimit_used > ratelimit_budget:
                 raise
             delay = (
-                exc.retry_after_seconds
-                if exc.retry_after_seconds is not None
-                else 60.0
+                exc.retry_after_seconds if exc.retry_after_seconds is not None else 60.0
             )
             if delay > MAX_RETRY_SLEEP:
                 sys.stderr.write(
@@ -2052,9 +2284,7 @@ def _resolve_model_name(name: str, provider: str) -> str:
     return name
 
 
-def _resolve_model(
-    args: argparse.Namespace, project_config: dict | None = None
-) -> str:
+def _resolve_model(args: argparse.Namespace, project_config: dict | None = None) -> str:
     """Resolve the single-model slug: CLI flag > per-provider env var >
     project config ``model`` > provider default (see
     ``_resolve_model_name`` for alias rules -- aliases work in every
@@ -2069,11 +2299,20 @@ def _resolve_model(
         name = args.model
     elif os.getenv(env_by_provider.get(args.provider, "")):
         name = os.environ[env_by_provider[args.provider]]
-    elif isinstance(config.get("model"), str):
-        name = config["model"]
+    elif "model" in config:
+        config_model = config["model"]
+        if not isinstance(config_model, str):
+            # Silently falling through to the provider default would
+            # hide the misconfig; fail typed like every other bad
+            # config value.
+            raise ConfigError(f"{_PROJECT_CONFIG_NAME} key 'model' must be a string.")
+        name = config_model
     else:
         name = DEFAULT_MODEL_BY_PROVIDER[args.provider]
-    return _resolve_model_name(name, args.provider)
+    # strip(): quoted .env values and TOML strings pick up stray spaces
+    # easily, and " flash" would miss the alias table and reach the
+    # provider as a bogus slug.
+    return _resolve_model_name(name.strip(), args.provider)
 
 
 # ---------------------------------------------------------------------------
@@ -2090,9 +2329,7 @@ def _resolve_model(
 # never destroy a paid-for review: the wrapper degrades to
 # ``parse_ok=False`` with the raw markdown embedded in the envelope.
 
-_SUMMARY_RE = re.compile(
-    r"^#\s+(?:Change|Codebase review)\s+summary:\s*(.*)$", re.I
-)
+_SUMMARY_RE = re.compile(r"^#\s+(?:Change|Codebase review)\s+summary:\s*(.*)$", re.I)
 _SUMMARY_FALLBACK_RE = re.compile(r"^#\s+.*?summary\s*:?\s*(.*)$", re.I)
 _FILE_RE = re.compile(r"^##\s+File:\s*(.+?)\s*$", re.I)
 _FINDING_RE = re.compile(r"^###\s+(.*)$")
@@ -2286,7 +2523,7 @@ def _extract_suggestion(body_lines: list[str]) -> tuple[str, str | None]:
         scan = found[1] + 1
     if span is not None:
         open_idx, close_idx, info = span
-        trailing = all(not l.strip() for l in body_lines[close_idx + 1 :])
+        trailing = all(not line.strip() for line in body_lines[close_idx + 1 :])
         if info in {"suggestion", "diff"} and trailing:
             suggestion = "\n".join(body_lines[open_idx + 1 : close_idx])
             remainder = body_lines[:open_idx]
@@ -2346,7 +2583,11 @@ def parse_review_markdown(text: str) -> ParsedReview:
     for raw_line in text.splitlines():
         if in_fence:
             closing = _FENCE_RE.match(raw_line)
-            if closing and len(closing.group(1)) >= fence_ticks and not closing.group(2):
+            if (
+                closing
+                and len(closing.group(1)) >= fence_ticks
+                and not closing.group(2)
+            ):
                 in_fence = False
             if open_heading is not None:
                 body_lines.append(raw_line)
@@ -2403,7 +2644,18 @@ def parse_review_markdown(text: str) -> ParsedReview:
         problems.append("no summary heading found")
 
     clean = not findings and bool(_CLEAN_RE.search(text))
-    parse_ok = clean or bool(findings) or (summary is not None and heading_count == 0)
+    # Summary-only output (no finding headings, no clean marker) is NOT
+    # parse_ok: the template mandates findings or the literal clean
+    # phrase, so a bare summary means the model drifted (bullets instead
+    # of ### headings, truncation before the first finding). Reporting
+    # it as a confident zero-finding review would let --baseline mark
+    # everything "resolved" and let agents treat the run as clean.
+    parse_ok = clean or bool(findings)
+    if summary is not None and heading_count == 0 and not clean and not findings:
+        problems.append(
+            "summary present but no finding headings and no clean marker; "
+            "the findings may be in an unparseable shape (see raw)"
+        )
     if any_unreadable:
         parse_ok = False
 
@@ -2448,13 +2700,20 @@ def load_baseline(path: str) -> dict:
     except OSError as exc:
         raise ConfigError(f"Cannot read --baseline file {path!r}: {exc}") from exc
     except ValueError as exc:
-        raise ConfigError(
-            f"--baseline file {path!r} is not valid JSON: {exc}"
-        ) from exc
+        raise ConfigError(f"--baseline file {path!r} is not valid JSON: {exc}") from exc
     if not isinstance(doc, dict) or doc.get("schema_version") != 1:
         raise ConfigError(
             f"--baseline file {path!r} is not a schema_version=1 review "
             "envelope (expected the output of a --format json run)."
+        )
+    findings = doc.get("findings")
+    if findings is not None and not isinstance(findings, list):
+        # A hand-mangled findings value would TypeError deep inside
+        # diff_against_baseline -> UNKNOWN; catch it here, pre-spend.
+        raise ConfigError(
+            f"--baseline file {path!r} has a non-list `findings` value "
+            f"({type(findings).__name__}); expected the findings array "
+            "of a --format json envelope."
         )
     return doc
 
@@ -2484,7 +2743,8 @@ def diff_against_baseline(
 
     1. **Strong**: fingerprint (file+severity+normalized title) equal,
        lines within ±10.
-    2. **Relaxed**: same file, lines within ±10 -- title and severity
+    2. **Relaxed**: same file, lines within ±10, and BOTH sides must
+       carry a real line number -- title and severity
        ignored. Empirically required: on back-to-back identical runs at
        T=0.3 the model rewords every title ("add a comment explaining
        the default" vs "add a comment to clarify its purpose") and even
@@ -2525,10 +2785,18 @@ def diff_against_baseline(
                 break
 
     # Pass 2: relaxed location match for whatever pass 1 left over.
+    # Both sides must carry a REAL line here: _location_match treats a
+    # missing line as matching anything, which is right for the
+    # fingerprint-backed pass but would let one line-less baseline entry
+    # vouch for any unrelated finding in the same file when title and
+    # severity are already being ignored. Line-less findings can still
+    # persist via pass 1's fingerprint.
     for idx, finding in enumerate(current):
-        if statuses[idx] is not None:
+        if statuses[idx] is not None or finding.line is None:
             continue
         for entry_idx, entry in enumerate(unmatched):
+            if _entry_line(entry) is None:
+                continue
             if _location_match(
                 finding.file, finding.line, _entry_file(entry), _entry_line(entry)
             ):
@@ -2537,6 +2805,64 @@ def diff_against_baseline(
                 break
 
     return [s or "new" for s in statuses], unmatched
+
+
+def _severity_at_or_above(severity: str, floor: str) -> bool:
+    """True when ``severity`` meets the floor.
+
+    Severities the parser couldn't rate (``UNKNOWN``) always pass:
+    hiding a finding whose severity we don't know would be worse than
+    showing it.
+    """
+    if severity not in SEVERITY_LEVELS:
+        return True
+    return SEVERITY_LEVELS.index(severity) >= SEVERITY_LEVELS.index(floor)
+
+
+def enforce_min_severity(parsed: ParsedReview, floor: str) -> ParsedReview:
+    """Drop parsed findings below the ``--min-severity`` floor.
+
+    The ``<SEVERITY_FILTER>`` prompt appendix ASKS the model not to
+    report below-floor findings, but a prompt is a request, not a
+    guarantee. Wherever the runner synthesizes structured findings
+    (--format json envelopes, panel reports) the floor is enforced here
+    after parsing, making the flag a hard contract for agent callers.
+    Verbatim markdown output is deliberately left untouched -- filtering
+    it would require rewriting the model's own text.
+
+    ``clean`` is not recomputed: it reports what the model said, and
+    "not clean, but nothing at or above your floor" is exactly what an
+    empty ``findings`` list next to ``clean: false`` means.
+    """
+    if floor == "LOW":
+        return parsed
+    kept = [f for f in parsed.findings if _severity_at_or_above(f.severity, floor)]
+    if len(kept) == len(parsed.findings):
+        return parsed
+    return dataclasses.replace(parsed, findings=kept)
+
+
+def filter_baseline_findings(baseline_doc: dict, floor: str) -> dict:
+    """Apply the severity floor to a baseline document's findings.
+
+    Without this, running with a higher floor than the baseline round
+    would report every below-floor baseline entry as ``resolved`` when
+    it was merely filtered, not fixed. Entries whose severity is
+    missing or malformed are kept, mirroring ``_severity_at_or_above``.
+    """
+    if floor == "LOW":
+        return baseline_doc
+    entries = baseline_doc.get("findings") or []
+    kept = [
+        entry
+        for entry in entries
+        if not isinstance(entry, dict)
+        or not isinstance(entry.get("severity"), str)
+        or _severity_at_or_above(entry["severity"], floor)
+    ]
+    filtered = dict(baseline_doc)
+    filtered["findings"] = kept
+    return filtered
 
 
 def build_json_envelope(
@@ -2579,8 +2905,7 @@ def build_json_envelope(
                 "prompt_tokens": result.prompt_tokens,
                 "completion_tokens": result.completion_tokens,
             }
-            if result.prompt_tokens is not None
-            or result.completion_tokens is not None
+            if result.prompt_tokens is not None or result.completion_tokens is not None
             else None
         ),
         "truncated": result.truncated,
@@ -2732,9 +3057,7 @@ def panel_findings_match(a: Finding, b: Finding) -> bool:
     # cost of a miss is a mislabeled status, not false confidence.)
     if a.line is None or b.line is None:
         return False
-    return a.severity == b.severity and _location_match(
-        a.file, a.line, b.file, b.line
-    )
+    return a.severity == b.severity and _location_match(a.file, a.line, b.file, b.line)
 
 
 def merge_panel_findings(
@@ -2784,6 +3107,7 @@ def _panel_exit_error(failures: list[tuple[str, ReviewError]]) -> ReviewError:
     Fixed category precedence (see ``_CATEGORY_PRECEDENCE``); ties break
     by CLI model order because ``min`` is stable.
     """
+
     def rank(item: tuple[str, ReviewError]) -> int:
         category = item[1].category
         return (
@@ -2808,14 +3132,19 @@ def render_panel_markdown(
     line), then every model's raw output verbatim in an appendix --
     nothing the models said is lost to the merge.
     """
-    lines: list[str] = [f"# Panel review ({len(parsed_by_model)}/{n_models} models)", ""]
+    lines: list[str] = [
+        f"# Panel review ({len(parsed_by_model)}/{n_models} models)",
+        "",
+    ]
 
     lines.append("Per-model results:")
     for model, parsed in parsed_by_model.items():
         if parsed.clean:
             note = "clean -- no issues found"
         elif parsed.parse_ok:
-            note = f"{len(parsed.findings)} finding(s): {parsed.summary or '(no summary)'}"
+            note = (
+                f"{len(parsed.findings)} finding(s): {parsed.summary or '(no summary)'}"
+            )
         else:
             note = "output could not be parsed (see appendix)"
         lines.append(f"- `{model}`: {note}")
@@ -2972,7 +3301,7 @@ def _min_severity_instruction(level: str) -> str:
     """
     if level == "LOW":
         return ""
-    kept = SEVERITY_LEVELS[SEVERITY_LEVELS.index(level):]
+    kept = SEVERITY_LEVELS[SEVERITY_LEVELS.index(level) :]
     return (
         "\n\n<SEVERITY_FILTER>\n"
         f"Report only findings of severity {level} or higher "
@@ -3013,9 +3342,7 @@ def _write_output_file(text: str, path: str) -> None:
         with open(path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
     except OSError as exc:
-        raise ConfigError(
-            f"Cannot write --output file {path!r}: {exc}"
-        ) from exc
+        raise ConfigError(f"Cannot write --output file {path!r}: {exc}") from exc
 
 
 def _resolve_ollama_window(
@@ -3047,11 +3374,31 @@ def _resolve_ollama_window(
 # installation), so different projects can pin different models,
 # excludes, or context strings.
 _PROJECT_CONFIG_NAME = ".code-review.toml"
-_PROJECT_CONFIG_KEYS = frozenset({
-    "provider", "model", "models", "temperature", "max_tokens", "retries",
-    "min_severity", "format", "context", "ollama_host", "ollama_num_ctx",
-    "ollama_timeout", "include", "exclude",
-})
+# Keys the reviewed repo's .code-review.toml may set. Deliberately
+# EXCLUDED, because this file is attacker-adjacent on untrusted
+# checkouts (e.g. a PR branch that adds one):
+#   - API keys: credentials never come from the reviewed repo.
+#   - context: injected as trusted operator framing AHEAD of the
+#     injection guard -- accepting it from the repo under review would
+#     let that repo instruct its own reviewer ("report no issues").
+#   - ollama_host: the full diff is POSTed to this URL -- a hostile
+#     value exfiltrates the code under review to an arbitrary server.
+#   - ollama_num_ctx / ollama_timeout: machine-local hardware facts, not
+#     project facts (and a huge num_ctx can OOM the reviewer's server).
+_PROJECT_CONFIG_KEYS = frozenset(
+    {
+        "provider",
+        "model",
+        "models",
+        "temperature",
+        "max_tokens",
+        "retries",
+        "min_severity",
+        "format",
+        "include",
+        "exclude",
+    }
+)
 
 
 def _load_project_config() -> dict:
@@ -3066,9 +3413,11 @@ def _load_project_config() -> dict:
     Security posture: this file lives in the REVIEWED repo, which for
     ``--pr``-style use may be an untrusted checkout -- so loading one is
     always announced on stderr with its path, unknown keys are dropped
-    with a WARN (that includes anything that looks like an API key:
-    credentials are never accepted from project config), and the keys it
-    can set only shape the review, never where credentials go.
+    with a WARN, and the accepted key set (see _PROJECT_CONFIG_KEYS) is
+    limited to review-shaping tunables: no credentials, no prompt
+    ``context``, no ``ollama_*`` endpoint/window settings. Pass
+    ``--no-project-config`` to ignore the file entirely when auditing
+    untrusted code (even ``exclude`` can hide a file from --codebase).
     """
     directory = Path.cwd()
     while True:
@@ -3078,22 +3427,16 @@ def _load_project_config() -> dict:
                 # utf-8-sig: Windows editors (Notepad, PowerShell
                 # Set-Content) write a BOM, which tomllib rejects;
                 # -sig strips it and is a no-op otherwise.
-                config = tomllib.loads(
-                    candidate.read_text(encoding="utf-8-sig")
-                )
+                config = tomllib.loads(candidate.read_text(encoding="utf-8-sig"))
             except (OSError, tomllib.TOMLDecodeError) as exc:
-                raise ConfigError(
-                    f"Cannot parse {candidate}: {exc}"
-                ) from exc
+                raise ConfigError(f"Cannot parse {candidate}: {exc}") from exc
             unknown = sorted(set(config) - _PROJECT_CONFIG_KEYS)
             if unknown:
                 sys.stderr.write(
                     f"WARN: {candidate} has unrecognized keys (ignored): "
                     f"{', '.join(unknown)}\n"
                 )
-                config = {
-                    k: v for k, v in config.items() if k in _PROJECT_CONFIG_KEYS
-                }
+                config = {k: v for k, v in config.items() if k in _PROJECT_CONFIG_KEYS}
             sys.stderr.write(f"[config] loaded {candidate}\n")
             return config
         if (directory / ".git").exists() or directory.parent == directory:
@@ -3106,7 +3449,7 @@ def _layered(
     env_name: str | None,
     toml_key: str,
     project_config: dict,
-) -> tuple[object, str]:
+) -> tuple[Any, str]:
     """One lookup through the precedence layers: CLI > env > project
     config. Returns ``(value, source)``; ``(None, "default")`` when no
     layer provided a value (the caller applies its built-in default).
@@ -3186,7 +3529,9 @@ class ReviewRequest:
     chunk_label: str | None = None  # --chunk mode: e.g. "3 file(s), 41,209 chars"
 
 
-def _chunk_budget(settings: Settings) -> tuple[int, str | None]:
+def _chunk_budget(
+    settings: Settings, *, is_codebase: bool = False
+) -> tuple[int, str | None]:
     """Per-chunk payload budget in chars, plus an optional WARN note.
 
     Cloud providers budget against the standard bundle cap. Ollama
@@ -3212,8 +3557,13 @@ def _chunk_budget(settings: Settings) -> tuple[int, str | None]:
             "window and cut the call count"
         )
     # Overhead: the prompts minus the payload (skill + command template +
-    # context wrapper + severity appendix). Measured, not estimated.
-    empty_system, empty_user = build_diff_prompts("", settings.context)
+    # context wrapper + severity appendix). Measured, not estimated --
+    # against the prompt set the chunks will actually use: the codebase
+    # skill/template is larger than the diff one, so measuring the diff
+    # overhead for --codebase chunks would oversize them and trip the
+    # post-call truncation verify.
+    build_prompts = build_codebase_prompts if is_codebase else build_diff_prompts
+    empty_system, empty_user = build_prompts("", settings.context)
     overhead = (
         len(empty_system)
         + len(empty_user)
@@ -3302,6 +3652,11 @@ def _resolve_settings(
     provider_raw, provider_source = _layered(
         args.provider, "CODE_REVIEW_PROVIDER", "provider", config
     )
+    # strip(): quoted .env values pick up stray whitespace easily, and
+    # " ollama" failing validation over an invisible space is hostile.
+    # Same treatment for the other validated string tunables below.
+    if isinstance(provider_raw, str):
+        provider_raw = provider_raw.strip()
     provider = provider_raw if provider_raw is not None else DEFAULT_PROVIDER
     if provider not in PROVIDERS:
         raise ConfigError(
@@ -3312,28 +3667,40 @@ def _resolve_settings(
     args.provider = provider
 
     # Panel model list: resolved pre-flight so alias errors exit 2
-    # before any network call. Exclusive with --model (manual check,
-    # same pattern as --context / --no-context).
+    # before any network call. --models and --model on the CLI together
+    # are genuinely ambiguous (manual check, same pattern as --context /
+    # --no-context) -- but a CLI --model OVERRIDES a project-config
+    # panel outright, per the documented CLI > project-config
+    # precedence: the config list only activates when the CLI didn't
+    # pick a single model.
     models: tuple[str, ...] | None = None
     names: list[str] | None = None
     if args.models is not None:
+        if args.model is not None:
+            raise ConfigError(
+                "--models and --model are mutually exclusive. Use "
+                "--models for a panel, --model for a single reviewer."
+            )
         names = [n.strip() for n in args.models.split(",") if n.strip()]
-    elif "models" in config:
+    elif "models" in config and args.model is None:
         config_models = config["models"]
         if not isinstance(config_models, list) or not all(
             isinstance(m, str) for m in config_models
         ):
             raise ConfigError(
-                f"{_PROJECT_CONFIG_NAME} key 'models' must be a list of "
-                "strings."
+                f"{_PROJECT_CONFIG_NAME} key 'models' must be a list of strings."
             )
         names = [n.strip() for n in config_models if n.strip()]
     if names is not None:
-        if args.model is not None:
+        if args.chunk:
+            # _validate_flag_combos already rejects CLI --chunk+--models,
+            # but it runs before project config loads -- re-check here so
+            # a config-sourced panel can't slip into a chunked run (which
+            # would silently review with only the first model).
             raise ConfigError(
-                "--models (or a project-config models list) and --model "
-                "are mutually exclusive. Use models for a panel, --model "
-                "for a single reviewer."
+                "--chunk and a models panel are not supported together "
+                "(the panel here comes from .code-review.toml). Chunk "
+                "with a single --model, or panel an unchunked payload."
             )
         if len(names) < 2:
             raise ConfigError(
@@ -3362,13 +3729,10 @@ def _resolve_settings(
         args.temperature, "CODE_REVIEW_TEMPERATURE", "temperature", config
     )
     try:
-        temperature = (
-            float(temp_raw) if temp_raw is not None else DEFAULT_TEMPERATURE  # type: ignore[arg-type]
-        )
+        temperature = float(temp_raw) if temp_raw is not None else DEFAULT_TEMPERATURE
     except (TypeError, ValueError) as exc:
         raise ConfigError(
-            f"temperature {temp_raw!r} (from {temp_source}) is not a valid "
-            "float."
+            f"temperature {temp_raw!r} (from {temp_source}) is not a valid float."
         ) from exc
     # Validate range here rather than letting the provider 4xx -- catches
     # the misconfig as a typed CONFIG error (exit 2) the LLM caller can
@@ -3386,11 +3750,10 @@ def _resolve_settings(
         args.max_tokens, "CODE_REVIEW_MAX_TOKENS", "max_tokens", config
     )
     try:
-        max_tokens = int(max_raw) if max_raw is not None else DEFAULT_MAX_TOKENS  # type: ignore[arg-type]
+        max_tokens = int(max_raw) if max_raw is not None else DEFAULT_MAX_TOKENS
     except (TypeError, ValueError) as exc:
         raise ConfigError(
-            f"max_tokens {max_raw!r} (from {max_source}) is not a valid "
-            "integer."
+            f"max_tokens {max_raw!r} (from {max_source}) is not a valid integer."
         ) from exc
     if max_tokens <= 0:
         raise ConfigError(
@@ -3402,23 +3765,20 @@ def _resolve_settings(
         args.retries, "CODE_REVIEW_RETRIES", "retries", config
     )
     try:
-        retries = int(retries_raw) if retries_raw is not None else 0  # type: ignore[arg-type]
+        retries = int(retries_raw) if retries_raw is not None else 0
     except (TypeError, ValueError) as exc:
         raise ConfigError(
-            f"retries {retries_raw!r} (from {retries_source}) is not a "
-            "valid integer."
+            f"retries {retries_raw!r} (from {retries_source}) is not a valid integer."
         ) from exc
     if retries < 0:
-        raise ConfigError(
-            f"retries={retries} (from {retries_source}) must be >= 0."
-        )
+        raise ConfigError(f"retries={retries} (from {retries_source}) must be >= 0.")
 
     # Severity floor.
     severity_raw, severity_source = _layered(
         args.min_severity, "CODE_REVIEW_MIN_SEVERITY", "min_severity", config
     )
     min_severity = (
-        str(severity_raw).upper() if severity_raw is not None else "LOW"
+        str(severity_raw).strip().upper() if severity_raw is not None else "LOW"
     )
     if min_severity not in SEVERITY_LEVELS:
         raise ConfigError(
@@ -3430,6 +3790,8 @@ def _resolve_settings(
     format_raw, format_source = _layered(
         args.format, "CODE_REVIEW_FORMAT", "format", config
     )
+    if isinstance(format_raw, str):
+        format_raw = format_raw.strip()
     output_format = format_raw if format_raw is not None else "markdown"
     if output_format not in ("markdown", "json"):
         raise ConfigError(
@@ -3438,24 +3800,20 @@ def _resolve_settings(
         )
 
     # Safety context: --no-context wins, then explicit --context, then
-    # env, then project config, then default. Empty string from env is
-    # treated as "use default" rather than "disabled" -- pass
-    # --no-context explicitly to disable, since an env value of "" is
-    # more likely a misconfig than intent.
+    # env, then default. Empty string from env is treated as "use
+    # default" rather than "disabled" -- pass --no-context explicitly to
+    # disable, since an env value of "" is more likely a misconfig than
+    # intent. Project config deliberately CANNOT set context: the block
+    # is injected as trusted operator framing ahead of the injection
+    # guard, and the config file lives in the (possibly untrusted)
+    # reviewed repo -- accepting it would let that repo instruct its
+    # own reviewer.
     if args.no_context:
         context: str | None = None
     elif args.context is not None:
         context = args.context
     else:
-        context = (
-            os.getenv("CODE_REVIEW_CONTEXT")
-            or config.get("context")
-            or DEFAULT_CONTEXT
-        )
-        if not isinstance(context, str):
-            raise ConfigError(
-                f"{_PROJECT_CONFIG_NAME} key 'context' must be a string."
-            )
+        context = os.getenv("CODE_REVIEW_CONTEXT") or DEFAULT_CONTEXT
 
     api_key: str | None = None
     referer: str | None = None
@@ -3490,26 +3848,29 @@ def _resolve_settings(
                 "--provider ollama (local server, no key needed)."
             )
     else:  # ollama
-        # No API key for local provider. A window pinned by ANY config
-        # layer (CLI-less: env or project config) is user-specified and
-        # therefore enforced, exactly like $OLLAMA_NUM_CTX always was;
-        # the /api/ps-detected window is NOT a config layer -- it
-        # resolves per model per call in _execute_call.
+        # No API key for local provider. A window pinned by CLI or env
+        # is user-specified and therefore enforced, exactly like
+        # $OLLAMA_NUM_CTX always was; the /api/ps-detected window is NOT
+        # a config layer -- it resolves per model per call in
+        # _execute_call. All ollama_* settings are machine-local (where
+        # YOUR server is, what fits YOUR RAM) and security-sensitive (a
+        # hostile ollama_host would receive the full diff), so they are
+        # never read from the reviewed repo's project config -- the
+        # empty dict below keeps that layer out of the lookup.
         host_raw, host_source = _layered(
-            args.ollama_host, "OLLAMA_HOST", "ollama_host", config
+            args.ollama_host, "OLLAMA_HOST", "ollama_host", {}
         )
         if host_raw is not None and not isinstance(host_raw, str):
             raise ConfigError(
-                f"ollama_host {host_raw!r} (from {host_source}) must be a "
-                "string."
+                f"ollama_host {host_raw!r} (from {host_source}) must be a string."
             )
         ollama_host = _normalize_ollama_host(host_raw or DEFAULT_OLLAMA_HOST)
         num_ctx_raw, num_ctx_source = _layered(
-            None, "OLLAMA_NUM_CTX", "ollama_num_ctx", config
+            None, "OLLAMA_NUM_CTX", "ollama_num_ctx", {}
         )
         if num_ctx_raw is not None:
             try:
-                ollama_num_ctx_env = int(num_ctx_raw)  # type: ignore[arg-type]
+                ollama_num_ctx_env = int(num_ctx_raw)
             except (TypeError, ValueError) as exc:
                 raise ConfigError(
                     f"ollama_num_ctx {num_ctx_raw!r} (from {num_ctx_source}) "
@@ -3523,11 +3884,11 @@ def _resolve_settings(
                     f"{num_ctx_source}) must be positive (tokens)."
                 )
         timeout_raw, timeout_source = _layered(
-            None, "OLLAMA_TIMEOUT", "ollama_timeout", config
+            None, "OLLAMA_TIMEOUT", "ollama_timeout", {}
         )
         try:
             ollama_timeout = (
-                float(timeout_raw)  # type: ignore[arg-type]
+                float(timeout_raw)
                 if timeout_raw is not None
                 else DEFAULT_OLLAMA_TIMEOUT
             )
@@ -3598,6 +3959,7 @@ def _build_request(args: argparse.Namespace, settings: Settings) -> ReviewReques
                     return (p, p.stat().st_size)
                 except OSError:
                     return None
+
             sized_pairs = [pair for p in files if (pair := _safe_stat(p))]
             sized = sorted(sized_pairs, key=lambda x: x[1], reverse=True)
             largest = "\n".join(
@@ -3623,32 +3985,39 @@ def _build_request(args: argparse.Namespace, settings: Settings) -> ReviewReques
     else:
         if args.include or args.exclude:
             sys.stderr.write(
-                "WARN: --include / --exclude are ignored outside "
-                "--codebase mode.\n"
+                "WARN: --include / --exclude are ignored outside --codebase mode.\n"
             )
-        if args.pr:
-            diff = pr_diff(args.pr)
-        else:
-            diff = git_diff_local(args.base, args.staged)
+        diff = _read_diff_source(args)
         if not diff.strip():
             sys.stderr.write("No diff found. Nothing to review.\n")
             sys.exit(0)
         reference = ""
         if args.full_files:
             if args.pr:
+                _guard_pr_full_files(args.pr, args.repo)
+            elif args.staged and _run_git(["git", "diff", "--name-only"]).strip():
+                # --staged reviews the INDEX; the reference bodies come
+                # from the working tree. Unstaged edits make those two
+                # diverge -- warn rather than fail, since the divergence
+                # is the user's own visible state (same policy as the
+                # --pr dirty-tree case). Reading staged blobs via
+                # `git show :path` would close the gap entirely but
+                # needs the bundler to accept non-filesystem content.
                 sys.stderr.write(
-                    "WARN: --full-files with --pr reads file content from "
-                    "the LOCAL working tree; it matches the PR only if "
-                    "that branch is checked out.\n"
+                    "WARN: --staged reviews the index, but --full-files "
+                    "reads the working tree, which has unstaged edits -- "
+                    "reference content may not match the staged diff.\n"
                 )
             ref_paths = _filter_reviewable(changed_file_paths(args))
             reference = build_reference_section(ref_paths)
             if len(diff) + len(reference) > MAX_BUNDLE_CHARS:
+
                 def _safe_size(p: Path) -> tuple[Path, int] | None:
                     try:
                         return (p, p.stat().st_size)
                     except OSError:
                         return None
+
                 sized = sorted(
                     (pair for p in ref_paths if (pair := _safe_size(p))),
                     key=lambda x: x[1],
@@ -3679,7 +4048,9 @@ def _build_request(args: argparse.Namespace, settings: Settings) -> ReviewReques
     return request
 
 
-def _build_requests(args: argparse.Namespace, settings: Settings) -> list[ReviewRequest]:
+def _build_requests(
+    args: argparse.Namespace, settings: Settings
+) -> list[ReviewRequest]:
     """Build one request normally, or several when ``--chunk`` splits an
     oversized payload.
 
@@ -3692,7 +4063,7 @@ def _build_requests(args: argparse.Namespace, settings: Settings) -> list[Review
     if not args.chunk:
         return [_build_request(args, settings)]
 
-    budget, note = _chunk_budget(settings)
+    budget, note = _chunk_budget(settings, is_codebase=args.codebase)
     if note is not None:
         sys.stderr.write(f"WARN: {note}\n")
     severity_appendix = _min_severity_instruction(settings.min_severity)
@@ -3724,10 +4095,7 @@ def _build_requests(args: argparse.Namespace, settings: Settings) -> list[Review
             )
         return requests
 
-    if args.pr:
-        diff = pr_diff(args.pr)
-    else:
-        diff = git_diff_local(args.base, args.staged)
+    diff = _read_diff_source(args)
     if not diff.strip():
         sys.stderr.write("No diff found. Nothing to review.\n")
         sys.exit(0)
@@ -3745,6 +4113,39 @@ def _build_requests(args: argparse.Namespace, settings: Settings) -> list[Review
             )
         )
     return requests
+
+
+def _read_diff_source(args: argparse.Namespace) -> str:
+    """Fetch the diff for the active diff mode (git, gh, file, or stdin)."""
+    if args.diff_file is not None:
+        if args.diff_file == "-":
+            if sys.stdin.isatty():
+                # Reading a TTY blocks forever waiting for input the
+                # user doesn't know to type -- fail fast with the fix.
+                raise ConfigError(
+                    "--diff-file - reads the diff from stdin, but stdin "
+                    "is a terminal. Pipe a diff in (e.g. `git diff | "
+                    "code-review --diff-file -`) or pass a file path."
+                )
+            return sys.stdin.read()
+        try:
+            # utf-8-sig: tolerate Windows-editor BOMs like the other
+            # user-supplied files.
+            return Path(args.diff_file).read_text(encoding="utf-8-sig")
+        except OSError as exc:
+            raise ConfigError(
+                f"Cannot read --diff-file {args.diff_file!r}: {exc}"
+            ) from exc
+    if args.pr:
+        # Announce the resolved PR URL: without --repo, gh's default-repo
+        # logic decides which repository "--pr N" means, and on forks
+        # that default often points at UPSTREAM -- the URL makes a wrong
+        # resolution visible before tokens are spent (--dry-run included).
+        sys.stderr.write(
+            f"[gh] reviewing PR #{args.pr}: {pr_url(args.pr, args.repo)}\n"
+        )
+        return pr_diff(args.pr, args.repo)
+    return git_diff_local(args.base, args.staged)
 
 
 def _validate_flag_combos(args: argparse.Namespace) -> None:
@@ -3775,6 +4176,16 @@ def _validate_flag_combos(args: argparse.Namespace) -> None:
         raise ConfigError(
             "--full-files applies to diff modes only; --codebase already "
             "sends full file content."
+        )
+    if args.full_files and args.diff_file is not None:
+        raise ConfigError(
+            "--full-files needs the diff to come from this working tree "
+            "(git/gh); a --diff-file diff has no local files to reference."
+        )
+    if args.repo is not None and not args.pr:
+        raise ConfigError(
+            "--repo only applies to --pr (it pins which repository the "
+            "PR number refers to). Drop it, or add --pr N."
         )
 
 
@@ -3836,19 +4247,24 @@ def _execute_call(
     guard runs -- per model, per call, so multi-model panels (M3) get a
     fresh probe for each sequentially loaded model.
     """
+    # Bind narrowed locals before the lambdas: assert-narrowing on
+    # ``settings.x`` doesn't survive into a closure for mypy, and the
+    # non-None guarantees come from _resolve_settings' config checks.
     if settings.provider == "openrouter":
-        # mypy: non-None enforced by _resolve_settings' config checks.
-        assert settings.api_key is not None
-        assert settings.referer is not None
-        assert settings.title is not None
+        api_key = settings.api_key
+        referer = settings.referer
+        title = settings.title
+        assert api_key is not None
+        assert referer is not None
+        assert title is not None
         return _call_with_retries(
             lambda: call_openrouter(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 model=model,
-                api_key=settings.api_key,
-                referer=settings.referer,
-                title=settings.title,
+                api_key=api_key,
+                referer=referer,
+                title=title,
                 temperature=settings.temperature,
                 max_tokens=settings.max_tokens,
             ),
@@ -3856,13 +4272,17 @@ def _execute_call(
             retries=settings.retries,
         )
     if settings.provider == "gemini":
-        assert settings.api_key is not None
+        # Separate local (not ``api_key``) so each branch's variable has
+        # a single assignment -- mypy refuses to narrow a captured
+        # variable that is reassigned anywhere in the function.
+        gemini_key = settings.api_key
+        assert gemini_key is not None
         return _call_with_retries(
             lambda: call_gemini(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 model=model,
-                api_key=settings.api_key,
+                api_key=gemini_key,
                 temperature=settings.temperature,
                 max_tokens=settings.max_tokens,
             ),
@@ -3870,10 +4290,12 @@ def _execute_call(
             retries=settings.retries,
         )
     # ollama
-    assert settings.ollama_host is not None
-    assert settings.ollama_timeout is not None
+    host = settings.ollama_host
+    timeout = settings.ollama_timeout
+    assert host is not None
+    assert timeout is not None
     num_ctx, enforced, _source = _resolve_ollama_window(
-        settings.ollama_host, model, settings.ollama_num_ctx_env
+        host, model, settings.ollama_num_ctx_env
     )
     # Pre-flight context-window guard: refuse (typed CONTEXT_OVERFLOW)
     # rather than let Ollama silently truncate the prompt and review a
@@ -3896,10 +4318,10 @@ def _execute_call(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             model=model,
-            host=settings.ollama_host,
+            host=host,
             temperature=settings.temperature,
             max_tokens=settings.max_tokens,
-            timeout=settings.ollama_timeout,
+            timeout=timeout,
             num_ctx=num_ctx_to_send,
         ),
         label="ollama",
@@ -3999,12 +4421,9 @@ def _run_chunked(
                 settings, request.system_prompt, request.user_prompt, settings.model
             )
         except ReviewError:
-            done = (
-                f"chunks 1-{idx - 1} completed" if idx > 1 else "no chunks completed"
-            )
+            done = f"chunks 1-{idx - 1} completed" if idx > 1 else "no chunks completed"
             sys.stderr.write(
-                f"WARN: [chunk] {done}; chunk {idx} failed -- review is "
-                "incomplete.\n"
+                f"WARN: [chunk] {done}; chunk {idx} failed -- review is incomplete.\n"
             )
             raise
         usage_line = _format_usage_line(result, settings.provider, settings.model)
@@ -4012,6 +4431,10 @@ def _run_chunked(
             sys.stderr.write(f"[chunk {idx}/{n}] {usage_line}\n")
         label = request.chunk_label or f"chunk {idx}"
         parsed = parse_review_markdown_safe(result.content)
+        if settings.format == "json":
+            # Markdown chunk output streams the model's text verbatim;
+            # only the JSON envelope enforces the severity floor.
+            parsed = enforce_min_severity(parsed, settings.min_severity)
         chunk_data.append((label, parsed, result, result.content))
         if settings.format == "markdown":
             part = (
@@ -4069,12 +4492,40 @@ def main() -> None:
     source.add_argument(
         "--pr",
         type=int,
-        help="GitHub PR number to review (uses `gh pr diff`).",
+        help=(
+            "GitHub PR number to review (uses `gh pr diff`). Without "
+            "--repo, gh's own default-repo resolution decides which "
+            "repository the number refers to -- the runner announces "
+            "the resolved PR URL on stderr so a wrong default is "
+            "visible."
+        ),
+    )
+    parser.add_argument(
+        "--repo",
+        default=None,
+        metavar="OWNER/NAME",
+        help=(
+            "Pin the GitHub repository for --pr (passed to every gh "
+            "call). Recommended on forks, where gh's default "
+            "(`gh repo set-default`) often points at the upstream repo "
+            "and a bare --pr N would review the wrong project's PR."
+        ),
     )
     source.add_argument(
         "--staged",
         action="store_true",
         help="Review staged changes only.",
+    )
+    source.add_argument(
+        "--diff-file",
+        default=None,
+        metavar="PATH",
+        dest="diff_file",
+        help=(
+            "Review a unified diff read from this file instead of "
+            "invoking git ('-' reads stdin). Powers the eval harness "
+            "and lets other tools hand the runner a diff directly."
+        ),
     )
     source.add_argument(
         "--codebase",
@@ -4132,10 +4583,11 @@ def main() -> None:
             "value (``google/gemini-2.5-pro`` for openrouter, "
             "``gemini-2.5-pro`` for gemini, ``qwen3-coder:30b`` for "
             "ollama). Override with $OPENROUTER_MODEL / $GEMINI_MODEL / "
-            "$OLLAMA_MODEL respectively. Aliases: pro/flash/claude/"
-            "claude-opus/gpt/gpt-mini/deepseek (openrouter); "
-            "local/local-pro (ollama). ``gemini-2.5-flash`` / "
-            "``flash`` is ~3x faster with some quality loss."
+            "$OLLAMA_MODEL respectively. Aliases: pro/gemini-pro, "
+            "flash/gemini-flash, claude/claude-sonnet, claude-opus, "
+            "gpt, gpt-mini, deepseek (openrouter); local, local-pro "
+            "(ollama) -- full table in the README. ``flash`` is ~3x "
+            "faster than ``pro`` with some quality loss."
         ),
     )
     parser.add_argument(
@@ -4252,9 +4704,23 @@ def main() -> None:
         help=(
             "Only report findings at or above this severity "
             "(LOW/MEDIUM/HIGH/CRITICAL; case-insensitive). Default LOW "
-            "= no filter. Implemented as a fork-owned instruction "
-            "appended to the prompt; the upstream prompt files are "
-            "untouched."
+            "= no filter. Override with $CODE_REVIEW_MIN_SEVERITY. "
+            "Asked of the model via a fork-owned prompt appendix "
+            "(upstream prompt files untouched) and ENFORCED after "
+            "parsing wherever the runner synthesizes findings (--format "
+            "json envelopes, panel reports); verbatim markdown output "
+            "remains best-effort."
+        ),
+    )
+    parser.add_argument(
+        "--no-project-config",
+        action="store_true",
+        help=(
+            "Ignore any .code-review.toml found for the reviewed repo. "
+            "Recommended when auditing untrusted checkouts: the file "
+            "can shape the review (model, temperature, include/exclude "
+            "-- exclude can hide files from --codebase). Env and CLI "
+            "settings still apply."
         ),
     )
     parser.add_argument(
@@ -4329,9 +4795,9 @@ def main() -> None:
     _validate_flag_combos(args)
 
     # Per-project config from the REVIEWED repo (upward walk from CWD);
-    # loading one is always announced on stderr. API keys never come
-    # from it.
-    project_config = _load_project_config()
+    # loading one is always announced on stderr. API keys, context, and
+    # ollama_* never come from it; --no-project-config skips it whole.
+    project_config = {} if args.no_project_config else _load_project_config()
     _apply_config_file_lists(args, project_config)
 
     settings = _resolve_settings(args, project_config)
@@ -4359,22 +4825,23 @@ def main() -> None:
                 # raising. Every model gets its own probe.
                 notes = []
                 for panel_model in settings.models:
-                    num_ctx, enforced, source = _resolve_ollama_window(
-                        settings.ollama_host, panel_model,
+                    num_ctx, enforced, window_source = _resolve_ollama_window(
+                        settings.ollama_host,
+                        panel_model,
                         settings.ollama_num_ctx_env,
                     )
                     would_fail = (
-                        enforced
-                        and prompt_chars // OLLAMA_CHARS_PER_TOKEN >= num_ctx
+                        enforced and prompt_chars // OLLAMA_CHARS_PER_TOKEN >= num_ctx
                     )
                     suffix = " -- WOULD FAIL pre-flight" if would_fail else ""
                     notes.append(
-                        f"{panel_model}: {num_ctx:,} tokens ({source}){suffix}"
+                        f"{panel_model}: {num_ctx:,} tokens ({window_source}){suffix}"
                     )
                 ollama_window = "; ".join(notes)
             else:
-                num_ctx, enforced, source = _resolve_ollama_window(
-                    settings.ollama_host, settings.model,
+                num_ctx, enforced, window_source = _resolve_ollama_window(
+                    settings.ollama_host,
+                    settings.model,
                     settings.ollama_num_ctx_env,
                 )
                 # Run the same guard a live run would, so --dry-run exits
@@ -4386,7 +4853,7 @@ def main() -> None:
                     model=settings.model,
                     enforced=enforced,
                 )
-                ollama_window = f"{num_ctx:,} tokens ({source})"
+                ollama_window = f"{num_ctx:,} tokens ({window_source})"
         print(_dry_run_report(settings, request, ollama_window=ollama_window))
         return
 
@@ -4422,8 +4889,15 @@ def main() -> None:
             # the documented category precedence.
             raise _panel_exit_error(failures)
         raw_by_model = {m: r.content for m, r in results_by_model.items()}
+        # Panel reports are runner-synthesized in BOTH formats (the
+        # markdown is generated from parsed findings, not verbatim), so
+        # the severity floor is enforced before merging; the per-model
+        # raw appendix still shows everything.
         parsed_by_model = {
-            m: parse_review_markdown_safe(raw) for m, raw in raw_by_model.items()
+            m: enforce_min_severity(
+                parse_review_markdown_safe(raw), settings.min_severity
+            )
+            for m, raw in raw_by_model.items()
         }
         merged = merge_panel_findings(parsed_by_model)
         if settings.format == "json":
@@ -4464,12 +4938,22 @@ def main() -> None:
 
     # Structured-output tail: parse only when something consumes the
     # parse (--format json or --baseline); markdown stdout stays the
-    # model's verbatim output either way.
+    # model's verbatim output either way. In JSON mode the severity
+    # floor is enforced post-parse (on both current findings and the
+    # baseline, so `resolved` can't fill up with merely-filtered
+    # entries); markdown mode leaves it prompt-level best-effort, since
+    # the verbatim output shows everything anyway.
     parsed: ParsedReview | None = None
     statuses: list[str] | None = None
     resolved: list[dict] | None = None
     if settings.format == "json" or baseline_doc is not None:
         parsed = parse_review_markdown_safe(result.content)
+        if settings.format == "json":
+            parsed = enforce_min_severity(parsed, settings.min_severity)
+            if baseline_doc is not None:
+                baseline_doc = filter_baseline_findings(
+                    baseline_doc, settings.min_severity
+                )
     if baseline_doc is not None:
         assert parsed is not None
         if parsed.parse_ok:
@@ -4527,12 +5011,12 @@ def _entrypoint() -> None:
         # even for unexpected bugs, so an LLM caller can classify the
         # failure without parsing a raw traceback. The traceback still
         # ships in the Detail line for humans debugging the runner.
-        err = ReviewError(
+        wrapped = ReviewError(
             f"unhandled {type(exc).__name__}: {exc}",
             detail=traceback.format_exc(),
         )
-        _print_error(err)
-        sys.exit(err.exit_code)
+        _print_error(wrapped)
+        sys.exit(wrapped.exit_code)
 
 
 if __name__ == "__main__":
