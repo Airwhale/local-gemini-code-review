@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-import review
-from review import (
+import code_review.cli as review
+from code_review.cli import (
     CallResult,
     ConfigError,
     ContextOverflow,

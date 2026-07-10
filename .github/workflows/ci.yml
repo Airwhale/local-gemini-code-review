@@ -19,3 +19,7 @@ jobs:
         uses: astral-sh/setup-uv@v5
       - name: Run tests
         run: uv run --group dev pytest tests/ -v
+      - name: Build wheel and verify prompt assets ship inside it
+        run: |
+          uv build
+          uv run python -c "import glob, sys, zipfile; names = zipfile.ZipFile(glob.glob('dist/*.whl')[0]).namelist(); skills = [n for n in names if 'code_review/skills/' in n]; commands = [n for n in names if 'code_review/commands/' in n]; print(f'{len(skills)} skill files, {len(commands)} command files in wheel'); sys.exit(0 if skills and commands else 1)"
