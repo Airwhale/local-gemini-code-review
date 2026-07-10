@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 import code_review.cli as review
+from code_review import providers
 from code_review.cli import (
     BUILTIN_CODEBASE_EXCLUDES,
     INJECTION_GUARD,
@@ -328,14 +329,18 @@ class TestOllamaPostVerify:
     def test_unknown_window_reprobes(self, monkeypatch: pytest.MonkeyPatch):
         # Window wasn't sent (tier 3); the model is loaded post-call, so
         # /api/ps supplies the real window for verification.
-        monkeypatch.setattr(review, "_detect_ollama_num_ctx", lambda host, model: 4096)
+        monkeypatch.setattr(
+            providers, "_detect_ollama_num_ctx", lambda host, model: 4096
+        )
         with pytest.raises(ContextOverflow):
             review._ollama_post_verify(4090, None, host=self.HOST, model="m")
 
     def test_unknown_window_reprobe_fails_warns_and_skips(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
     ):
-        monkeypatch.setattr(review, "_detect_ollama_num_ctx", lambda host, model: None)
+        monkeypatch.setattr(
+            providers, "_detect_ollama_num_ctx", lambda host, model: None
+        )
         review._ollama_post_verify(50_000, None, host=self.HOST, model="m")
         err = capsys.readouterr().err
         assert err.startswith("WARN:")
@@ -520,7 +525,7 @@ class _FlakyCall:
 @pytest.fixture
 def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     recorded: list[float] = []
-    monkeypatch.setattr(review.time, "sleep", recorded.append)
+    monkeypatch.setattr(providers.time, "sleep", recorded.append)
     return recorded
 
 

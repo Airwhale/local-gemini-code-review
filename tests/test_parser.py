@@ -247,12 +247,12 @@ class TestParseFailureModes:
         assert not parsed.parse_ok
 
     def test_safe_wrapper_never_raises(self, monkeypatch: pytest.MonkeyPatch):
-        from code_review import cli as review_module
+        from code_review import parser as parser_module
 
         def _boom(_text: str):
             raise RuntimeError("parser bug")
 
-        monkeypatch.setattr(review_module, "parse_review_markdown", _boom)
+        monkeypatch.setattr(parser_module, "parse_review_markdown", _boom)
         parsed = parse_review_markdown_safe("anything")
         assert not parsed.parse_ok
         assert any("parser crashed" in p for p in parsed.problems)

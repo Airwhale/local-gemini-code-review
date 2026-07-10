@@ -2,7 +2,13 @@
 
 Notable user-facing changes, newest first. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); the version is the wheel version in `pyproject.toml`. The exit-code table and `ERROR:` stderr contract are public API — breaking changes to them will always be called out here explicitly.
 
-## [0.2.0] — unreleased (PR stack #3–#9)
+## [Unreleased]
+
+### Changed
+
+- **Module split**: the single-file `code_review/cli.py` (~5,000 lines) is now nine focused modules (`errors`, `prompts`, `providers`, `sources`, `parser`, `panel`, `chunking`, `config`, plus a slimmed orchestrating `cli`). No behavior change; `from code_review.cli import X` keeps working (cli re-exports the full surface) and the console entry point is unchanged. See the code map in `docs/architecture.md`.
+
+## [0.2.0] — 2026-07-07
 
 The M1–M7 roadmap: the single-file runner became an installable, testable, agent-friendly tool.
 

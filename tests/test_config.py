@@ -4,6 +4,7 @@ per-project .code-review.toml, and the 4-layer settings precedence."""
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 from typing import Any
 
@@ -123,7 +124,7 @@ class TestPromptRoot:
 
 class TestUserConfigDir:
     def test_windows_uses_appdata(self, monkeypatch: pytest.MonkeyPatch):
-        if review.os.name != "nt":
+        if os.name != "nt":
             pytest.skip("windows-only expectation")
         monkeypatch.setenv("APPDATA", r"C:\Users\t\AppData\Roaming")
         assert _user_config_dir() == Path(r"C:\Users\t\AppData\Roaming\code-review")
@@ -148,9 +149,9 @@ class TestLoadEnvFiles:
         monkeypatch.setenv("CODE_REVIEW_ENV", str(env_file))
         monkeypatch.delenv("M6_TEST_MARKER", raising=False)
         _load_env_files()
-        assert review.os.environ["M6_TEST_MARKER"] == "from-file"
+        assert os.environ["M6_TEST_MARKER"] == "from-file"
         # override=False: the process env (set by the fixture) wins.
-        assert review.os.environ["OPENROUTER_API_KEY"] == "test-key"
+        assert os.environ["OPENROUTER_API_KEY"] == "test-key"
         monkeypatch.delenv("M6_TEST_MARKER", raising=False)
 
 

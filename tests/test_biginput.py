@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 import code_review.cli as review
+from code_review import chunking, sources
 from code_review.cli import (
     CallResult,
     ConfigError,
@@ -142,7 +143,7 @@ class TestChangedFilePaths:
             calls.append(args)
             return "one.py\ntwo.py\n"
 
-        monkeypatch.setattr(review, "_run_git", fake_run_git)
+        monkeypatch.setattr(sources, "_run_git", fake_run_git)
         return calls
 
     def test_staged(self, monkeypatch: pytest.MonkeyPatch):
@@ -173,7 +174,7 @@ class TestRebaseRepoRelative:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr(review, "_run_git", lambda a: str(tmp_path) + "\n")
+        monkeypatch.setattr(sources, "_run_git", lambda a: str(tmp_path) + "\n")
         paths = [Path("src/x.py")]
         assert review._rebase_repo_relative(paths) == paths
 
@@ -185,7 +186,7 @@ class TestRebaseRepoRelative:
         sub = tmp_path / "sub"
         sub.mkdir()
         monkeypatch.chdir(sub)
-        monkeypatch.setattr(review, "_run_git", lambda a: str(tmp_path) + "\n")
+        monkeypatch.setattr(sources, "_run_git", lambda a: str(tmp_path) + "\n")
         [rebased] = review._rebase_repo_relative([Path("src/x.py")])
         assert not rebased.is_absolute()
         assert rebased.resolve() == (tmp_path / "src" / "x.py").resolve()
@@ -200,14 +201,14 @@ class TestDiffFileStdin:
     def test_tty_stdin_is_config_error(self, monkeypatch: pytest.MonkeyPatch):
         # Reading a TTY would block forever waiting for input the user
         # doesn't know to type.
-        monkeypatch.setattr(review.sys, "stdin", self._TTY())
+        monkeypatch.setattr(sources.sys, "stdin", self._TTY())
         args = argparse.Namespace(diff_file="-", pr=None)
         with pytest.raises(ConfigError) as exc_info:
             review._read_diff_source(args)
         assert "stdin is a terminal" in str(exc_info.value)
 
     def test_piped_stdin_reads(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setattr(review.sys, "stdin", io.StringIO("diff x\n"))
+        monkeypatch.setattr(sources.sys, "stdin", io.StringIO("diff x\n"))
         args = argparse.Namespace(diff_file="-", pr=None)
         assert review._read_diff_source(args) == "diff x\n"
 
@@ -228,7 +229,7 @@ class TestGhRepoPin:
             calls.append(list(args))
             return self._Result()
 
-        monkeypatch.setattr(review.subprocess, "run", fake_run)
+        monkeypatch.setattr(sources.subprocess, "run", fake_run)
         return calls
 
     def test_repo_appended_to_every_gh_call(self, monkeypatch: pytest.MonkeyPatch):
@@ -257,9 +258,9 @@ class TestGhRepoPin:
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
     ):
         monkeypatch.setattr(
-            review, "pr_url", lambda pr, repo=None: "https://github.com/o/n/pull/7"
+            sources, "pr_url", lambda pr, repo=None: "https://github.com/o/n/pull/7"
         )
-        monkeypatch.setattr(review, "pr_diff", lambda pr, repo=None: "diff text")
+        monkeypatch.setattr(sources, "pr_diff", lambda pr, repo=None: "diff text")
         args = argparse.Namespace(diff_file=None, pr=7, repo=None)
         assert review._read_diff_source(args) == "diff text"
         err = capsys.readouterr().err
@@ -281,7 +282,7 @@ class TestGuardPrFullFiles:
         local_head: str,
         dirty: bool = False,
     ) -> None:
-        monkeypatch.setattr(review, "pr_head_sha", lambda pr, repo=None: pr_head)
+        monkeypatch.setattr(sources, "pr_head_sha", lambda pr, repo=None: pr_head)
 
         def fake_run_git(args: list[str]) -> str:
             if args[:3] == ["git", "rev-parse", "HEAD"]:
@@ -290,7 +291,7 @@ class TestGuardPrFullFiles:
                 return " M code_review/cli.py\n" if dirty else ""
             raise AssertionError(f"unexpected git call: {args}")
 
-        monkeypatch.setattr(review, "_run_git", fake_run_git)
+        monkeypatch.setattr(sources, "_run_git", fake_run_git)
 
     def test_head_mismatch_is_config_error(self, monkeypatch: pytest.MonkeyPatch):
         self._patch(monkeypatch, pr_head=self.HEAD, local_head=self.OTHER)
@@ -384,7 +385,7 @@ class TestChunkBudget:
 
     def test_ollama_enforced_window(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(
-            review, "_resolve_ollama_window", lambda h, m, e: (32768, True, "env")
+            chunking, "_resolve_ollama_window", lambda h, m, e: (32768, True, "env")
         )
         budget, note = _chunk_budget(
             _settings(provider="ollama", ollama_host="http://x", ollama_timeout=1.0)
@@ -396,7 +397,7 @@ class TestChunkBudget:
 
     def test_ollama_unknown_window_warns(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(
-            review,
+            chunking,
             "_resolve_ollama_window",
             lambda h, m, e: (review.DEFAULT_OLLAMA_NUM_CTX, False, "advisory-default"),
         )
@@ -408,7 +409,7 @@ class TestChunkBudget:
 
     def test_ollama_overhead_exceeds_window(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(
-            review, "_resolve_ollama_window", lambda h, m, e: (128, True, "env")
+            chunking, "_resolve_ollama_window", lambda h, m, e: (128, True, "env")
         )
         with pytest.raises(ContextOverflow):
             _chunk_budget(
@@ -422,13 +423,13 @@ class TestChunkBudget:
         # measuring diff overhead for --codebase chunks would oversize
         # them and trip the post-call truncation verify.
         monkeypatch.setattr(
-            review, "_resolve_ollama_window", lambda h, m, e: (8000, True, "env")
+            chunking, "_resolve_ollama_window", lambda h, m, e: (8000, True, "env")
         )
         monkeypatch.setattr(
-            review, "build_diff_prompts", lambda payload, ctx: ("s" * 100, "u" * 100)
+            chunking, "build_diff_prompts", lambda payload, ctx: ("s" * 100, "u" * 100)
         )
         monkeypatch.setattr(
-            review,
+            chunking,
             "build_codebase_prompts",
             lambda payload, ctx: ("s" * 500, "u" * 500),
         )

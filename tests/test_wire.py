@@ -14,7 +14,7 @@ from typing import Any
 import httpx
 import pytest
 
-import code_review.cli as review
+from code_review import providers
 from code_review.cli import (
     CallResult,
     ConfigError,
@@ -32,7 +32,7 @@ from code_review.cli import (
 def _mock(monkeypatch: pytest.MonkeyPatch, handler) -> None:
     transport = httpx.MockTransport(handler)
     monkeypatch.setattr(
-        review,
+        providers,
         "_make_client",
         lambda timeout: httpx.Client(transport=transport, timeout=timeout),
     )
@@ -492,7 +492,7 @@ class TestApiPsProbeWire:
                 }
             ),
         )
-        assert review._detect_ollama_num_ctx("http://localhost:11434", "m") == 32768
+        assert providers._detect_ollama_num_ctx("http://localhost:11434", "m") == 32768
 
     def test_missing_field_returns_none(self, monkeypatch):
         _mock(
@@ -503,22 +503,22 @@ class TestApiPsProbeWire:
                 }
             ),
         )
-        assert review._detect_ollama_num_ctx("http://localhost:11434", "m") is None
+        assert providers._detect_ollama_num_ctx("http://localhost:11434", "m") is None
 
     def test_non_200_returns_none(self, monkeypatch):
         _mock(monkeypatch, lambda req: httpx.Response(500, text="down"))
-        assert review._detect_ollama_num_ctx("http://x", "m") is None
+        assert providers._detect_ollama_num_ctx("http://x", "m") is None
 
     def test_top_level_non_dict_returns_none(self, monkeypatch):
         _mock(monkeypatch, lambda req: _json_response([]))
-        assert review._detect_ollama_num_ctx("http://x", "m") is None
+        assert providers._detect_ollama_num_ctx("http://x", "m") is None
 
     def test_transport_error_returns_none(self, monkeypatch):
         def handler(req):
             raise httpx.ConnectError("refused", request=req)
 
         _mock(monkeypatch, handler)
-        assert review._detect_ollama_num_ctx("http://x", "m") is None
+        assert providers._detect_ollama_num_ctx("http://x", "m") is None
 
     def test_probe_and_chat_share_the_seam(self, monkeypatch):
         """One path-dispatching transport serves /api/ps AND /api/chat --
@@ -549,7 +549,7 @@ class TestApiPsProbeWire:
             )
 
         _mock(monkeypatch, handler)
-        window = review._detect_ollama_num_ctx("http://localhost:11434", "m")
+        window = providers._detect_ollama_num_ctx("http://localhost:11434", "m")
         result = _ollama(num_ctx=window)
         assert window == 8192
         assert result.content == "ok"

@@ -1,6 +1,6 @@
 [project]
 name = "local-gemini-code-review"
-version = "0.2.0"
+version = "0.3.0"
 description = "Multi-provider code review runner (OpenRouter, Gemini API, local Ollama) using the Gemini CLI code-review extension prompts."
 requires-python = ">=3.11"
 dependencies = [

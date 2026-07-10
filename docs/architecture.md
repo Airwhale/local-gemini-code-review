@@ -61,13 +61,23 @@ A one-page map of how a review request flows through the runner, the design deci
 
 **Windows is a first-class target.** Explicit `encoding="utf-8"` on every file/subprocess boundary (cp1252 mojibake in diffs produced *phantom review findings* in early testing), `utf-8-sig` where Windows editors write BOMs, stdout reconfigured to UTF-8. CI runs the suite on windows-latest for this reason.
 
-**One module, deliberately (for now).** `code_review/cli.py` is large but linearly organized (section map below). It was kept whole while the M1–M7 stack was in flight so refactors wouldn't invalidate open PRs; a module split is the planned next structural change once the stack lands.
+**`cli.py` is the stable import path.** The runner was a single module through the M1–M7 stack (kept whole so refactors wouldn't invalidate open PRs) and was split afterward. `code_review/cli.py` re-exports the full surface, so `from code_review.cli import X` keeps working for tests, the `review.py` shim, and any downstream scripts; the console entry point stays `code_review.cli:_entrypoint`. Tests monkeypatch the *owning* module (patching a re-export in `cli` doesn't affect callers inside the sibling modules).
 
 ## Code map
 
+The import graph is acyclic, top to bottom:
+
 | Path | What it is |
 |---|---|
-| `code_review/cli.py` | The runner. In file order: error hierarchy + exit codes → constants (providers, aliases, safety context, injection guard) → prompt-asset resolution (`_prompt_root`, loaders) → diff/codebase sources (`git`/`gh` subprocesses) → provider callers + HTTP classification + `_make_client` seam → Ollama window logic → markdown parser + fingerprints + envelopes → panel engine → chunk engine → env/config layering (`_load_env_files`, `_load_project_config`, `_layered`) → `_resolve_settings` / `_build_request` / `_execute_call` → `main()` / `_entrypoint()`. |
+| `code_review/errors.py` | The typed error model: exception hierarchy → exit codes, and the `ERROR:` stderr block renderer. No project imports. |
+| `code_review/prompts.py` | Prompt assets and assembly: upstream skill/command loading (`_prompt_root` tiers), the safety-context + injection-guard wrapper, severity ladder + `--min-severity` appendix, payload caps, file bundling/numbering, the `<REFERENCE_FILES>` block. |
+| `code_review/providers.py` | The wire layer: `_make_client` seam, the three `call_*` functions, HTTP-error classification, retry policy, model aliases/defaults, and the Ollama window machinery (probe → guard → post-call verify). |
+| `code_review/sources.py` | What gets reviewed: git/gh subprocess plumbing (repo-pinned PR calls + the `[gh]` announce), `--diff-file`/stdin, codebase gathering/filtering, subdirectory path re-basing. |
+| `code_review/parser.py` | Structured output: the markdown findings parser (fence-aware state machine), fingerprints, `--baseline` diffing, severity enforcement, and the single/chunked JSON envelopes. |
+| `code_review/panel.py` | Panel pure logic: consensus matching/merge, the panel markdown report and envelope, all-failed exit precedence. |
+| `code_review/chunking.py` | `--chunk`: lossless file-boundary splitting, next-fit packing, and the per-chunk budget math (bundle cap / enforced Ollama window). |
+| `code_review/config.py` | Settings resolution: `.env` layering, the untrusted `.code-review.toml` (capped keys), `_layered` precedence, model resolution, the frozen `Settings`/`ReviewRequest` shapes. |
+| `code_review/cli.py` | Orchestration: argparse, `_build_request(s)`, `_execute_call` (provider dispatch + per-call window resolution), panel/chunk run loops, `main()`/`_entrypoint()` — plus the compatibility facade re-exporting the sibling modules' surface. |
 | `review.py` | 11-line back-compat shim so `uv run review.py` keeps working from a checkout. Not an API surface. |
 | `code_review/__init__.py` | `__version__` from package metadata. |
 | `skills/`, `commands/` | Prompt assets at the repo root (upstream files byte-identical; `code-review-codebase` is fork-added). Force-included into the wheel as package data. |
