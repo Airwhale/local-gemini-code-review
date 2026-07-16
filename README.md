@@ -319,12 +319,13 @@ Runs the same review through several models (concurrently on cloud, capped at 4;
 
 ## Per-project configuration (`.code-review.toml`)
 
-Put a `.code-review.toml` in any repo you review (found by upward walk from the working directory, stopping at `.git`); it supplies project defaults for `provider`, `model`, `models`, `temperature`, `max_tokens`, `retries`, `min_severity`, `format`, `include`, `exclude`.
+Put a `.code-review.toml` in any repo you review (found by upward walk from the working directory, stopping at `.git`); it supplies project defaults for `provider`, `model`, `models`, `temperature`, `max_tokens`, `retries`, `min_severity`, `min_found_by`, `format`, `include`, `exclude`.
 
 ```toml
 # .code-review.toml — this project reviews with a pro+flash panel and skips generated code
 models = ["pro", "flash"]
 min_severity = "MEDIUM"
+min_found_by = 2            # only findings BOTH models raised independently
 exclude = ["generated/**", "**/*_pb2.py"]
 ```
 
