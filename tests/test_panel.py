@@ -278,6 +278,7 @@ def _args(**overrides) -> argparse.Namespace:
         max_tokens=None,
         retries=None,
         min_severity="LOW",
+        min_found_by=None,
         context=None,
         no_context=False,
         output=None,

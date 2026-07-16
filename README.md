@@ -198,9 +198,14 @@ A 700,000-char (~175K-token) bundle cap is enforced pre-flight — conservative 
 - `--output <path>`: also write the review (exact stdout content) to a file, UTF-8/LF — no `tee` gymnastics on Windows, and the natural way to save rounds for `--baseline`.
 - `--dry-run`: resolve config, gather the payload, build the prompts, print a report (provider/model/temperature, prompt sizes, estimated tokens, the Ollama window + its source, the codebase file list) — and exit **without calling the model**. Read-only subprocesses (git, `gh pr diff`) and the read-only Ollama `/api/ps` probe still run, so exit-12 behavior matches a live run exactly. The best way to debug `--include`/`--exclude`.
 - `--ollama-host <url>` (env `OLLAMA_HOST`, default `http://localhost:11434`): Ollama server URL for this call; scheme-less `host:port` accepted.
+- `--list-models`: print the model aliases and per-provider defaults, then exit. Offline and instant — it answers "what do I type for `--model`", not "what are OpenRouter's 300 models". No API key or repo needed.
 - `--version`: print the installed version and exit.
 
 After each successful call, a `[usage] prompt=… completion=… total=… tokens (provider/model)` stderr line reports what the provider billed (never estimated).
+
+**Cost, before you spend it.** A `[cost] est ~$0.17 -- ceiling: prompt ~7,388 tok + completion <= 16,000 tok` line prints alongside "Reviewing…", and `--dry-run` reports the same as `est_cost`. It's an honest **ceiling**, not a prediction: the prompt side is estimated (chars/4 — no local tokenizer) and the completion side is bounded by `--max-tokens` rather than guessed. Panels sum every model. Prices come from OpenRouter's live feed (cached for a day in your config dir), so they can't silently go stale; Ollama reports `$0.00 (local)`. **When pricing can't be sourced the line is simply omitted** — for `--provider gemini` (no unauthenticated price feed), an unknown slug, or an unreachable feed. Same rule as `[usage]`: this tool never invents a number about money.
+
+Long calls print `... still waiting (45s elapsed)` every 15s **when stderr is a terminal**, so a slow model is distinguishable from a hang. Piped/redirected runs stay byte-for-byte identical — the stderr contract for agent callers is unchanged.
 
 ## Advanced
 
@@ -227,6 +232,7 @@ After each successful call, a `[usage] prompt=… completion=… total=… token
       "suggestion": "for attempt in …",  // null when none offered
       "fingerprint": "a1b2c3d4e5f6",     // stable finding identity
       "in_hunk": true,               // diff modes: is `line` inside a changed hunk?
+      "needs_verification": false,   // model flagged it as resting on unseen code
       "status": "new"                // only when --baseline was given
     }
   ],
@@ -250,6 +256,10 @@ A formal [JSON Schema](./docs/schema/review-envelope.schema.json) describes the 
 | `null` | Unknown / not applicable: `--codebase` mode, no line cited, or the model's path matches no diff path (or matches ambiguously) | **Verify before posting** — `null` is "can't say", *not* "no" |
 
 Ranges are inclusive and use post-image (RIGHT-side) line numbers — the same coordinates GitHub uses. Path matching is exact-then-unique-suffix, so a model citing `x.py` still resolves against `src/x.py`; two files sharing a basename stay `null` rather than guess.
+
+> **Caveat — `in_hunk` describes *the diff you reviewed*, not necessarily GitHub's.** Local diff modes use `-U5` (5 lines of context); GitHub serves PR diffs with its own (narrower) context. So a line in the tool's context window but outside GitHub's could be `in_hunk: true` here and still 422 there. With `--pr` this can't happen — the diff *is* GitHub's, via `gh pr diff`. For `--base` → post-to-a-PR workflows, read `true` as "postable against the reviewed diff", and be ready for a 422 on the edges.
+
+**`needs_verification`** is the companion field. The diff-mode prompt asks models to prefix a title `NEEDS-VERIFICATION:` when a finding depends on code they couldn't see; the parser lifts that into a boolean and strips the marker from `title`. Two consequences worth knowing: fingerprints stay stable whether or not the model hedged (so `--baseline` doesn't report a hedged re-run as a brand-new finding), and an agent can triage on the field instead of string-matching titles. Treat `needs_verification: true` as *check this against the file first* — it's the model telling you it guessed.
 
 `--baseline <prior.json>` compares current findings against a previous `--format json` run: each finding gets `status: "new" | "persisting"`, disappeared findings are listed under `resolved`, and a `[baseline] N finding(s): X new, Y persisting, Z resolved` line lands on stderr (markdown mode keeps stdout verbatim). The loop:
 
@@ -304,6 +314,7 @@ Runs the same review through several models (concurrently on cloud, capped at 4;
 - **JSON**: `models[]`, per-finding `found_by`, a `per_model[]` array (parse status, usage, truncation, or the typed error for failures), summed usage.
 - **Merging is deliberately conservative**: exact fingerprint, or same location *and* same severity — consensus must not be manufactured from two models disagreeing about the same hunk.
 - **Exit contract**: ≥1 model succeeded → **exit 0** (failures as `WARN: [panel] <model> failed: …` stderr lines, machine-readable in `per_model`). All failed → one `ERROR:` block chosen by precedence `CONFIG > SAFETY_REFUSAL > CONTEXT_OVERFLOW > RATE_LIMIT > PROVIDER_HICCUP > TRANSPORT > UNKNOWN` (CLI-order ties).
+- **`--min-found-by N`** turns that signal into a filter: drop merged findings fewer than N models reported. `--min-found-by 2` keeps only what two models found *independently* — the highest-precision, lowest-effort noise filter available here. Applied after merging, to **both** formats (panel markdown is runner-synthesized too), with a `[panel] --min-found-by 2: dropped 7 finding(s)…` line on stderr; the per-model raw appendix still shows everything. Needs `--models` (a consensus count is meaningless for one model — asking for it alone is a typed `CONFIG` error). Env: `CODE_REVIEW_MIN_FOUND_BY`; also settable in `.code-review.toml`.
 - Mutually exclusive with `--model`; `--baseline` isn't supported with panels yet; per-model temperatures and streaming are out of scope.
 
 ## Per-project configuration (`.code-review.toml`)
@@ -458,7 +469,8 @@ This tool is built to be invoked by AI coding agents as an iteration partner dur
 **Three things that exist specifically for you:**
 
 - **`in_hunk` tells you what you can post.** Turning findings into GitHub review comments? Only `in_hunk: true` can carry an inline ```suggestion``` (GitHub 422s anything else); `false` belongs in the review body; `null` means verify first. See [Structured output](#structured-output---format-json-and-round-over-round-diffing---baseline). Don't re-parse the diff to work this out — it's in the envelope.
-- **Cross-model agreement is your cheapest precision filter.** A finding one model raises is usually noise; one two models raise independently is usually real. Prefer `--models pro,gpt,deepseek --format json` and read `found_by` before you spend a round chasing a single-model claim. Set `CODE_REVIEW_NO_TIPS=1` to silence the reminder in scripted runs.
+- **Cross-model agreement is your cheapest precision filter.** A finding one model raises is usually noise; one two models raise independently is usually real. Prefer `--models pro,gpt,deepseek --format json` and read `found_by` — or just let the tool do it: **`--min-found-by 2`** drops everything below the consensus floor. Set `CODE_REVIEW_NO_TIPS=1` to silence the reminder in scripted runs.
+- **`needs_verification: true` is the model admitting it guessed.** It means the finding rests on code outside the shown hunks. Check it against the file before spending a round on it — and note these are exactly the findings that turn out to be phantom "X is undefined / missing" claims.
 - **Know what the model could see.** Diff reviews carry an evidence-discipline rule, and changed files are auto-attached when they fit (`Full-file context: on` on stderr). If they *weren't* attached, treat "X is missing / undefined / never called" claims as unverified by construction — the model was looking at a keyhole. Findings prefixed `NEEDS-VERIFICATION:` are the model telling you it guessed; check them against the file before acting.
 
 ## Error model (for LLM callers)
@@ -519,6 +531,9 @@ Non-error stderr lines use a fixed prefix vocabulary — **no informational line
 | `NOTE: full-file context … would exceed …` | Auto full-files declined (over the cap); reviewing hunks only. Informational — not an error, and not emitted for an explicit `--full-files` (that's a typed `CONTEXT_OVERFLOW`) |
 | `WARN: <base> has N commit(s) not in HEAD…` | `--base` drift: `git diff <base>` is two-dot, so base-only commits show up as removals and may be reported as intentional deletions. Rebase, or diff the merge-base |
 | `TIP: --models …` | Single-model run; panel mode cross-checks and filters noise. Silence with `CODE_REVIEW_NO_TIPS=1` |
+| `[cost] est …` | Pre-call cost **ceiling** (see [Everyday flags](#everyday-flags)). Omitted entirely when pricing can't be sourced — never estimated from a stale table |
+| `[panel] --min-found-by N: dropped …` | Findings removed by the consensus floor |
+| `... still waiting (Ns elapsed)` | Long call in flight. **TTY only** — never emitted when stderr is piped, so the machine-readable contract is unchanged |
 | `No diff found…` / `No files matched…` | Empty scope — the run exits 0 without calling the model |
 | `Interrupted.` | Ctrl-C / SIGINT (exit 130) |
 

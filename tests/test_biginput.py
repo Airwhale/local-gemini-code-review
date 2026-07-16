@@ -328,6 +328,7 @@ def _combo_args(**overrides) -> argparse.Namespace:
     base: dict[str, Any] = dict(
         chunk=False,
         models=None,
+        min_found_by=None,
         full_files=False,
         baseline=None,
         codebase=False,

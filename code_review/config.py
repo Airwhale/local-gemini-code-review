@@ -175,6 +175,7 @@ _PROJECT_CONFIG_KEYS = frozenset(
         "max_tokens",
         "retries",
         "min_severity",
+        "min_found_by",
         "format",
         "include",
         "exclude",
@@ -290,6 +291,11 @@ class Settings:
     format: str = "markdown"
     baseline: str | None = None
     models: tuple[str, ...] | None = None  # panel mode (--models)
+    # Panel consensus floor: drop merged findings raised by fewer than N
+    # models. 1 = keep everything (default). Cross-model agreement is the
+    # cheapest high-precision filter this tool has, so this makes it a flag
+    # instead of a post-processing chore.
+    min_found_by: int = 1
     api_key: str | None = None
     referer: str | None = None
     title: str | None = None
@@ -467,6 +473,23 @@ def _resolve_settings(
         raise ConfigError(
             f"min_severity {severity_raw!r} (from {severity_source}) is "
             "not valid. Use one of: " + ", ".join(SEVERITY_LEVELS) + "."
+        )
+
+    # Panel consensus floor. Validated even without --models so a typo in a
+    # .code-review.toml surfaces at config time rather than silently doing
+    # nothing on the next panel run.
+    found_by_raw, found_by_source = _layered(
+        args.min_found_by, "CODE_REVIEW_MIN_FOUND_BY", "min_found_by", config
+    )
+    try:
+        min_found_by = 1 if found_by_raw is None else int(found_by_raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            f"min_found_by {found_by_raw!r} (from {found_by_source}) is not an integer."
+        ) from exc
+    if min_found_by < 1:
+        raise ConfigError(
+            f"min_found_by={min_found_by} (from {found_by_source}) must be >= 1."
         )
 
     # Output format.

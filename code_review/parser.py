@@ -68,10 +68,48 @@ class Finding:
     body: str
     suggestion: str | None
     in_hunk: bool | None = None
+    # True when the model prefixed the title `NEEDS-VERIFICATION:` -- i.e.
+    # it is telling you the finding rests on code it could not see. The
+    # marker is stripped from `title`; see `_split_needs_verification`.
+    needs_verification: bool = False
 
 
-# `+++ b/path` gives the post-image path; `/dev/null` for deletions.
-_DIFF_NEW_PATH_RE = re.compile(r"^\+\+\+ (?:b/)?(.+)$", re.M)
+# The prompt's evidence rule asks models to prefix a title with
+# `NEEDS-VERIFICATION:` when the finding depends on code outside the shown
+# hunks. Recognize it tolerantly (models drift on case/spacing/punctuation)
+# and lift it into a structured field: a caller filtering "did the model
+# admit it guessed?" shouldn't have to string-match a title.
+#
+# Stripping it from the title also keeps finding identity stable: the
+# fingerprint hashes the normalized title, so a model that hedges in round 2
+# but not round 1 would otherwise look like a brand-new finding to
+# --baseline.
+# Trailing `\**` matters: models bold the whole marker including the colon
+# (`**NEEDS-VERIFICATION:** X`), which would otherwise leave `** X` behind.
+_NEEDS_VERIFICATION_RE = re.compile(
+    r"^\s*\**\s*NEEDS[\s_-]*VERIFICATION\s*\**\s*[:\-–—]\s*\**\s*", re.I
+)
+
+
+def _split_needs_verification(title: str) -> tuple[str, bool]:
+    """Strip a leading ``NEEDS-VERIFICATION:`` marker off ``title``.
+
+    Returns ``(clean_title, flagged)``. A title that is *only* the marker
+    keeps its original text rather than becoming empty.
+    """
+    stripped = _NEEDS_VERIFICATION_RE.sub("", title, count=1)
+    if stripped == title:
+        return title, False
+    stripped = stripped.strip()
+    return (stripped or title), True
+
+
+# `+++ b/path` gives the post-image path. Split on tab first: unified diffs
+# from non-git tools (GNU `diff -u`, which --diff-file explicitly accepts)
+# append a timestamp -- `+++ b/x.py\t2026-07-16 10:00:00`. Without this the
+# path captures the timestamp too and matches nothing, silently degrading
+# every finding in that file to `in_hunk: null`.
+_DIFF_NEW_PATH_RE = re.compile(r"^\+\+\+ (?:b/)?([^\t\n]+)", re.M)
 # `@@ -old,n +new,m @@` -- only the post-image side matters: GitHub anchors
 # review comments on RIGHT-side line numbers. The count is optional (`+12`
 # means a one-line hunk).
@@ -342,6 +380,7 @@ def parse_review_markdown(text: str) -> ParsedReview:
             return
         line, severity, title = open_heading
         body, suggestion = _extract_suggestion(body_lines)
+        title, needs_verification = _split_needs_verification(title)
         findings.append(
             Finding(
                 file=open_file,
@@ -350,6 +389,7 @@ def parse_review_markdown(text: str) -> ParsedReview:
                 title=title,
                 body=body,
                 suggestion=suggestion,
+                needs_verification=needs_verification,
             )
         )
         open_heading = None

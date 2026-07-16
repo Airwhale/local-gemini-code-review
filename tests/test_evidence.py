@@ -17,13 +17,24 @@ No network, no git, no Ollama server required.
 
 from __future__ import annotations
 
+import pytest
+
+import code_review.providers as providers
 import code_review.sources as sources
-from code_review.parser import Finding, annotate_in_hunk, hunk_ranges
+from code_review.parser import (
+    Finding,
+    _split_needs_verification,
+    annotate_in_hunk,
+    finding_fingerprint,
+    hunk_ranges,
+    parse_review_markdown_safe,
+)
 from code_review.prompts import (
     DIFF_EVIDENCE_RULE,
     FULL_FILES_EVIDENCE_RULE,
     build_diff_prompts,
 )
+from code_review.providers import estimate_cost_usd, format_cost
 
 _DIFF = "--- a/x.py\n+++ b/x.py\n@@ -1,2 +1,2 @@\n-a = 1\n+a = 2\n"
 
@@ -145,6 +156,101 @@ class TestDiffEvidenceRule:
         _, user = build_diff_prompts(_DIFF, None)
         assert "Evidence discipline" in user
         assert "<CONTEXT_FOR_REVIEWER>" not in user
+
+
+class TestNeedsVerification:
+    """The evidence rule asks models to hedge with a title prefix; the
+    parser lifts that into a field so callers don't string-match titles."""
+
+    def test_marker_variants_are_recognised_and_stripped(self) -> None:
+        for raw in (
+            "NEEDS-VERIFICATION: X may be undefined",
+            "needs verification - X may be undefined",
+            "NEEDS_VERIFICATION: X may be undefined",
+            "**NEEDS-VERIFICATION:** X may be undefined",
+        ):
+            title, flagged = _split_needs_verification(raw)
+            assert flagged is True, raw
+            assert title == "X may be undefined", raw
+
+    def test_plain_title_untouched(self) -> None:
+        assert _split_needs_verification("Retry loop never sleeps") == (
+            "Retry loop never sleeps",
+            False,
+        )
+
+    def test_marker_only_title_keeps_original_text(self) -> None:
+        # Better a useless title than an empty one.
+        title, flagged = _split_needs_verification("NEEDS-VERIFICATION:")
+        assert flagged is True
+        assert title == "NEEDS-VERIFICATION:"
+
+    def test_stripping_keeps_fingerprints_stable(self) -> None:
+        # A model that hedges in round 2 but not round 1 must not read as a
+        # brand-new finding to --baseline.
+        plain = Finding("a.py", 1, "HIGH", "X may be undefined", "b", None)
+        hedged_title, flag = _split_needs_verification(
+            "NEEDS-VERIFICATION: X may be undefined"
+        )
+        hedged = Finding("a.py", 1, "HIGH", hedged_title, "b", None)
+        hedged.needs_verification = flag
+        assert finding_fingerprint(plain) == finding_fingerprint(hedged)
+
+    def test_parser_sets_the_field_end_to_end(self) -> None:
+        md = (
+            "# Change summary: t\n\n"
+            "## File: a.py\n"
+            "### L10: [HIGH] NEEDS-VERIFICATION: caller may not exist\n"
+            "Body text.\n"
+        )
+        parsed = parse_review_markdown_safe(md)
+        f = parsed.findings[0]
+        assert f.needs_verification is True
+        assert f.title == "caller may not exist"
+
+
+class TestCostEstimate:
+    """Money is a courtesy, never a fabrication and never fatal."""
+
+    def test_openrouter_uses_live_prices(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            providers,
+            "openrouter_pricing",
+            lambda: {"m": {"prompt": 1e-6, "completion": 2e-6}},
+        )
+        # 1000 prompt tok * 1e-6 + 500 completion tok * 2e-6 = 0.002
+        assert estimate_cost_usd("openrouter", "m", 1000, 500) == pytest.approx(0.002)
+
+    def test_unknown_model_returns_none_not_a_guess(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            providers, "openrouter_pricing", lambda: {"other": {"prompt": 1.0}}
+        )
+        assert estimate_cost_usd("openrouter", "m", 1000, 500) is None
+
+    def test_unavailable_pricing_returns_none(self, monkeypatch) -> None:
+        # Offline / rate-limited / shape change -- all just "no estimate".
+        monkeypatch.setattr(providers, "openrouter_pricing", lambda: None)
+        assert estimate_cost_usd("openrouter", "m", 1000, 500) is None
+
+    def test_ollama_is_free(self) -> None:
+        assert estimate_cost_usd("ollama", "qwen3-coder:30b", 10_000, 8_000) == 0.0
+
+    def test_gemini_has_no_public_feed(self) -> None:
+        # Returning a stale hardcoded number would be worse than silence.
+        assert estimate_cost_usd("gemini", "gemini-2.5-pro", 1000, 500) is None
+
+    def test_fetch_failure_is_swallowed(self, monkeypatch) -> None:
+        def _boom(_timeout):
+            raise OSError("network down")
+
+        monkeypatch.setattr(providers, "_load_cached_pricing", lambda: None)
+        monkeypatch.setattr(providers, "_make_client", _boom)
+        assert providers.openrouter_pricing() is None
+
+    def test_format_cost_precision(self) -> None:
+        assert format_cost(0.0) == "$0.00 (local)"
+        assert format_cost(0.0001234) == "~$0.0001"  # sub-cent stays visible
+        assert format_cost(0.17) == "~$0.17"
 
 
 class TestBaseAheadWarning:

@@ -10,11 +10,13 @@ truncation verify).
 from __future__ import annotations
 
 import dataclasses
+import json
 import sys
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import TypeVar
 from urllib.parse import urlparse
 
@@ -417,6 +419,119 @@ def _warn_if_truncated(hit_token_ceiling: bool, max_tokens: int, provider: str) 
             f"{max_tokens}; the review below may be incomplete. "
             "Re-run with a higher --max-tokens for full output.\n"
         )
+
+
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+# Pricing moves (models get repriced, new ones appear), so a hardcoded table
+# would quietly go stale -- and a WRONG money number is worse than none.
+# OpenRouter publishes live per-token prices unauthenticated, so fetch and
+# cache. One day is short enough to track repricing, long enough that the
+# fetch is invisible in normal use.
+PRICING_CACHE_TTL_SECONDS = 24 * 3600
+PRICING_FETCH_TIMEOUT = 10.0
+
+
+def _pricing_cache_path() -> Path:
+    from code_review.config import _user_config_dir
+
+    return _user_config_dir() / "openrouter-pricing.json"
+
+
+def _load_cached_pricing() -> dict[str, dict[str, float]] | None:
+    """Return cached OpenRouter pricing, or None if absent/stale/corrupt."""
+    path = _pricing_cache_path()
+    try:
+        blob = json.loads(path.read_text(encoding="utf-8"))
+        if time.time() - float(blob["fetched_at"]) > PRICING_CACHE_TTL_SECONDS:
+            return None
+        models = blob["models"]
+    except (OSError, ValueError, KeyError, TypeError):
+        # Corrupt/absent cache is not an error -- just a miss.
+        return None
+    return models if isinstance(models, dict) else None
+
+
+def _store_cached_pricing(models: dict[str, dict[str, float]]) -> None:
+    path = _pricing_cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps({"fetched_at": time.time(), "models": models}),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+    except OSError:
+        # A read-only/absent config dir must not break a review.
+        pass
+
+
+def openrouter_pricing() -> dict[str, dict[str, float]] | None:
+    """Per-token USD prices keyed by model slug, or None if unavailable.
+
+    Cached to the user config dir for a day. Every failure path returns
+    None rather than raising: a cost *estimate* is a courtesy, and must
+    never be the reason a review fails or a --dry-run errors.
+    """
+    cached = _load_cached_pricing()
+    if cached is not None:
+        return cached
+    try:
+        with _make_client(PRICING_FETCH_TIMEOUT) as client:
+            resp = client.get(OPENROUTER_MODELS_URL)
+            resp.raise_for_status()
+            data = resp.json()
+        models: dict[str, dict[str, float]] = {}
+        for entry in data.get("data") or []:
+            slug = entry.get("id")
+            pricing = entry.get("pricing") or {}
+            try:
+                # OpenRouter sends prices as per-token decimal STRINGS
+                # ("0.00000125"); floats here, formatting at the edge.
+                models[slug] = {
+                    "prompt": float(pricing["prompt"]),
+                    "completion": float(pricing["completion"]),
+                }
+            except (TypeError, ValueError, KeyError):
+                continue  # skip unpriced/odd entries, keep the rest
+        if not models:
+            return None
+        _store_cached_pricing(models)
+        return models
+    except Exception:
+        # Offline, rate-limited, shape change -- all just "no estimate".
+        return None
+
+
+def estimate_cost_usd(
+    provider: str, model: str, prompt_tokens: int, max_completion_tokens: int
+) -> float | None:
+    """Upper-bound USD estimate for one call, or None when unknowable.
+
+    Prompt side is an estimate (chars/4); completion is bounded by
+    ``max_tokens``, so the total is a ceiling, not a prediction. Ollama is
+    local and free. Gemini publishes no unauthenticated price feed, so it
+    returns None rather than a guess -- consistent with the rule that this
+    tool never invents usage numbers.
+    """
+    if provider == "ollama":
+        return 0.0
+    if provider != "openrouter":
+        return None
+    prices = openrouter_pricing()
+    if not prices or model not in prices:
+        return None
+    p = prices[model]
+    return prompt_tokens * p["prompt"] + max_completion_tokens * p["completion"]
+
+
+def format_cost(usd: float) -> str:
+    """Human-readable USD, with enough precision for sub-cent estimates."""
+    if usd == 0:
+        return "$0.00 (local)"
+    if usd < 0.01:
+        return f"~${usd:.4f}"
+    return f"~${usd:.2f}"
 
 
 def _make_client(timeout: httpx.Timeout | float) -> httpx.Client:

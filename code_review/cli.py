@@ -73,10 +73,14 @@ just set `OLLAMA_HOST` if your server isn't at the default
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
+import threading
+import time
 import traceback
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -222,6 +226,8 @@ from code_review.providers import (
     call_gemini,
     call_ollama,
     call_openrouter,
+    estimate_cost_usd,
+    format_cost,
 )
 from code_review.sources import (
     BUILTIN_CODEBASE_EXCLUDES,
@@ -670,6 +676,100 @@ def _build_requests(
     return requests
 
 
+def _estimate_cost_line(settings: Settings, prompt_chars: int) -> str | None:
+    """Render the cost estimate, or None when it can't be sourced.
+
+    Deliberately a CEILING, and labelled as one: the prompt side is
+    estimated (chars/4, no local tokenizer) and the completion side is
+    bounded by --max-tokens rather than predicted. Panels sum every model.
+
+    Returns None -- rather than a guess -- whenever pricing is unavailable
+    (Gemini publishes no unauthenticated feed; OpenRouter unreachable; an
+    unknown slug). Same rule as `_format_usage_line`: never invent numbers
+    about money or usage.
+    """
+    prompt_tokens = prompt_chars // 4
+    models = list(settings.models) if settings.models is not None else [settings.model]
+    total = 0.0
+    for model in models:
+        usd = estimate_cost_usd(
+            settings.provider, model, prompt_tokens, settings.max_tokens
+        )
+        if usd is None:
+            return None
+        total += usd
+    suffix = f" (x{len(models)} models)" if len(models) > 1 else ""
+    return (
+        f"{format_cost(total)}{suffix} -- ceiling: prompt ~{prompt_tokens:,} tok "
+        f"+ completion <= {settings.max_tokens:,} tok"
+    )
+
+
+def _list_models_report() -> str:
+    """Render the ``--list-models`` report: aliases + defaults, per provider.
+
+    Deliberately OFFLINE. Fetching each provider's live catalogue would mean
+    three network paths (OpenRouter's 300+ model list, a keyed Gemini call,
+    Ollama's /api/tags) in a tool whose contract is typed, deterministic,
+    no-surprise behavior -- and it would answer a question nobody asks. The
+    friction is not "which of OpenRouter's 300 models exist", it is "what do
+    I type here": the aliases, and which provider they belong to. That is
+    local data, so this is instant and works offline.
+    """
+    lines = ["Model aliases (pass to --model / --models; any real slug also works):"]
+    for provider in PROVIDERS:
+        default = DEFAULT_MODEL_BY_PROVIDER.get(provider, "?")
+        lines.append("")
+        lines.append(f"  --provider {provider}   (default: {default})")
+        aliases = MODEL_ALIASES_BY_PROVIDER.get(provider, {})
+        if not aliases:
+            # gemini takes bare model names; there is nothing to alias.
+            lines.append("    (no aliases -- pass the model name directly)")
+            continue
+        width = max(len(a) for a in aliases)
+        for alias, slug in aliases.items():
+            lines.append(f"    {alias:<{width}}  ->  {slug}")
+    lines += [
+        "",
+        "Aliases are provider-scoped: using one from another provider's table",
+        "is a typed CONFIG error naming the right --provider.",
+    ]
+    return "\n".join(lines)
+
+
+@contextlib.contextmanager
+def _heartbeat(interval: float = 15.0) -> Iterator[None]:
+    """Emit an elapsed-time line on stderr while a long call is in flight.
+
+    A big review on a slow model runs for minutes with nothing on screen,
+    which is indistinguishable from a hang -- the observed response is to
+    kill it or background the whole runner rather than trust it.
+
+    Gated on ``stderr.isatty()``: the stderr format is a documented contract
+    for agent callers, so a piped/redirected run stays byte-for-byte what it
+    was. Humans get the reassurance; parsers get the contract.
+    """
+    if not sys.stderr.isatty():
+        yield
+        return
+    stop = threading.Event()
+    started = time.monotonic()
+
+    def _tick() -> None:
+        while not stop.wait(interval):
+            elapsed = int(time.monotonic() - started)
+            sys.stderr.write(f"  ... still waiting ({elapsed}s elapsed)\n")
+            sys.stderr.flush()
+
+    thread = threading.Thread(target=_tick, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=1)
+
+
 def _annotate_hunks(parsed: ParsedReview, request: ReviewRequest) -> None:
     """Tag each finding with whether it sits inside a changed hunk.
 
@@ -711,6 +811,15 @@ def _validate_flag_combos(args: argparse.Namespace) -> None:
         raise ConfigError(
             "--full-files applies to diff modes only; --codebase already "
             "sends full file content."
+        )
+    # `found_by` only exists once several models are merged. Silently
+    # ignoring this on a single-model run would let a caller believe a
+    # consensus floor was applied when nothing filtered.
+    if args.min_found_by is not None and args.min_found_by > 1 and not args.models:
+        raise ConfigError(
+            f"--min-found-by {args.min_found_by} needs --models: consensus "
+            "counts only exist when several models review the same diff. "
+            "Add e.g. --models pro,gpt,deepseek, or drop --min-found-by."
         )
     if args.full_files and args.diff_file is not None:
         raise ConfigError(
@@ -754,6 +863,9 @@ def _dry_run_report(
         f"user_prompt:       {len(request.user_prompt):,} chars",
         f"est_prompt_tokens: ~{prompt_chars // 4:,}",
     ]
+    cost_line = _estimate_cost_line(settings, prompt_chars)
+    if cost_line is not None:
+        lines.append(f"est_cost:          {cost_line}")
     if ollama_window is not None:
         lines.append(f"ollama_window:     {ollama_window}")
     if request.files is not None:
@@ -1020,6 +1132,16 @@ def main() -> None:
         action="version",
         version=f"%(prog)s {__version__}",
     )
+    parser.add_argument(
+        "--list-models",
+        action="store_true",
+        dest="list_models",
+        help=(
+            "Print the model aliases and per-provider defaults, then exit. "
+            "Offline and instant -- shows what you can type for --model / "
+            "--models, not the provider's full remote catalogue."
+        ),
+    )
     source = parser.add_mutually_exclusive_group()
     source.add_argument(
         "--base",
@@ -1163,6 +1285,21 @@ def main() -> None:
             "Diff modes only: never attach changed-file reference "
             "content; review the hunks alone. Cheaper in tokens, but "
             "expect more false 'X is missing' findings."
+        ),
+    )
+    parser.add_argument(
+        "--min-found-by",
+        type=int,
+        default=None,
+        dest="min_found_by",
+        metavar="N",
+        help=(
+            "Panel mode (--models) only: drop merged findings that fewer "
+            "than N models reported. Cross-model agreement is the "
+            "strongest cheap filter for plausible-but-wrong findings, so "
+            "--min-found-by 2 keeps only what at least two models found "
+            "independently. Default: 1 (keep everything). Env: "
+            "CODE_REVIEW_MIN_FOUND_BY."
         ),
     )
     parser.add_argument(
@@ -1351,6 +1488,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Informational, like --version: print and exit before any config
+    # resolution, so it works with no API key and in any directory.
+    if args.list_models:
+        print(_list_models_report())
+        return
+
     if args.no_context and args.context is not None:
         raise ConfigError(
             "--no-context and --context are mutually exclusive. Pick one."
@@ -1438,6 +1581,16 @@ def main() -> None:
             f"(T={settings.temperature}, max_tokens={settings.max_tokens})...\n"
         )
 
+    # Money before the spend, not after. Auto full-file context makes payloads
+    # several times larger than the bare diff, so "what is this about to cost"
+    # stopped being guessable from the char count. Silent when pricing can't
+    # be sourced -- never a fabricated number.
+    _cost = _estimate_cost_line(
+        settings, len(request.system_prompt) + len(request.user_prompt)
+    )
+    if _cost is not None:
+        sys.stderr.write(f"[cost] est {_cost}\n")
+
     # Single-model runs: point at panel mode once, on the way past.
     # Cross-model agreement is the cheapest high-precision filter this tool
     # has (see parser.merge/panel_findings_match) -- a finding two models
@@ -1454,7 +1607,8 @@ def main() -> None:
         )
 
     if settings.models is not None:
-        results_by_model, failures = _run_panel(settings, request)
+        with _heartbeat():
+            results_by_model, failures = _run_panel(settings, request)
         for model, err in failures:
             # Never starts with "ERROR:" -- that prefix is reserved for
             # the single terminal error block.
@@ -1480,6 +1634,21 @@ def main() -> None:
         for _parsed in parsed_by_model.values():
             _annotate_hunks(_parsed, request)
         merged = merge_panel_findings(parsed_by_model)
+        if settings.min_found_by > 1:
+            # Applied AFTER merging (found_by only exists post-merge) and to
+            # BOTH formats, like the severity floor: panel reports are
+            # runner-synthesized in markdown too, so the filter is a real
+            # contract rather than a JSON-only convenience. The per-model raw
+            # appendix still shows everything that was dropped.
+            kept = [m for m in merged if len(m.found_by) >= settings.min_found_by]
+            dropped = len(merged) - len(kept)
+            if dropped:
+                sys.stderr.write(
+                    f"[panel] --min-found-by {settings.min_found_by}: dropped "
+                    f"{dropped} finding(s) below the consensus floor "
+                    f"({len(kept)} kept).\n"
+                )
+            merged = kept
         if settings.format == "json":
             stdout_text = json.dumps(
                 build_panel_envelope(
@@ -1509,9 +1678,10 @@ def main() -> None:
             _write_output_file(stdout_text, settings.output)
         return
 
-    result = _execute_call(
-        settings, request.system_prompt, request.user_prompt, settings.model
-    )
+    with _heartbeat():
+        result = _execute_call(
+            settings, request.system_prompt, request.user_prompt, settings.model
+        )
     usage_line = _format_usage_line(result, settings.provider, settings.model)
     if usage_line is not None:
         sys.stderr.write(usage_line + "\n")
