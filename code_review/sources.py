@@ -124,8 +124,47 @@ def git_diff_local(base: str | None, staged: bool) -> str:
     if staged:
         return _run_git(["git", "diff", "--cached", "-U5"])
     if base:
+        _warn_if_base_ahead(base)
         return _run_git(["git", "diff", "-U5", base])
     return _run_git(["git", "diff", "-U5", "--merge-base", "origin/HEAD"])
+
+
+def _warn_if_base_ahead(base: str) -> None:
+    """Warn when ``base`` has commits HEAD lacks (two-dot drift).
+
+    ``git diff <base>`` is two-dot: it compares base's TIP to the working
+    tree. That is the right default (see ``git_diff_local``), but it has a
+    sharp edge once base moves ahead: every commit on base that HEAD lacks
+    shows up in the diff as a REMOVAL, as though this branch deleted it.
+    Models read that literally and report confident, wrong findings --
+    "this reverts the fix in X", "you dropped the guard on Y" -- about code
+    the author never touched.
+
+    Observed in the wild: a branch cut before a one-commit base fix was
+    reviewed against the moved base; three of four models independently
+    flagged the (untouched) file as "behavior changed". The findings were
+    artifacts of drift, not of the change under review.
+
+    Warn rather than switch to three-dot: three-dot would HIDE the drift,
+    and drift genuinely matters at merge time. The caller deserves to know
+    the diff is mixed, and can rebase or pass an explicit merge-base ref.
+    Best-effort -- an unresolvable ref just skips the check (the diff call
+    right after will produce the real error).
+    """
+    try:
+        behind = _run_git(["git", "rev-list", "--count", f"HEAD..{base}"]).strip()
+    except ConfigError:
+        return
+    if not behind.isdigit() or behind == "0":
+        return
+    sys.stderr.write(
+        f"WARN: {base} has {behind} commit(s) not in HEAD. `git diff {base}` "
+        "is two-dot, so those commits appear in the diff as removals -- the "
+        "model may report them as intentional deletions/reverts. Rebase onto "
+        f"{base}, or diff against the merge-base "
+        f"(--diff-file with `git diff $(git merge-base HEAD {base})`) to "
+        "review only this branch's changes.\n"
+    )
 
 
 def _run_gh(args: list[str], repo: str | None) -> str:

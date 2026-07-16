@@ -15,6 +15,7 @@ import hashlib
 import json
 import re
 
+from code_review.chunking import split_diff_by_file
 from code_review.errors import ConfigError
 from code_review.prompts import SEVERITY_LEVELS
 from code_review.providers import CallResult
@@ -46,7 +47,19 @@ _CLEAN_RE = re.compile(r"^No issues found\.", re.M)
 
 @dataclasses.dataclass
 class Finding:
-    """One review finding recovered from the model's markdown."""
+    """One review finding recovered from the model's markdown.
+
+    ``in_hunk`` answers "can this be posted as a GitHub suggestion?" --
+    True when ``line`` falls inside a changed hunk of ``file`` in the
+    reviewed diff, False when it lands outside every hunk, and None when
+    the question doesn't apply or can't be answered (codebase mode, no
+    line, no diff, or the model's path doesn't match any diff path).
+    GitHub rejects a review comment whose line is not in the served diff,
+    so a caller automating suggestions needs this to know which findings
+    can be one-click and which must go in the review body. Populated by
+    ``annotate_in_hunk``; left None by the parser itself, which only ever
+    sees the model's markdown and not the diff.
+    """
 
     file: str | None
     line: int | None
@@ -54,6 +67,78 @@ class Finding:
     title: str
     body: str
     suggestion: str | None
+    in_hunk: bool | None = None
+
+
+# `+++ b/path` gives the post-image path; `/dev/null` for deletions.
+_DIFF_NEW_PATH_RE = re.compile(r"^\+\+\+ (?:b/)?(.+)$", re.M)
+# `@@ -old,n +new,m @@` -- only the post-image side matters: GitHub anchors
+# review comments on RIGHT-side line numbers. The count is optional (`+12`
+# means a one-line hunk).
+_DIFF_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", re.M)
+
+
+def hunk_ranges(diff: str) -> dict[str, list[tuple[int, int]]]:
+    """Map each changed file to its post-image (RIGHT-side) hunk ranges.
+
+    Ranges are inclusive ``(start, end)`` line numbers in the file as it
+    exists after the change -- the same coordinate space GitHub uses for
+    review comments, and the same one models are asked to cite.
+
+    Used by ``annotate_in_hunk`` to tell postable findings from ones that
+    must go in the review body. Deletions (``+++ /dev/null``) are skipped:
+    they have no post-image to comment on.
+    """
+    ranges: dict[str, list[tuple[int, int]]] = {}
+    for part in split_diff_by_file(diff):
+        m = _DIFF_NEW_PATH_RE.search(part)
+        if not m:
+            continue
+        path = m.group(1).strip()
+        if path == "/dev/null":
+            continue
+        spans = ranges.setdefault(path, [])
+        for hm in _DIFF_HUNK_RE.finditer(part):
+            start = int(hm.group(1))
+            count = int(hm.group(2)) if hm.group(2) is not None else 1
+            if count <= 0:
+                # A pure deletion hunk (`+n,0`) has no post-image lines;
+                # there is nothing on the RIGHT side to anchor to.
+                continue
+            spans.append((start, start + count - 1))
+    return ranges
+
+
+def annotate_in_hunk(
+    findings: list[Finding], ranges: dict[str, list[tuple[int, int]]]
+) -> None:
+    """Set ``Finding.in_hunk`` in place from ``hunk_ranges`` output.
+
+    Leaves ``in_hunk`` as None -- "unknown", not "no" -- whenever the
+    question can't be answered honestly: no line cited, or the finding's
+    path matches nothing in the diff. Reporting False there would tell a
+    caller "not postable" when the truth is "we don't know", and the two
+    warrant different handling.
+
+    Path matching is exact-then-suffix: models cite paths inconsistently
+    (``src/x.py`` vs ``x.py`` vs ``./src/x.py``), so a bare-name citation
+    still resolves as long as exactly one diff path ends with it. An
+    ambiguous suffix (two files with the same basename) stays None rather
+    than guessing wrong.
+    """
+    if not ranges:
+        return
+    for f in findings:
+        if f.line is None or not f.file:
+            continue
+        cited = f.file.strip().lstrip("./")
+        spans = ranges.get(cited)
+        if spans is None:
+            matches = [p for p in ranges if p.endswith("/" + cited) or p == cited]
+            if len(matches) != 1:
+                continue  # unknown or ambiguous -- leave None
+            spans = ranges[matches[0]]
+        f.in_hunk = any(start <= f.line <= end for start, end in spans)
 
 
 @dataclasses.dataclass

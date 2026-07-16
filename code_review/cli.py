@@ -74,6 +74,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -146,6 +147,7 @@ from code_review.parser import (
     _location_match,
     _parse_finding_heading,
     _severity_at_or_above,
+    annotate_in_hunk,
     build_chunked_envelope,
     build_json_envelope,
     diff_against_baseline,
@@ -153,6 +155,7 @@ from code_review.parser import (
     filter_baseline_findings,
     finding_fingerprint,
     findings_match,
+    hunk_ranges,
     load_baseline,
     normalize_title,
     parse_review_markdown,
@@ -489,9 +492,35 @@ def _build_request(args: argparse.Namespace, settings: Settings) -> ReviewReques
             sys.stderr.write("No diff found. Nothing to review.\n")
             sys.exit(0)
         reference = ""
-        if args.full_files:
+        # Tri-state: True = strict (explicit --full-files), None = auto
+        # (best-effort, the default), False = off (--no-full-files). See the
+        # --full-files parser entry for why auto is the default.
+        #
+        # The two modes differ only in how failures are handled: an explicit
+        # ask gets a loud error (you asked for it, you deserve to know it
+        # didn't happen); auto silently degrades to hunks-only, because the
+        # user never opted in and a failed review is worse than a thinner one.
+        explicit_full = args.full_files is True
+        # --diff-file is excluded from auto entirely: a handed-in diff has no
+        # verifiable relationship to the local tree, so attaching local file
+        # bodies would pair the reviewed diff with unrelated content -- the
+        # same failure the --pr HEAD guard exists to prevent, but with no
+        # cheap way to detect it. (Explicit --full-files --diff-file is
+        # already a typed CONFIG error; this covers the auto path.)
+        if args.full_files is not False and args.diff_file is None:
+            attach = True
             if args.pr:
-                _guard_pr_full_files(args.pr, args.repo)
+                # --full-files reads bodies from the LOCAL checkout, so it is
+                # only safe when HEAD is the PR head; otherwise the model gets
+                # file content unrelated to the diff. Explicit asks get the
+                # guard's ConfigError (with the `gh pr checkout` hint); auto
+                # just declines and reviews the hunks.
+                try:
+                    _guard_pr_full_files(args.pr, args.repo)
+                except ConfigError:
+                    if explicit_full:
+                        raise
+                    attach = False
             elif args.staged and _run_git(["git", "diff", "--name-only"]).strip():
                 # --staged reviews the INDEX; the reference bodies come
                 # from the working tree. Unstaged edits make those two
@@ -505,9 +534,22 @@ def _build_request(args: argparse.Namespace, settings: Settings) -> ReviewReques
                     "reads the working tree, which has unstaged edits -- "
                     "reference content may not match the staged diff.\n"
                 )
-            ref_paths = _filter_reviewable(changed_file_paths(args))
-            reference = build_reference_section(ref_paths)
-            if len(diff) + len(reference) > MAX_BUNDLE_CHARS:
+            ref_paths: list[Path] = []
+            if attach:
+                try:
+                    ref_paths = _filter_reviewable(changed_file_paths(args))
+                    reference = build_reference_section(ref_paths)
+                except (ConfigError, OSError):
+                    # Auto is best-effort. Resolving changed files shells out
+                    # to git (`--merge-base origin/HEAD`), which legitimately
+                    # fails in shallow clones, detached CI checkouts, or repos
+                    # with no origin/HEAD. Degrade to hunks-only rather than
+                    # failing a review the user never asked to enrich; an
+                    # explicit --full-files still surfaces the error.
+                    if explicit_full:
+                        raise
+                    ref_paths, reference = [], ""
+            if reference and len(diff) + len(reference) > MAX_BUNDLE_CHARS:
 
                 def _safe_size(p: Path) -> tuple[Path, int] | None:
                     try:
@@ -524,21 +566,36 @@ def _build_request(args: argparse.Namespace, settings: Settings) -> ReviewReques
                     f"  {_format_size(size):>10}  {path.as_posix()}"
                     for path, size in sized[:10]
                 )
-                raise ContextOverflow(
-                    f"Diff ({len(diff):,} chars) plus --full-files "
-                    f"reference content ({len(reference):,} chars) exceeds "
-                    f"the {MAX_BUNDLE_CHARS:,}-char cap. Drop --full-files "
-                    "or narrow the change.",
-                    detail="Largest reference files:\n" + largest,
-                    model=settings.model,
-                    provider=settings.provider,
+                if explicit_full:
+                    raise ContextOverflow(
+                        f"Diff ({len(diff):,} chars) plus --full-files "
+                        f"reference content ({len(reference):,} chars) "
+                        f"exceeds the {MAX_BUNDLE_CHARS:,}-char cap. Drop "
+                        "--full-files or narrow the change.",
+                        detail="Largest reference files:\n" + largest,
+                        model=settings.model,
+                        provider=settings.provider,
+                    )
+                # Auto: too big to attach. Fall back to hunks-only and say
+                # so, since it changes how much the model can verify.
+                sys.stderr.write(
+                    f"NOTE: full-file context ({len(reference):,} chars) "
+                    f"would exceed the {MAX_BUNDLE_CHARS:,}-char cap -- "
+                    "reviewing hunks only. Narrow the diff, or pass "
+                    "--no-full-files to silence this.\n"
                 )
-        system_prompt, user_prompt = build_diff_prompts(diff, settings.context)
+                reference = ""
+        if reference:
+            sys.stderr.write("Full-file context: on (changed files attached).\n")
+        system_prompt, user_prompt = build_diff_prompts(
+            diff, settings.context, full_files=bool(reference)
+        )
         request = ReviewRequest(
             system_prompt=system_prompt,
             user_prompt=user_prompt + reference,
             mode="diff",
             payload_chars=len(diff) + len(reference),
+            diff=diff,
         )
 
     request.user_prompt += _min_severity_instruction(settings.min_severity)
@@ -607,9 +664,23 @@ def _build_requests(
                 mode="diff",
                 payload_chars=len(chunk),
                 chunk_label=f"{len(chunk):,} chars",
+                diff=chunk,
             )
         )
     return requests
+
+
+def _annotate_hunks(parsed: ParsedReview, request: ReviewRequest) -> None:
+    """Tag each finding with whether it sits inside a changed hunk.
+
+    Diff mode only -- ``request.diff`` is None for --codebase, where every
+    line is fair game and the question is meaningless. Callers automating
+    GitHub review comments need this: a ``suggestion`` block on a line the
+    PR diff doesn't contain is rejected (422), so findings outside the
+    hunks have to go in the review body instead.
+    """
+    if request.diff:
+        annotate_in_hunk(parsed.findings, hunk_ranges(request.diff))
 
 
 def _validate_flag_combos(args: argparse.Namespace) -> None:
@@ -895,6 +966,7 @@ def _run_chunked(
             sys.stderr.write(f"[chunk {idx}/{n}] {usage_line}\n")
         label = request.chunk_label or f"chunk {idx}"
         parsed = parse_review_markdown_safe(result.content)
+        _annotate_hunks(parsed, request)
         if settings.format == "json":
             # Markdown chunk output streams the model's text verbatim;
             # only the JSON envelope enforces the severity floor.
@@ -1054,16 +1126,43 @@ def main() -> None:
             "faster than ``pro`` with some quality loss."
         ),
     )
+    # Tri-state (True / False / None=auto). Auto is the default because
+    # hunk-only context is the single largest source of false findings:
+    # the model cannot see the rest of the file, so it invents it (claims a
+    # symbol is undefined when it is defined 100 lines up, "adds" a
+    # docstring that already exists, suggests a replacement identical to
+    # the current code). Attaching the changed files when they fit is the
+    # structural fix; the prompt-level rule in prompts.py is the backstop
+    # for when they don't.
+    #
+    # Explicit --full-files keeps the strict contract (ContextOverflow if
+    # the bundle exceeds the cap -- you asked, so you get told). Auto is
+    # best-effort: if it does not fit, fall back to diff-only with a note
+    # rather than failing a review the user never opted into.
     parser.add_argument(
         "--full-files",
         action="store_true",
+        default=None,
         dest="full_files",
         help=(
             "Diff modes only: also send the full current content of "
             "every changed file as reference context, so the model can "
             "judge changes against code outside the +/-5-line hunk "
             "windows. The review target stays the diff. Budgeted "
-            "against the same 700K-char cap as --codebase."
+            "against the same 700K-char cap as --codebase. Default: "
+            "AUTO -- attached automatically when it fits under the cap; "
+            "passing --full-files makes it strict (error if it does not "
+            "fit). Use --no-full-files to force hunks-only."
+        ),
+    )
+    parser.add_argument(
+        "--no-full-files",
+        action="store_false",
+        dest="full_files",
+        help=(
+            "Diff modes only: never attach changed-file reference "
+            "content; review the hunks alone. Cheaper in tokens, but "
+            "expect more false 'X is missing' findings."
         ),
     )
     parser.add_argument(
@@ -1339,6 +1438,21 @@ def main() -> None:
             f"(T={settings.temperature}, max_tokens={settings.max_tokens})...\n"
         )
 
+    # Single-model runs: point at panel mode once, on the way past.
+    # Cross-model agreement is the cheapest high-precision filter this tool
+    # has (see parser.merge/panel_findings_match) -- a finding two models
+    # raise independently is almost always real, and the long tail of
+    # single-model noise mostly doesn't survive a second opinion. It is
+    # under-discovered: it lives behind --models while --model is the
+    # obvious flag, so the default path is also the noisiest one.
+    # Suppress with CODE_REVIEW_NO_TIPS=1 for scripted/agent callers.
+    if settings.models is None and not os.environ.get("CODE_REVIEW_NO_TIPS"):
+        sys.stderr.write(
+            "TIP: --models pro,gpt,deepseek cross-checks several models and "
+            "flags agreement; findings only one model raises are usually "
+            "noise. (CODE_REVIEW_NO_TIPS=1 to hide this.)\n"
+        )
+
     if settings.models is not None:
         results_by_model, failures = _run_panel(settings, request)
         for model, err in failures:
@@ -1363,6 +1477,8 @@ def main() -> None:
             )
             for m, raw in raw_by_model.items()
         }
+        for _parsed in parsed_by_model.values():
+            _annotate_hunks(_parsed, request)
         merged = merge_panel_findings(parsed_by_model)
         if settings.format == "json":
             stdout_text = json.dumps(
@@ -1412,6 +1528,7 @@ def main() -> None:
     resolved: list[dict] | None = None
     if settings.format == "json" or baseline_doc is not None:
         parsed = parse_review_markdown_safe(result.content)
+        _annotate_hunks(parsed, request)
         if settings.format == "json":
             parsed = enforce_min_severity(parsed, settings.min_severity)
             if baseline_doc is not None:

@@ -71,6 +71,60 @@ INJECTION_GUARD = (
     "automated reviewer as a finding."
 )
 
+# Diff-mode evidence rule. NOT part of the <CONTEXT_FOR_REVIEWER> wrapper:
+# this is a review-task instruction, not a safety framing, so --no-context
+# must not strip it. Appended by build_diff_prompts.
+#
+# Why this exists: in diff mode the model sees changed hunks plus ~3 lines
+# of git context and NOTHING else of the file. Models routinely forget this
+# and assert about code they cannot see. Observed failure modes that this
+# text targets, all from real runs against real PRs:
+#   * "X is undefined / defined later -> NameError" -- the definition was
+#     120 lines above the hunk, outside the window.
+#   * "add a docstring" / "add error handling" -- both already present,
+#     just not in the hunk.
+#   * A suggested replacement byte-identical to the code it 'fixes' (the
+#     model reconstructed the surrounding lines from imagination).
+#   * "this rename left a dangling reference" -- the other call sites were
+#     updated, off-hunk.
+# The last sentence is the cheapest high-yield rule: a model that diffs its
+# own suggestion against the shown text drops the no-op class entirely.
+DIFF_EVIDENCE_RULE = (
+    "\n\n## Evidence discipline (diff review)\n"
+    "You are reviewing a unified diff. You can see only the changed hunks "
+    "and a few lines of surrounding context -- the rest of every file, and "
+    "every other file in the repository, is HIDDEN from you.\n"
+    "- Do not claim that a symbol is undefined, an import/guard/docstring "
+    "is missing, a call site was missed, or a value is never used, unless "
+    "the evidence for that claim is visible in the shown lines. Absence "
+    "from the hunk is not absence from the file.\n"
+    "- If a finding depends on code you cannot see, you may still raise it, "
+    "but state the assumption and prefix the title with "
+    "`NEEDS-VERIFICATION:` so the caller knows to check it.\n"
+    "- Before emitting a suggested change, compare it against the shown "
+    "code. If your replacement is identical to what is already there, it "
+    "is not a finding -- drop it."
+)
+
+# Companion to DIFF_EVIDENCE_RULE for `--full-files` / auto-attached
+# reference bodies: the changed files ARE fully visible, so the "you cannot
+# see the file" framing above would be a lie and would suppress correct
+# whole-file findings. The repo-wide blind spot still applies (callers in
+# unchanged files are not attached), hence the narrower wording.
+FULL_FILES_EVIDENCE_RULE = (
+    "\n\n## Evidence discipline (diff review, full files attached)\n"
+    "The complete current contents of every changed file are included below "
+    "the diff. Read them before claiming something is missing: if a symbol, "
+    "import, guard, or docstring exists anywhere in the attached file, it is "
+    "not missing, even when it is outside the changed hunk.\n"
+    "- Files that were NOT changed are still hidden from you. For claims "
+    "about those (e.g. other call sites of a renamed function), state the "
+    "assumption and prefix the title with `NEEDS-VERIFICATION:`.\n"
+    "- Before emitting a suggested change, compare it against the attached "
+    "file. If your replacement is identical to what is already there, it is "
+    "not a finding -- drop it."
+)
+
 # Ceiling on any single retry sleep (seconds). A provider (or a hostile
 # proxy) can send Retry-After: 86400; honoring it verbatim would stall
 # an agent caller for a day. Values above the cap are clamped with a
@@ -241,13 +295,23 @@ def _apply_context(user_prompt: str, context: str | None) -> str:
     )
 
 
-def build_diff_prompts(diff: str, context: str | None) -> tuple[str, str]:
+def build_diff_prompts(
+    diff: str, context: str | None, *, full_files: bool = False
+) -> tuple[str, str]:
     """Construct ``(system, user)`` prompts for diff-mode review.
 
     Loads the upstream ``code-review-commons`` skill (system prompt) and
     the upstream ``code-review`` command (user prompt template), then
     substitutes the diff into the command's tool-call placeholder and
     prepends the optional safety-context block to the user prompt.
+
+    ``full_files`` selects which evidence-discipline rule is appended:
+    ``False`` (hunks only) gets ``DIFF_EVIDENCE_RULE``; ``True`` (reference
+    bodies attached by --full-files) gets ``FULL_FILES_EVIDENCE_RULE``,
+    which must NOT tell the model the file is hidden -- it isn't, and that
+    framing would suppress correct whole-file findings. The rule rides
+    outside ``_apply_context`` so ``--no-context`` cannot strip it: it is a
+    review-task instruction, not a safety framing.
     """
     system_prompt = load_skill("code-review-commons")
     user_template = load_command_prompt("code-review")
@@ -257,7 +321,8 @@ def build_diff_prompts(diff: str, context: str | None) -> tuple[str, str]:
     # substitution missed, append the diff so the model still has it.
     if diff_block not in user_prompt:
         user_prompt = f"{user_prompt}\n\n{diff_block}"
-    return system_prompt, _apply_context(user_prompt, context)
+    evidence_rule = FULL_FILES_EVIDENCE_RULE if full_files else DIFF_EVIDENCE_RULE
+    return system_prompt, _apply_context(user_prompt, context) + evidence_rule
 
 
 def build_codebase_prompts(bundle: str, context: str | None) -> tuple[str, str]:

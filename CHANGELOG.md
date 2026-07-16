@@ -4,8 +4,18 @@ Notable user-facing changes, newest first. Format loosely follows [Keep a Change
 
 ## [Unreleased]
 
+Precision pass: five changes aimed at the tool's dominant failure mode — a model asserting things about code it cannot see. In diff mode it sees hunks plus ~3 lines of context, and fills the rest in from imagination: "`X` is undefined" when `X` is defined 100 lines up, "add the missing docstring" when one exists off-hunk, a suggested fix byte-identical to the code it claims to repair. Observed across ~20 real review runs; the first two changes attack it structurally, the third makes findings actionable, the last two remove known traps.
+
+### Added
+
+- **Evidence-discipline rule in diff prompts.** The model is now told what it *cannot* see, that absence from a hunk is not absence from the file, to prefix `NEEDS-VERIFICATION:` on claims that depend on unshown code, and — the cheapest high-yield rule — to drop any suggestion identical to the code already on screen. The rule flips when `--full-files` attaches the bodies (claiming a visible file is hidden would suppress correct findings), and rides *outside* the safety wrapper so `--no-context` can't strip it.
+- **`in_hunk` on every finding** (`--format json`, diff modes): `true` = inside a changed hunk (postable as a one-click GitHub ```suggestion```), `false` = outside every hunk (must go in the review body — GitHub 422s the alternative), `null` = unknown/not applicable (codebase mode, no line, or an unmatched/ambiguous path). `null` means "verify", not "no". Additive to the envelope schema; existing consumers are unaffected.
+- **Base-drift warning for `--base`.** `git diff <base>` is two-dot, so once the base moves ahead, its commits appear in the diff as *removals* and get reported as intentional deletions/reverts. The runner now counts `HEAD..<base>` and warns, with both escapes (rebase, or diff the merge-base). Warn rather than silently switch to three-dot: three-dot hides drift, and drift is what bites at merge time.
+- **Panel discoverability**: single-model runs print a one-line `TIP:` pointing at `--models`, since cross-model agreement is the cheapest precision filter the tool has and it lived behind the less obvious flag. Silence with `CODE_REVIEW_NO_TIPS=1`.
+
 ### Changed
 
+- **`--full-files` is now on by default (auto).** Hunk-only context is the single largest source of false findings, so changed files are attached whenever the payload fits under the 700K cap. Three states: *auto* (default — attach if it fits, otherwise fall back to hunks-only with a `NOTE:`), `--full-files` (strict — typed error if it doesn't fit, i.e. today's behavior), `--no-full-files` (off). Auto is best-effort by design: it costs tokens, so it declines rather than fails a review you never opted into — including when git can't resolve changed files (shallow clones, detached CI checkouts) or `--pr` isn't checked out at the PR head. `--diff-file` is excluded from auto entirely: a handed-in diff has no verifiable relationship to the local tree, so attaching local bodies could pair the review with unrelated content.
 - **Module split**: the single-file `code_review/cli.py` (~5,000 lines) is now nine focused modules (`errors`, `prompts`, `providers`, `sources`, `parser`, `panel`, `chunking`, `config`, plus a slimmed orchestrating `cli`). No behavior change; `from code_review.cli import X` keeps working (cli re-exports the full surface) and the console entry point is unchanged. See the code map in `docs/architecture.md`.
 
 ## [0.2.0] — 2026-07-07

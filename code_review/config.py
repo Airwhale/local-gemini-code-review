@@ -308,6 +308,10 @@ class ReviewRequest:
     payload_chars: int  # diff length or bundle length (pre-prompt-wrapping)
     files: list[Path] | None = None  # codebase mode only
     chunk_label: str | None = None  # --chunk mode: e.g. "3 file(s), 41,209 chars"
+    # Raw diff (diff mode only), retained so findings can be annotated with
+    # `in_hunk` after parsing -- the parser sees only the model's markdown,
+    # and hunk membership needs the diff. None in codebase mode.
+    diff: str | None = None
 
 
 def _resolve_settings(

@@ -147,11 +147,32 @@ One review source per run (mutually exclusive):
 | Flag | What it does |
 |---|---|
 | *(none)* | Diff: current branch vs `origin/HEAD` merge-base — matches the upstream `gemini-cli` `/code-review` shape. |
-| `--base <ref>` | Diff: vs an explicit base ref (**includes uncommitted changes**, so iterative loops work without committing each pass). |
+| `--base <ref>` | Diff: vs an explicit base ref (**includes uncommitted changes**, so iterative loops work without committing each pass). Warns when the base has moved ahead — see [base drift](#base-drift-when-base-has-moved-ahead). |
 | `--pr <N>` | Diff: pulls a GitHub PR diff via `gh pr diff` (requires `gh auth login`). **Add `--repo owner/name` on forks**: a bare PR number resolves through gh's default-repo logic (`gh repo set-default`), which often points at the upstream repo — the runner announces the resolved PR URL on stderr (`[gh] reviewing PR #N: <url>`, also during `--dry-run`) so a wrong target is visible before tokens are spent. |
 | `--staged` | Diff: staged changes only — pre-commit style. |
 | `--diff-file <path>` | Diff: review a unified diff read from a file (`-` reads stdin) instead of invoking git — for piping diffs from other tools, replaying saved diffs, and the eval harness. Not combinable with `--full-files` (a handed-in diff has no local files to reference). |
 | `--codebase` | Whole codebase: bundles tracked files (via `git ls-files`) and reviews them all. Narrow with `--include` / `--exclude` globs. |
+
+### Base drift: when `--base` has moved ahead
+
+`--base <ref>` runs `git diff <ref>` — **two-dot**, comparing the base's *tip* to your working tree. That's deliberate (it's what makes uncommitted fixes visible round to round), but it has a sharp edge once the base moves ahead of you: **every commit on the base that your branch lacks appears in the diff as a removal**, exactly as if you had deleted it. Models read that literally and report confident, wrong findings — *"this reverts the fix in X"*, *"you dropped the guard on Y"* — about code you never touched.
+
+This is not hypothetical: a branch cut before a one-commit base fix was reviewed against the moved base, and three of four models independently flagged the untouched file as "behavior changed."
+
+So the runner counts `HEAD..<base>` first and warns:
+
+```
+WARN: origin/main has 34 commit(s) not in HEAD. `git diff origin/main` is two-dot, so those
+commits appear in the diff as removals -- the model may report them as intentional
+deletions/reverts. Rebase onto origin/main, or diff against the merge-base […]
+```
+
+Two ways out, depending on what you want to review:
+
+- **Rebase onto the base** — then two-dot *is* your change, and drift disappears.
+- **Review only your branch's commits** — diff the merge-base instead: `code-review --diff-file <(git diff $(git merge-base HEAD origin/main))`.
+
+The runner warns rather than silently switching to three-dot, because three-dot would **hide** the drift — and drift is exactly what bites you at merge time.
 
 ### Whole-codebase mode (`--codebase`)
 
@@ -205,6 +226,7 @@ After each successful call, a `[usage] prompt=… completion=… total=… token
       "body": "Explanation…",
       "suggestion": "for attempt in …",  // null when none offered
       "fingerprint": "a1b2c3d4e5f6",     // stable finding identity
+      "in_hunk": true,               // diff modes: is `line` inside a changed hunk?
       "status": "new"                // only when --baseline was given
     }
   ],
@@ -219,6 +241,16 @@ After each successful call, a `[usage] prompt=… completion=… total=… token
 
 A formal [JSON Schema](./docs/schema/review-envelope.schema.json) describes the envelope — one shape covering single-model, panel, and chunked documents — and is pinned to the builders by tests, so it can't silently drift from what the tool actually emits.
 
+**`in_hunk` — which findings can be posted as one-click GitHub suggestions.** GitHub rejects a review comment whose line isn't in the served diff (HTTP 422), so an agent turning findings into PR comments has to know, per finding, whether the cited line is inside a changed hunk. That's a diff-parsing job the caller shouldn't have to redo, so the runner answers it:
+
+| `in_hunk` | Meaning | What a caller should do |
+|---|---|---|
+| `true` | `line` is inside a changed hunk of `file` | Safe to post inline, including a ```suggestion``` block |
+| `false` | `line` is outside every hunk (real, but the PR doesn't touch that line) | Put it in the **review body** — an inline comment would 422 |
+| `null` | Unknown / not applicable: `--codebase` mode, no line cited, or the model's path matches no diff path (or matches ambiguously) | **Verify before posting** — `null` is "can't say", *not* "no" |
+
+Ranges are inclusive and use post-image (RIGHT-side) line numbers — the same coordinates GitHub uses. Path matching is exact-then-unique-suffix, so a model citing `x.py` still resolves against `src/x.py`; two files sharing a basename stay `null` rather than guess.
+
 `--baseline <prior.json>` compares current findings against a previous `--format json` run: each finding gets `status: "new" | "persisting"`, disappeared findings are listed under `resolved`, and a `[baseline] N finding(s): X new, Y persisting, Z resolved` line lands on stderr (markdown mode keeps stdout verbatim). The loop:
 
 ```bash
@@ -232,6 +264,20 @@ Matching is a two-pass heuristic — exact fingerprint (file + severity + normal
 ### Big inputs: `--full-files` and `--chunk`
 
 **`--full-files`** (git-backed diff modes only): the model normally sees only ±5-line hunk windows — it can't judge a change against code 40 lines away. This sends the **full current content of every changed file** as a `<REFERENCE_FILES>` block (line-numbered, size-capped, noise-filtered), while the review target stays the diff. Budgeted against the same 700K-char cap. Works from repo subdirectories too (git's root-relative paths are re-based onto your working directory). Two staleness guards: with `--pr`, the runner requires HEAD to be the PR head (a typed `CONFIG` error tells you to `gh pr checkout N` first — otherwise the model would silently pair the PR diff with unrelated file bodies), and a dirty tree gets a WARN — including with `--staged`, where the reference bodies come from the working tree while the reviewed diff is the index.
+
+**It is on by default (auto).** Hunk-only context is the single largest source of false findings: the model can't see the rest of the file, so it fills the gap from imagination — "`X` is undefined" when `X` is defined 100 lines up, "add the missing docstring" when one exists off-hunk, or a suggested fix byte-identical to the code it claims to repair. Attaching the changed files removes the guesswork, so the runner now does it whenever the payload fits.
+
+Three states:
+
+| You pass | Behavior | On failure (too big / no local checkout / git can't resolve) |
+|---|---|---|
+| *(nothing)* — **default** | **Auto**: attach when it fits under the 700K cap | Silently falls back to hunks-only with a `NOTE:` — a review you didn't opt into never fails because of an extra |
+| `--full-files` | **Strict**: you asked for it | Typed error (`CONTEXT_OVERFLOW`, or `CONFIG` for `--pr` off the PR head) — you asked, so you're told |
+| `--no-full-files` | **Off**: hunks only | — cheaper in tokens; expect more false "X is missing" findings |
+
+Auto is best-effort by design: it costs tokens, so it declines rather than errors. Whenever files are attached you'll see `Full-file context: on (changed files attached).` on stderr.
+
+**When files can't be attached, the prompt compensates.** Diff-mode reviews carry an *evidence-discipline* rule telling the model exactly what it can't see — that absence from a hunk is not absence from the file, that claims depending on unseen code must be prefixed `NEEDS-VERIFICATION:`, and that a suggestion identical to the shown code is not a finding. When full files *are* attached the rule flips (the changed files are visible; only unchanged files elsewhere are not), because telling a model a file is hidden when it isn't suppresses correct findings. The rule is review instruction, not safety framing, so `--no-context` does **not** strip it.
 
 **`--chunk`** (opt-in): when the payload exceeds the budget — 700K chars for cloud, or the Ollama window — the runner splits **at file boundaries** into sequential chunk reviews instead of erroring:
 
@@ -409,6 +455,12 @@ This tool is built to be invoked by AI coding agents as an iteration partner dur
 6. **Re-run until**: output is clean, a round is all hallucinations, or you've hit 4 rounds. Then run tests + build, commit, push.
 7. **Track rounds** in a per-finding ledger for the final commit/PR message — format and examples in the [runbook](./docs/llm-code-review-runbook.md#per-round-tracking).
 
+**Three things that exist specifically for you:**
+
+- **`in_hunk` tells you what you can post.** Turning findings into GitHub review comments? Only `in_hunk: true` can carry an inline ```suggestion``` (GitHub 422s anything else); `false` belongs in the review body; `null` means verify first. See [Structured output](#structured-output---format-json-and-round-over-round-diffing---baseline). Don't re-parse the diff to work this out — it's in the envelope.
+- **Cross-model agreement is your cheapest precision filter.** A finding one model raises is usually noise; one two models raise independently is usually real. Prefer `--models pro,gpt,deepseek --format json` and read `found_by` before you spend a round chasing a single-model claim. Set `CODE_REVIEW_NO_TIPS=1` to silence the reminder in scripted runs.
+- **Know what the model could see.** Diff reviews carry an evidence-discipline rule, and changed files are auto-attached when they fit (`Full-file context: on` on stderr). If they *weren't* attached, treat "X is missing / undefined / never called" claims as unverified by construction — the model was looking at a keyhole. Findings prefixed `NEEDS-VERIFICATION:` are the model telling you it guessed; check them against the file before acting.
+
 ## Error model (for LLM callers)
 
 If you're calling this tool in a loop, here's the contract.
@@ -463,6 +515,10 @@ Non-error stderr lines use a fixed prefix vocabulary — **no informational line
 | `[panel …] …` | Per-model progress in `--models` panels |
 | `[chunk …] …` | Per-chunk progress in `--chunk` runs |
 | `skip …` | A file was dropped from the codebase bundle or `--full-files` reference set (100 KB per-file cap) |
+| `Full-file context: on …` | Changed files were attached as reference (auto or `--full-files`) — the model can see beyond the hunks |
+| `NOTE: full-file context … would exceed …` | Auto full-files declined (over the cap); reviewing hunks only. Informational — not an error, and not emitted for an explicit `--full-files` (that's a typed `CONTEXT_OVERFLOW`) |
+| `WARN: <base> has N commit(s) not in HEAD…` | `--base` drift: `git diff <base>` is two-dot, so base-only commits show up as removals and may be reported as intentional deletions. Rebase, or diff the merge-base |
+| `TIP: --models …` | Single-model run; panel mode cross-checks and filters noise. Silence with `CODE_REVIEW_NO_TIPS=1` |
 | `No diff found…` / `No files matched…` | Empty scope — the run exits 0 without calling the model |
 | `Interrupted.` | Ctrl-C / SIGINT (exit 130) |
 

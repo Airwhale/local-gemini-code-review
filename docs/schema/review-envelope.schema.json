@@ -122,6 +122,10 @@
           "type": ["string", "null"],
           "description": "The proposed-fix code block, when the model supplied one. Review like any untrusted patch before applying."
         },
+        "in_hunk": {
+          "type": ["boolean", "null"],
+          "description": "Diff modes only: true when `line` falls inside a changed hunk of `file`, false when it falls outside every hunk, null when unknown or not applicable (codebase mode, no line cited, or the cited path matches no diff path / matches ambiguously). Use this to decide how to post a finding: GitHub rejects a review comment whose line is not in the served diff, so only `in_hunk: true` findings can carry a one-click `suggestion`; the rest belong in the review body. Treat null as 'verify before posting', not as false."
+        },
         "fingerprint": {
           "type": "string",
           "pattern": "^[0-9a-f]{12}$",
