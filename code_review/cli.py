@@ -228,6 +228,7 @@ from code_review.providers import (
     call_openrouter,
     estimate_cost_usd,
     format_cost,
+    model_context_limit,
 )
 from code_review.sources import (
     BUILTIN_CODEBASE_EXCLUDES,
@@ -591,6 +592,32 @@ def _build_request(args: argparse.Namespace, settings: Settings) -> ReviewReques
                     "--no-full-files to silence this.\n"
                 )
                 reference = ""
+        if reference and not explicit_full:
+            # The 700K-char cap is a GLOBAL constant sized for Gemini (1M
+            # tokens) and Claude (200K). Smaller models exist: deepseek-chat
+            # -v3.1 is 163,840, so a payload can clear the cap and still blow
+            # the model's window -- a hard HTTP 400 on a review that would
+            # have succeeded hunks-only. That is auto breaking something the
+            # user never asked for, so check the model's published window
+            # (from the same OpenRouter feed the cost estimate uses) and
+            # decline rather than fail. Unknown window -> no guard available;
+            # attach and let the provider decide. Explicit --full-files is
+            # left alone: you asked, so you get the error instead of silence.
+            window = model_context_limit(settings.provider, settings.model)
+            if window is not None:
+                # ~4 chars/token, plus the output ceiling: the provider
+                # counts requested completion tokens against the window too
+                # (its 400 reads "169737 tokens (153737 of text input,
+                # 16000 in the output)").
+                est_tokens = (len(diff) + len(reference)) // 4 + settings.max_tokens
+                if est_tokens > window:
+                    sys.stderr.write(
+                        f"NOTE: full-file context would need ~{est_tokens:,} tokens "
+                        f"but {settings.model} has a {window:,}-token window -- "
+                        "reviewing hunks only. Use a wider model, or "
+                        "--no-full-files to silence this.\n"
+                    )
+                    reference = ""
         if reference:
             sys.stderr.write("Full-file context: on (changed files attached).\n")
         system_prompt, user_prompt = build_diff_prompts(

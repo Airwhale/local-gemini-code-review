@@ -379,6 +379,12 @@ def _classify_http_error(
     # classifications on unrelated 4xx errors.
     CONTEXT_OVERFLOW_PHRASES = (
         "context_length",
+        # OpenRouter's 400 reads "This endpoint's maximum context length is
+        # 163840 tokens. However, you requested about 169737 tokens" -- no
+        # underscore, and not "exceeds the maximum", so it fell through to
+        # UNKNOWN (exit 1, "escalate if unclear") when the truth is a typed
+        # CONTEXT_OVERFLOW (exit 12, "the scope is wrong, not the call").
+        "maximum context length",
         "too long",
         "exceeds the maximum",
         "token limit",
@@ -434,7 +440,10 @@ PRICING_FETCH_TIMEOUT = 10.0
 def _pricing_cache_path() -> Path:
     from code_review.config import _user_config_dir
 
-    return _user_config_dir() / "openrouter-pricing.json"
+    # Filename bumped from openrouter-pricing.json when context_length was
+    # added: a v1 cache has no windows, and a stale hit would silently
+    # disable the context guard for a day.
+    return _user_config_dir() / "openrouter-models-v2.json"
 
 
 def _load_cached_pricing() -> dict[str, dict[str, float]] | None:
@@ -488,12 +497,22 @@ def openrouter_pricing() -> dict[str, dict[str, float]] | None:
             try:
                 # OpenRouter sends prices as per-token decimal STRINGS
                 # ("0.00000125"); floats here, formatting at the edge.
-                models[slug] = {
+                entry_info: dict[str, float] = {
                     "prompt": float(pricing["prompt"]),
                     "completion": float(pricing["completion"]),
                 }
             except (TypeError, ValueError, KeyError):
                 continue  # skip unpriced/odd entries, keep the rest
+            # Context window, when published. Drives the auto full-files
+            # guard: the global 700K-char cap is sized for Gemini (1M) and
+            # Claude (200K), but deepseek-chat-v3.1 is 163,840 -- smaller
+            # than the cap allows, so a payload can clear the cap and still
+            # blow the model's window.
+            try:
+                entry_info["context_length"] = float(entry["context_length"])
+            except (TypeError, ValueError, KeyError):
+                pass
+            models[slug] = entry_info
         if not models:
             return None
         _store_cached_pricing(models)
@@ -501,6 +520,22 @@ def openrouter_pricing() -> dict[str, dict[str, float]] | None:
     except Exception:
         # Offline, rate-limited, shape change -- all just "no estimate".
         return None
+
+
+def model_context_limit(provider: str, model: str) -> int | None:
+    """Published context window (tokens) for ``model``, or None if unknown.
+
+    Only OpenRouter publishes this in a feed we already fetch. None means
+    "don't know" -- callers must treat that as "no guard available" rather
+    than assuming any particular size.
+    """
+    if provider != "openrouter":
+        return None
+    info = openrouter_pricing()
+    if not info or model not in info:
+        return None
+    window = info[model].get("context_length")
+    return int(window) if window else None
 
 
 def estimate_cost_usd(

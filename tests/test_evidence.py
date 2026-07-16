@@ -17,10 +17,15 @@ No network, no git, no Ollama server required.
 
 from __future__ import annotations
 
+import argparse
+
 import pytest
 
+import code_review.panel as panel
 import code_review.providers as providers
 import code_review.sources as sources
+from code_review.config import _resolve_settings
+from code_review.errors import ConfigError, ContextOverflow
 from code_review.parser import (
     Finding,
     _split_needs_verification,
@@ -207,6 +212,131 @@ class TestNeedsVerification:
         f = parsed.findings[0]
         assert f.needs_verification is True
         assert f.title == "caller may not exist"
+
+
+class TestMinFoundByPropagation:
+    """Regression: --min-found-by shipped as a silent no-op.
+
+    It was parsed and validated, but never passed into the Settings
+    constructor, so the panel filter read the dataclass default (1) and
+    dropped nothing. The original tests asserted the *validation* and the
+    *error paths* and never that the value arrives -- testing around the
+    feature instead of the feature. These assert the wiring end to end.
+    """
+
+    def _ns(self, **kw):
+        base = dict(
+            base=None,
+            pr=None,
+            staged=False,
+            codebase=False,
+            include=[],
+            exclude=[],
+            provider="openrouter",
+            model=None,
+            models="pro,gpt",
+            ollama_host=None,
+            temperature=None,
+            max_tokens=None,
+            retries=None,
+            min_severity=None,
+            min_found_by=None,
+            context=None,
+            no_context=False,
+            output=None,
+            format=None,
+            baseline=None,
+            dry_run=False,
+            chunk=False,
+        )
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    @pytest.fixture(autouse=True)
+    def _key(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+        monkeypatch.delenv("CODE_REVIEW_MIN_FOUND_BY", raising=False)
+
+    def test_cli_value_reaches_settings(self) -> None:
+        assert _resolve_settings(self._ns(min_found_by=2)).min_found_by == 2
+
+    def test_default_is_one(self) -> None:
+        assert _resolve_settings(self._ns()).min_found_by == 1
+
+    def test_env_value_reaches_settings(self, monkeypatch) -> None:
+        monkeypatch.setenv("CODE_REVIEW_MIN_FOUND_BY", "3")
+        assert _resolve_settings(self._ns()).min_found_by == 3
+
+    def test_floor_without_a_panel_is_rejected_from_any_layer(
+        self, monkeypatch
+    ) -> None:
+        # _validate_flag_combos only sees argv; env/TOML must fail here too,
+        # or the floor silently filters nothing.
+        monkeypatch.setenv("CODE_REVIEW_MIN_FOUND_BY", "2")
+        with pytest.raises(ConfigError, match="needs a panel"):
+            _resolve_settings(self._ns(models=None))
+
+    def test_filter_drops_below_floor(self) -> None:
+        # The behavior the flag actually promises.
+        def _mf(found_by):
+            f = Finding("a.py", 1, "HIGH", f"t{len(found_by)}", "b", None)
+            return panel.MergedFinding(finding=f, found_by=found_by)
+
+        merged = [_mf(["pro"]), _mf(["pro", "gpt"]), _mf(["pro", "gpt", "ds"])]
+        kept = [m for m in merged if len(m.found_by) >= 2]
+        assert [len(m.found_by) for m in kept] == [2, 3]
+
+
+class TestModelContextLimit:
+    """Regression: auto full-files hard-failed a model with a small window.
+
+    The 700K-char cap is global and sized for Gemini (1M tokens) / Claude
+    (200K). deepseek-chat-v3.1 is 163,840 -- so a payload cleared the cap,
+    blew the window, and returned HTTP 400 on a review that would have
+    succeeded hunks-only. Caught by dogfooding this tool on its own diff.
+    """
+
+    def test_reads_the_published_window(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            providers,
+            "openrouter_pricing",
+            lambda: {"m": {"prompt": 0.0, "completion": 0.0, "context_length": 1000.0}},
+        )
+        assert providers.model_context_limit("openrouter", "m") == 1000
+
+    def test_missing_window_is_unknown_not_a_guess(self, monkeypatch) -> None:
+        # A model with no published context_length must not be assumed to
+        # be small (that would disable full files for no reason) or large.
+        monkeypatch.setattr(
+            providers,
+            "openrouter_pricing",
+            lambda: {"m": {"prompt": 0.0, "completion": 0.0}},
+        )
+        assert providers.model_context_limit("openrouter", "m") is None
+
+    def test_non_openrouter_has_no_feed(self) -> None:
+        assert providers.model_context_limit("ollama", "qwen3-coder:30b") is None
+        assert providers.model_context_limit("gemini", "gemini-2.5-pro") is None
+
+    def test_unavailable_feed_is_unknown(self, monkeypatch) -> None:
+        monkeypatch.setattr(providers, "openrouter_pricing", lambda: None)
+        assert providers.model_context_limit("openrouter", "m") is None
+
+
+class TestContextOverflowClassification:
+    def test_openrouter_wording_is_typed_not_unknown(self) -> None:
+        # OpenRouter's 400 says "maximum context length is 163840 tokens";
+        # the phrase list only had "context_length"/"exceeds the maximum",
+        # so this fell through to UNKNOWN (exit 1, "escalate if unclear")
+        # instead of CONTEXT_OVERFLOW (exit 12, "the scope is wrong").
+        err = providers._classify_http_error(
+            400,
+            '{"error":{"message":"This endpoint\'s maximum context length is '
+            '163840 tokens. However, you requested about 169737 tokens"}}',
+            model="deepseek/deepseek-chat-v3.1",
+            provider="openrouter",
+        )
+        assert isinstance(err, ContextOverflow)
 
 
 class TestCostEstimate:

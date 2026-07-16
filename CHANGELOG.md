@@ -4,7 +4,9 @@ Notable user-facing changes, newest first. Format loosely follows [Keep a Change
 
 ## [Unreleased]
 
-Precision pass: five changes aimed at the tool's dominant failure mode — a model asserting things about code it cannot see. In diff mode it sees hunks plus ~3 lines of context, and fills the rest in from imagination: "`X` is undefined" when `X` is defined 100 lines up, "add the missing docstring" when one exists off-hunk, a suggested fix byte-identical to the code it claims to repair. Observed across ~20 real review runs; the first two changes attack it structurally, the third makes findings actionable, the last two remove known traps.
+Precision pass, aimed at the tool's dominant failure mode — a model asserting things about code it cannot see. In diff mode it sees hunks plus ~3 lines of context and fills the rest in from imagination: "`X` is undefined" when `X` is defined 100 lines up, "add the missing docstring" when one exists off-hunk, a suggested fix byte-identical to the code it claims to repair. Observed across ~20 real review runs.
+
+The changes fall into three groups: **remove the blind spot** (auto full-file context, and an evidence-discipline rule for when the files don't fit), **make findings actionable** (`in_hunk`, `needs_verification`, `--min-found-by`, a pre-call cost ceiling), and **remove known traps** (base-drift warning, diff-timestamp parsing, panel discoverability, `--list-models`, a call heartbeat).
 
 ### Added
 
@@ -20,6 +22,10 @@ Precision pass: five changes aimed at the tool's dominant failure mode — a mod
 
 ### Fixed
 
+- **`--min-found-by` was a silent no-op.** It was parsed and validated but never passed into the `Settings` constructor, so the panel filter read the dataclass default (1) and dropped nothing — the flag did exactly what not passing it did. Found by dogfooding this tool on its own diff.
+- **A consensus floor from `$CODE_REVIEW_MIN_FOUND_BY` / `.code-review.toml` silently filtered nothing.** The CLI-flag combo was rejected in `_validate_flag_combos`, but that only sees argv, so an env/TOML value with no panel slipped past — the exact "you think a filter applied but it didn't" failure the flag exists to prevent. Now validated where `models` resolves, so every layer is covered.
+- **Auto full-file context could hard-fail a model with a small window.** The 700K-char cap is global and sized for Gemini (1M tokens) / Claude (200K); `deepseek-chat-v3.1` is 163,840, so a payload cleared the cap and still blew the window — HTTP 400 on a review that would have succeeded hunks-only, i.e. auto breaking something the user never opted into. Auto now checks the model's published context window (from the same OpenRouter feed the cost estimate uses) and declines with a `NOTE:` instead of failing. Unknown window → no guard, attach and let the provider decide; explicit `--full-files` still errors rather than degrade silently.
+- **OpenRouter's context-length 400 was classified `UNKNOWN` (exit 1) instead of `CONTEXT_OVERFLOW` (exit 12).** Its wording ("This endpoint's maximum context length is …") matched none of the phrase list, so callers got "escalate if unclear" for what is really "the scope is wrong, not the call".
 - `in_hunk` path extraction now tolerates unified diffs carrying timestamps (`+++ b/x.py\t2026-07-16 10:00:00`), which GNU `diff -u` emits and `--diff-file` explicitly accepts. Previously the path captured the timestamp, matched nothing, and silently degraded every finding in that file to `in_hunk: null`.
 
 ### Changed

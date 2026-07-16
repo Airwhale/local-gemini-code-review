@@ -491,6 +491,19 @@ def _resolve_settings(
         raise ConfigError(
             f"min_found_by={min_found_by} (from {found_by_source}) must be >= 1."
         )
+    # A consensus floor without a panel silently filters nothing. The CLI-flag
+    # combo is rejected in _validate_flag_combos, but that only sees argv --
+    # a value from CODE_REVIEW_MIN_FOUND_BY or .code-review.toml would slip
+    # past it and quietly do nothing, which is exactly the "you think a filter
+    # applied but it didn't" failure the flag exists to avoid. `models` is
+    # resolved here, so this is the only layer that can catch every source.
+    if min_found_by > 1 and models is None:
+        raise ConfigError(
+            f"min_found_by={min_found_by} (from {found_by_source}) needs a "
+            "panel: consensus counts only exist when several models review "
+            "the same diff. Add --models (or a `models` key), or drop "
+            "min_found_by."
+        )
 
     # Output format.
     format_raw, format_source = _layered(
@@ -616,6 +629,7 @@ def _resolve_settings(
         max_tokens=max_tokens,
         retries=retries,
         min_severity=min_severity,
+        min_found_by=min_found_by,
         context=context,
         output=args.output,
         format=output_format,
