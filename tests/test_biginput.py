@@ -131,6 +131,59 @@ class TestReferenceSection:
         assert build_reference_section([]) == ""
 
 
+class TestAutoFullFilesOllama:
+    def test_drops_reference_before_known_context_overflow(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        diff = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n"
+        reference = "r" * 5_000
+        prompt_full_flags: list[bool] = []
+
+        monkeypatch.setattr(review, "_read_diff_source", lambda args: diff)
+        monkeypatch.setattr(review, "changed_file_paths", lambda args: [Path("x.py")])
+        monkeypatch.setattr(review, "_filter_reviewable", lambda paths: paths)
+        monkeypatch.setattr(review, "build_reference_section", lambda paths: reference)
+        monkeypatch.setattr(
+            review,
+            "_resolve_ollama_window",
+            lambda host, model, env: (1_000, True, "env"),
+        )
+
+        def fake_build_diff_prompts(
+            payload: str, context: str | None, *, full_files: bool = False
+        ) -> tuple[str, str]:
+            prompt_full_flags.append(full_files)
+            return "S", "U_FULL" if full_files else "U_HUNK"
+
+        monkeypatch.setattr(review, "build_diff_prompts", fake_build_diff_prompts)
+        args = argparse.Namespace(
+            codebase=False,
+            include=[],
+            exclude=[],
+            full_files=None,
+            diff_file=None,
+            pr=None,
+            staged=False,
+            repo=None,
+            base=None,
+        )
+        settings = _settings(
+            provider="ollama",
+            model="local",
+            ollama_host="http://localhost:11434",
+            ollama_timeout=1.0,
+        )
+
+        request = review._build_request(args, settings)
+
+        assert request.payload_chars == len(diff)
+        assert request.user_prompt == "U_HUNK"
+        assert prompt_full_flags == [True, False]
+        err = capsys.readouterr().err
+        assert "reviewing hunks only" in err
+        assert "Full-file context: on" not in err
+
+
 class TestChangedFilePaths:
     def _capture(self, monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
         calls: list[list[str]] = []
