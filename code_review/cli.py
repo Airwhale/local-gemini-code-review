@@ -618,6 +618,34 @@ def _build_request(args: argparse.Namespace, settings: Settings) -> ReviewReques
                         "--no-full-files to silence this.\n"
                     )
                     reference = ""
+        if reference and not explicit_full and settings.provider == "ollama":
+            assert settings.ollama_host is not None
+            num_ctx, enforced, window_source = _resolve_ollama_window(
+                settings.ollama_host,
+                settings.model,
+                settings.ollama_num_ctx_env,
+            )
+            check_system, check_user = build_diff_prompts(
+                diff, settings.context, full_files=True
+            )
+            prompt_chars = (
+                len(check_system)
+                + len(check_user)
+                + len(reference)
+                + len(_min_severity_instruction(settings.min_severity))
+            )
+            est_tokens = prompt_chars // OLLAMA_CHARS_PER_TOKEN
+            if est_tokens >= num_ctx:
+                certainty = "known" if enforced else "advisory"
+                sys.stderr.write(
+                    f"NOTE: full-file context would make the Ollama prompt "
+                    f"~{est_tokens:,} tokens, but {settings.model} has a "
+                    f"{num_ctx:,}-token {certainty} window ({window_source}) -- "
+                    "reviewing hunks only. Raise $OLLAMA_NUM_CTX, pass "
+                    "--full-files to make this strict, or --no-full-files "
+                    "to silence this.\n"
+                )
+                reference = ""
         if reference:
             sys.stderr.write("Full-file context: on (changed files attached).\n")
         system_prompt, user_prompt = build_diff_prompts(

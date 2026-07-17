@@ -446,6 +446,15 @@ def _pricing_cache_path() -> Path:
     return _user_config_dir() / "openrouter-models-v2.json"
 
 
+def _pricing_float(value: object) -> float | None:
+    """Coerce a pricing/cache numeric field; anything odd is invalid."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
 def _load_cached_pricing() -> dict[str, dict[str, float]] | None:
     """Return cached OpenRouter pricing, or None if absent/stale/corrupt."""
     path = _pricing_cache_path()
@@ -457,7 +466,22 @@ def _load_cached_pricing() -> dict[str, dict[str, float]] | None:
     except (OSError, ValueError, KeyError, TypeError):
         # Corrupt/absent cache is not an error -- just a miss.
         return None
-    return models if isinstance(models, dict) else None
+    if not isinstance(models, dict):
+        return None
+    validated: dict[str, dict[str, float]] = {}
+    for slug, entry in models.items():
+        if not isinstance(slug, str) or not isinstance(entry, dict):
+            continue
+        prompt = _pricing_float(entry.get("prompt"))
+        completion = _pricing_float(entry.get("completion"))
+        if prompt is None or completion is None:
+            continue
+        validated_entry = {"prompt": prompt, "completion": completion}
+        context_length = _pricing_float(entry.get("context_length"))
+        if context_length is not None:
+            validated_entry["context_length"] = context_length
+        validated[slug] = validated_entry
+    return validated or None
 
 
 def _store_cached_pricing(models: dict[str, dict[str, float]]) -> None:
@@ -534,7 +558,10 @@ def model_context_limit(provider: str, model: str) -> int | None:
     info = openrouter_pricing()
     if not info or model not in info:
         return None
-    window = info[model].get("context_length")
+    entry = info.get(model)
+    if not isinstance(entry, dict):
+        return None
+    window = _pricing_float(entry.get("context_length"))
     return int(window) if window else None
 
 
@@ -556,8 +583,14 @@ def estimate_cost_usd(
     prices = openrouter_pricing()
     if not prices or model not in prices:
         return None
-    p = prices[model]
-    return prompt_tokens * p["prompt"] + max_completion_tokens * p["completion"]
+    p = prices.get(model)
+    if not isinstance(p, dict):
+        return None
+    prompt_price = _pricing_float(p.get("prompt"))
+    completion_price = _pricing_float(p.get("completion"))
+    if prompt_price is None or completion_price is None:
+        return None
+    return prompt_tokens * prompt_price + max_completion_tokens * completion_price
 
 
 def format_cost(usd: float) -> str:

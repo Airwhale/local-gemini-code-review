@@ -18,6 +18,7 @@ No network, no git, no Ollama server required.
 from __future__ import annotations
 
 import argparse
+from typing import Any
 
 import pytest
 
@@ -224,8 +225,8 @@ class TestMinFoundByPropagation:
     feature instead of the feature. These assert the wiring end to end.
     """
 
-    def _ns(self, **kw):
-        base = dict(
+    def _ns(self, **kw: Any) -> argparse.Namespace:
+        base: dict[str, Any] = dict(
             base=None,
             pr=None,
             staged=False,
@@ -361,6 +362,20 @@ class TestCostEstimate:
         # Offline / rate-limited / shape change -- all just "no estimate".
         monkeypatch.setattr(providers, "openrouter_pricing", lambda: None)
         assert estimate_cost_usd("openrouter", "m", 1000, 500) is None
+
+    def test_malformed_pricing_returns_none(self, monkeypatch) -> None:
+        # A corrupt cache must not turn a courtesy estimate into a fatal
+        # pre-call crash.
+        monkeypatch.setattr(providers, "openrouter_pricing", lambda: {"m": "bad"})
+        assert estimate_cost_usd("openrouter", "m", 1000, 500) is None
+
+        monkeypatch.setattr(
+            providers,
+            "openrouter_pricing",
+            lambda: {"m": {"prompt": "bad", "completion": 1.0}},
+        )
+        assert estimate_cost_usd("openrouter", "m", 1000, 500) is None
+        assert providers.model_context_limit("openrouter", "m") is None
 
     def test_ollama_is_free(self) -> None:
         assert estimate_cost_usd("ollama", "qwen3-coder:30b", 10_000, 8_000) == 0.0
