@@ -450,7 +450,7 @@ def _pricing_float(value: object) -> float | None:
     """Coerce a pricing/cache numeric field; anything odd is invalid."""
     if isinstance(value, bool):
         return None
-    if isinstance(value, int | float):
+    if isinstance(value, (int, float)):
         return float(value)
     return None
 
