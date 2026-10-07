@@ -78,14 +78,17 @@ def _run_git(args: list[str]) -> str:
     is defensive in case git ever emits bytes that aren't valid UTF-8
     (rare; usually a corrupted file).
     """
+    # NUL-delimited path output must preserve embedded CR/LF characters;
+    # subprocess text mode would normalize those characters in filenames.
+    nul_delimited = "-z" in args
     try:
         result = subprocess.run(
             args,
             capture_output=True,
-            text=True,
+            text=not nul_delimited,
             check=True,
-            encoding="utf-8",
-            errors="replace",
+            encoding=None if nul_delimited else "utf-8",
+            errors=None if nul_delimited else "replace",
         )
     except FileNotFoundError as exc:
         # Same typed-error contract as ``pr_diff`` gives missing ``gh``:
@@ -104,9 +107,17 @@ def _run_git(args: list[str]) -> str:
         # the caller has to fix before retry makes sense.
         raise ConfigError(
             f"`{' '.join(args)}` failed (exit {exc.returncode})",
-            detail=exc.stderr.strip(),
+            detail=(
+                exc.stderr.decode("utf-8", errors="replace")
+                if isinstance(exc.stderr, bytes)
+                else exc.stderr
+            ).strip(),
         ) from exc
-    return result.stdout
+    return (
+        result.stdout.decode("utf-8", errors="replace")
+        if isinstance(result.stdout, bytes)
+        else result.stdout
+    )
 
 
 def git_diff_local(base: str | None, staged: bool) -> str:
@@ -301,12 +312,14 @@ def changed_file_paths(args: argparse.Namespace) -> list[Path]:
     if args.pr:
         return _rebase_repo_relative(pr_changed_files(args.pr, args.repo))
     if args.staged:
-        output = _run_git(["git", "diff", "--cached", "--name-only"])
+        output = _run_git(["git", "diff", "--cached", "--name-only", "-z"])
     elif args.base:
-        output = _run_git(["git", "diff", "--name-only", args.base])
+        output = _run_git(["git", "diff", "--name-only", "-z", args.base])
     else:
-        output = _run_git(["git", "diff", "--name-only", "--merge-base", "origin/HEAD"])
-    return _rebase_repo_relative([Path(line) for line in output.splitlines() if line])
+        output = _run_git(
+            ["git", "diff", "--name-only", "-z", "--merge-base", "origin/HEAD"]
+        )
+    return _rebase_repo_relative([Path(name) for name in output.split("\0") if name])
 
 
 def _glob_match(path: Path, patterns: tuple[str, ...] | list[str]) -> bool:
@@ -357,8 +370,8 @@ def gather_codebase_files(includes: list[str], excludes: list[str]) -> list[Path
     expected to be the project being reviewed, since we run ``git
     ls-files`` against CWD).
     """
-    output = _run_git(["git", "ls-files"])
-    paths = [Path(line) for line in output.splitlines() if line]
+    output = _run_git(["git", "ls-files", "-z"])
+    paths = [Path(name) for name in output.split("\0") if name]
 
     # Step 2: user --include filter.
     if includes:

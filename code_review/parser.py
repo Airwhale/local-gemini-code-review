@@ -727,7 +727,7 @@ def build_json_envelope(
         "parse_ok": parsed.parse_ok,
         "problems": parsed.problems,
     }
-    if resolved is not None:
+    if resolved is not None and not result.truncated:
         envelope["resolved"] = resolved
     if not parsed.parse_ok:
         envelope["raw"] = raw_markdown

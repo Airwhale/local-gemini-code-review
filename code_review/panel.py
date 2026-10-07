@@ -15,7 +15,6 @@ from code_review.errors import ReviewError
 from code_review.parser import (
     Finding,
     ParsedReview,
-    _location_match,
     finding_fingerprint,
     findings_match,
 )
@@ -49,25 +48,12 @@ class MergedFinding:
 
 
 def panel_findings_match(a: Finding, b: Finding) -> bool:
-    """Do two findings from DIFFERENT models describe the same issue?
+    """Require matching issue fingerprints and compatible line locations.
 
-    Strong fingerprint match, or same location AND same severity. The
-    location tier is tighter than the baseline matcher's (which ignores
-    severity): consensus is sold as a high-precision signal, and merging
-    two different same-hunk findings from different models would
-    manufacture false confidence. Under-merging just leaves found_by=1,
-    which is the empirical norm anyway.
+    Nearby lines and equal severity alone cannot establish agreement.
+    Reworded titles stay separate unless title normalization makes them equal.
     """
-    if findings_match(a, b):
-        return True
-    # Location tier: BOTH lines must be known. A line-less finding
-    # matching "any line in the same file" would let one vague finding
-    # absorb an unrelated specific one and manufacture consensus. (The
-    # baseline matcher keeps the looser rule deliberately -- there the
-    # cost of a miss is a mislabeled status, not false confidence.)
-    if a.line is None or b.line is None:
-        return False
-    return a.severity == b.severity and _location_match(a.file, a.line, b.file, b.line)
+    return findings_match(a, b)
 
 
 def merge_panel_findings(
