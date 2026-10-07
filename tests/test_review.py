@@ -168,7 +168,7 @@ class TestResolveModel:
         for var in ("OPENROUTER_MODEL", "GEMINI_MODEL", "OLLAMA_MODEL"):
             monkeypatch.delenv(var, raising=False)
         assert _resolve_model(_ns("openrouter")) == "google/gemini-2.5-pro"
-        assert _resolve_model(_ns("gemini")) == "gemini-2.5-pro"
+        assert _resolve_model(_ns("gemini")) == "gemini-3.8-flash"
         assert _resolve_model(_ns("ollama")) == "qwen3-coder:30b"
 
     def test_env_var_alias_resolves_too(self, monkeypatch: pytest.MonkeyPatch):

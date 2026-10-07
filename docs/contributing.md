@@ -17,6 +17,13 @@
 > uv run --group dev mypy                # type check (config in pyproject.toml)
 > ```
 >
+> Coverage gates: `uv run --group dev pytest --cov=code_review` requires
+> at least 75% overall coverage. CI also requires 100% line coverage of
+> `code_review/generation.py`. Local commit hooks run lint, formatting,
+> types, and the suite with coverage. Enable them with
+> `uv run --group dev pre-commit install`; run them manually with
+> `uv run --group dev pre-commit run --all-files`.
+>
 > Two invariants PRs must respect: the upstream prompt files
 > (`skills/code-review-commons/`, `commands/code-review.toml`,
 > `commands/pr-code-review.toml`) stay byte-identical, and the error

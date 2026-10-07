@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import sys
 import time
 from collections.abc import Callable
@@ -30,6 +31,15 @@ from code_review.errors import (
     ReviewError,
     SafetyRefusal,
     TransportError,
+)
+from code_review.generation import (
+    GeminiContent,
+    GeminiGenerationConfig,
+    GeminiPart,
+    GeminiRequest,
+    OpenRouterMessage,
+    OpenRouterRequest,
+    uses_default_sampling,
 )
 
 T = TypeVar("T")
@@ -77,7 +87,7 @@ MAX_RETRY_SLEEP = 300.0
 PROVIDERS = ("openrouter", "gemini", "ollama")
 DEFAULT_MODEL_BY_PROVIDER: dict[str, str] = {
     "openrouter": "google/gemini-2.5-pro",
-    "gemini": "gemini-2.5-pro",
+    "gemini": "gemini-3.8-flash",
     # Ollama default. ``qwen3-coder:30b`` is the MoE coder model with
     # ~3.3B active params -- best quality/speed balance on CPU. If the
     # user hasn't pulled it, ``call_ollama`` raises a typed ConfigError
@@ -164,7 +174,8 @@ OLLAMA_POST_VERIFY_MARGIN = 0.98
 # leaves generation room (Ollama's output shares num_ctx).
 OLLAMA_WINDOW_FILL = 0.85
 
-# Sampling temperature for the model. History of this constant:
+# Sampling temperature for non-Gemini models. Gemini uses model defaults
+# on both cloud routes. History of this constant before that migration:
 #
 #   0.2  (original): too conservative -- 1-2 findings per round on diffs
 #        that plausibly contained more; 5-7 rounds to converge.
@@ -451,7 +462,11 @@ def _pricing_float(value: object) -> float | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        try:
+            number = float(value)
+        except OverflowError:
+            return None
+        return number if math.isfinite(number) else None
     return None
 
 
@@ -645,20 +660,15 @@ def call_openrouter(
     "Error model" section for the contract. ``main`` catches and formats
     them with the correct exit code.
     """
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+    payload = OpenRouterRequest(
+        model=model,
+        messages=[
+            OpenRouterMessage(role="system", content=system_prompt),
+            OpenRouterMessage(role="user", content=user_prompt),
         ],
-        # Temperature broadens exploration so more findings surface per
-        # call; the upstream prompt's "Critical Constraints" section
-        # still gates *quality*. ``max_tokens`` is a ceiling so a
-        # thorough review isn't truncated mid-finding -- the user pays
-        # only for tokens actually emitted, not the unused headroom.
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
+        temperature=None if uses_default_sampling("openrouter", model) else temperature,
+        max_tokens=max_tokens,
+    )
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -671,7 +681,11 @@ def call_openrouter(
 
     try:
         with _make_client(HTTP_TIMEOUT) as client:
-            response = client.post(OPENROUTER_URL, headers=headers, json=payload)
+            response = client.post(
+                OPENROUTER_URL,
+                headers=headers,
+                json=payload.model_dump(exclude_none=True),
+            )
     except httpx.RequestError as exc:
         # Network-level failure: DNS, TCP, timeout, connection reset.
         # Distinct from a provider 5xx (which is also a transport-class
@@ -811,21 +825,17 @@ def call_gemini(
     return a ``CallResult``. Caller builds the prompts (same as
     ``call_openrouter``) so the wire path is mode-agnostic. Raises typed
     ``ReviewError`` subclasses; see README "Error model".
+
+    ``temperature`` is retained for caller compatibility but never sent.
+    Sampling and thinking use model defaults.
     """
-    payload = {
-        "contents": [
-            {"role": "user", "parts": [{"text": user_prompt}]},
+    payload = GeminiRequest(
+        contents=[
+            GeminiContent(role="user", parts=[GeminiPart(text=user_prompt)]),
         ],
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
-        "generationConfig": {
-            # camelCase keys per the v1beta generateContent spec.
-            # ``maxOutputTokens`` is the ceiling on generated tokens;
-            # ``temperature`` matches the OpenRouter side so review
-            # behavior is consistent across providers.
-            "temperature": temperature,
-            "maxOutputTokens": max_tokens,
-        },
-    }
+        system_instruction=GeminiContent(parts=[GeminiPart(text=system_prompt)]),
+        generation_config=GeminiGenerationConfig(max_output_tokens=max_tokens),
+    )
     headers = {
         "Content-Type": "application/json",
         # ``x-goog-api-key`` is the documented auth header for the v1beta
@@ -837,7 +847,11 @@ def call_gemini(
 
     try:
         with _make_client(HTTP_TIMEOUT) as client:
-            response = client.post(url, headers=headers, json=payload)
+            response = client.post(
+                url,
+                headers=headers,
+                json=payload.model_dump(by_alias=True, exclude_none=True),
+            )
     except httpx.RequestError as exc:
         raise TransportError(
             f"Gemini request failed before response: {exc}",

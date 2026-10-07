@@ -1,0 +1,5 @@
+{
+  "contents": [{"parts": [{"text": "u"}], "role": "user"}],
+  "systemInstruction": {"parts": [{"text": "s"}]},
+  "generationConfig": {"maxOutputTokens": 100}
+}

@@ -31,7 +31,7 @@ providers selectable at the command line:
       size and CPU/GPU.
 
 Provider defaults: openrouter -> ``google/gemini-2.5-pro``, gemini ->
-``gemini-2.5-pro``, ollama -> ``qwen3-coder:30b`` (the MoE coder model
+``gemini-3.8-flash``, ollama -> ``qwen3-coder:30b`` (the MoE coder model
 with ~3.3B active params, the quality/speed sweet spot on CPU). The
 ``--model <slug>`` flag overrides per call; ``--provider openrouter``
 and ``--provider ollama`` also accept named aliases (see
@@ -121,6 +121,7 @@ from code_review.errors import (
     TransportError,
     _print_error,
 )
+from code_review.generation import uses_default_sampling
 from code_review.panel import (
     _CATEGORY_PRECEDENCE,
     _SEVERITY_RANK,
@@ -888,6 +889,16 @@ def _validate_flag_combos(args: argparse.Namespace) -> None:
         )
 
 
+def _temperature_summary(settings: Settings) -> str:
+    models = settings.models or (settings.model,)
+    defaults = [uses_default_sampling(settings.provider, model) for model in models]
+    if all(defaults):
+        return f"model default (Gemini; configured {settings.temperature} ignored)"
+    if any(defaults):
+        return f"{settings.temperature} (Gemini uses model default)"
+    return str(settings.temperature)
+
+
 def _dry_run_report(
     settings: Settings, request: ReviewRequest, ollama_window: str | None = None
 ) -> str:
@@ -909,7 +920,7 @@ def _dry_run_report(
         f"provider:          {settings.provider}",
         model_line,
         f"mode:              {request.mode}",
-        f"temperature:       {settings.temperature}",
+        f"temperature:       {_temperature_summary(settings)}",
         f"max_tokens:        {settings.max_tokens}",
         f"retries:           {settings.retries}",
         f"min_severity:      {settings.min_severity}",
@@ -1294,7 +1305,7 @@ def main() -> None:
         help=(
             "Model slug or alias. Defaults to the provider-appropriate "
             "value (``google/gemini-2.5-pro`` for openrouter, "
-            "``gemini-2.5-pro`` for gemini, ``qwen3-coder:30b`` for "
+            "``gemini-3.8-flash`` for gemini, ``qwen3-coder:30b`` for "
             "ollama). Override with $OPENROUTER_MODEL / $GEMINI_MODEL / "
             "$OLLAMA_MODEL respectively. Aliases: pro/gemini-pro, "
             "flash/gemini-flash, claude/claude-sonnet, claude-opus, "
@@ -1401,13 +1412,10 @@ def main() -> None:
         default=None,
         metavar="FLOAT",
         help=(
-            f"Sampling temperature. Default {DEFAULT_TEMPERATURE} -- "
-            "tuned between the original 0.2 (too conservative, "
-            "missed real findings) and a brief 0.5 default (caught "
-            "more but produced hallucinated findings on cross-model "
-            "review). Range typically 0.0-1.0; higher widens "
-            "exploration at higher hallucination risk. Override with "
-            "$CODE_REVIEW_TEMPERATURE."
+            f"Sampling temperature for non-Gemini models. Default "
+            f"{DEFAULT_TEMPERATURE}; range 0.0-2.0. Gemini uses model "
+            "defaults on both direct and OpenRouter routes, so this "
+            "option is ignored for Gemini. Override with $CODE_REVIEW_TEMPERATURE."
         ),
     )
     parser.add_argument(
@@ -1626,14 +1634,14 @@ def main() -> None:
         sys.stderr.write(
             f"Reviewing {len(request.files)} file(s) "
             f"({request.payload_chars:,} chars) with `{reviewer}` "
-            f"via {settings.provider} (T={settings.temperature}, "
+            f"via {settings.provider} (T={_temperature_summary(settings)}, "
             f"max_tokens={settings.max_tokens})...\n"
         )
     else:
         sys.stderr.write(
             f"Reviewing {request.payload_chars:,}-char diff with "
             f"`{reviewer}` via {settings.provider} "
-            f"(T={settings.temperature}, max_tokens={settings.max_tokens})...\n"
+            f"(T={_temperature_summary(settings)}, max_tokens={settings.max_tokens})...\n"
         )
 
     # Money before the spend, not after. Auto full-file context makes payloads

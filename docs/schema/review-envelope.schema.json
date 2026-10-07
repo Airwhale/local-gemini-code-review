@@ -31,7 +31,10 @@
       "items": { "type": "string" },
       "description": "Panel runs only: the resolved model slugs in CLI order."
     },
-    "temperature": { "type": "number" },
+    "temperature": {
+      "type": "number",
+      "description": "Configured temperature for non-Gemini models. Gemini requests omit this parameter on direct and OpenRouter routes and use model defaults. This field is retained for schema_version 1 compatibility; it is not the effective Gemini sampling temperature."
+    },
     "summary": {
       "type": ["string", "null"],
       "description": "The model's change/codebase summary; null when absent or for panel/chunked documents (which have no single summary)."

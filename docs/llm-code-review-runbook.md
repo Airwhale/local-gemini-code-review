@@ -76,7 +76,7 @@ Secrets are configured once (per-user or checkout `.env` — see Setup) and work
 | `--provider`    | Env key required        | Default model            | Notes                                                                                   |
 |-----------------|-------------------------|--------------------------|-----------------------------------------------------------------------------------------|
 | `openrouter` *  | `OPENROUTER_API_KEY`    | `google/gemini-2.5-pro`  | Default. Reliable quota; recommended for iterative work.                                |
-| `gemini`        | `GEMINI_API_KEY`        | `gemini-2.5-pro`         | Direct to Google AI Studio. **Free tier has zero quota for pro** — use flash if free.   |
+| `gemini`        | `GEMINI_API_KEY`        | `gemini-3.8-flash`       | Direct to Google AI Studio. Access and quota depend on your account. |
 | `ollama`        | *(none — local)*        | `qwen3-coder:30b`        | Offline / no API key / no token cost. CPU inference is slower (1–5 min per review typical). Different failure mode than cloud — see "Local vs cloud" below. |
 
 \* default
@@ -134,6 +134,15 @@ The runner's Ollama-specific errors are surgical: a connection refusal raises `C
 
 Two runtime knobs control how much the model says and how exploratory it is:
 
+**Gemini sampling migration:** `--temperature` and `CODE_REVIEW_TEMPERATURE`
+apply only to non-Gemini models. Direct Gemini and OpenRouter `google/gemini-*`
+requests omit sampling parameters and use the model's default thinking behavior.
+The numeric `temperature` in JSON output and the eval table's `T` column record
+the configured value, not an effective Gemini setting. Use one temperature for
+Gemini evals. `--max-tokens` still applies, including to Gemini's combined
+thinking and response tokens; a small ceiling can exhaust the budget before
+the review text is produced.
+
 | Flag | Default | What it controls | When to change |
 |---|---|---|---|
 | `--temperature <float>` | `0.3` (env: `CODE_REVIEW_TEMPERATURE`) | Sampling randomness. Higher = more exploration, more findings per call, more hallucinations. Lower = tighter, more conservative, fewer findings. | Drop to `0.2` for security-critical PRs where decline-comment overhead is expensive. Raise to `0.5–0.7` for first-pass audits where you want maximum coverage and can afford the false-positive rate. |
@@ -141,7 +150,8 @@ Two runtime knobs control how much the model says and how exploratory it is:
 | `--min-severity <LEVEL>` | `LOW` (no filter; env: `CODE_REVIEW_MIN_SEVERITY`) | Severity floor: `MEDIUM`/`HIGH`/`CRITICAL` drop lower-severity findings. Asked of the model in the prompt AND enforced post-parse in `--format json` envelopes and panel reports (verbatim markdown stays best-effort). | `HIGH` for fast pre-commit gates; leave at `LOW` for the thorough pre-PR pass. |
 | `--retries <N>` | `0` (env: `CODE_REVIEW_RETRIES`) | Extra retry attempts beyond the built-in single transient retry; `N > 0` also retries RATE_LIMIT honoring `Retry-After` (clamped 300s). | Set `2–3` for unattended runs; keep `0` when your agent loop manages its own backoff. |
 
-The temperature default has been retuned twice based on empirical observation:
+The historical temperature default was retuned twice before this migration.
+The following observations do not establish a current Gemini tuning control:
 
 - **`0.2`** (original): too conservative — 1–2 findings per round on diffs that plausibly contained more, requiring 5–7 rounds to converge.
 - **`0.5`** (raised in response to the above): Prone to hallucinations. more findings per round (3–5 typical), but during cross-model integration testing `google/gemini-2.5-pro` produced a HIGH-severity finding that referenced a CLI flag (`--timeout`) and quoted "help text" that did not exist in the codebase. The proposed fix would have crashed the runner with `AttributeError: 'Namespace' object has no attribute 'timeout'`. Confident, well-formatted, and a hallucination.
@@ -273,7 +283,7 @@ See the README's "Safety context" section for the default phrasing.
 
 ## Known gotchas
 
-1. **Free-tier 429 on Gemini direct.** `--provider gemini --model gemini-2.5-pro` required a paid Google AI Studio plan as of late 2025 — the free tier returned HTTP 429 immediately (`RATE_LIMIT`, exit 11). Quota policy is Google's to change; the symptom is what's stable. Either use `--provider openrouter` (preferred) or `--model gemini-2.5-flash`.
+1. **Gemini direct access and quota.** Older Gemini 2.5 models may return HTTP 404 for accounts without legacy access. The default is now `gemini-3.8-flash`. HTTP 429 (`RATE_LIMIT`, exit 11) means the chosen model has no available quota; check AI Studio billing and quota, choose a model available to the account, or use `--provider openrouter`. HTTP 503 is temporary provider unavailability and follows the transport retry policy.
 
 2. **Codebase mode line numbers used to drift.** Before commit `b124501`, the bundle had no per-line anchors and the model estimated line positions from visual context, drifting 5–150 lines depending on file size. As of `b124501` every content line is pre-numbered (`cat -n` style) and the model transcribes the prefix instead of counting. If you ever see drift again on a current build, that's a regression worth investigating — the prompt or bundle format may have been changed in a way that broke the contract.
 

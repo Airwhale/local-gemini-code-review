@@ -132,8 +132,23 @@ class TestReferenceSection:
 
 
 class TestAutoFullFilesOllama:
-    def test_drops_reference_before_known_context_overflow(
-        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    @pytest.mark.parametrize(
+        ("full_files", "window", "enforced", "keep_reference"),
+        [
+            (None, 1_000, True, False),
+            (None, 1_000, False, False),
+            (None, 4_000, True, True),
+            (True, 1_000, True, True),
+        ],
+    )
+    def test_reference_respects_window_and_explicit_setting(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+        full_files: bool | None,
+        window: int,
+        enforced: bool,
+        keep_reference: bool,
     ) -> None:
         diff = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n"
         reference = "r" * 5_000
@@ -146,7 +161,11 @@ class TestAutoFullFilesOllama:
         monkeypatch.setattr(
             review,
             "_resolve_ollama_window",
-            lambda host, model, env: (1_000, True, "env"),
+            lambda host, model, env: (
+                window,
+                enforced,
+                "env" if enforced else "advisory-default",
+            ),
         )
 
         def fake_build_diff_prompts(
@@ -160,7 +179,7 @@ class TestAutoFullFilesOllama:
             codebase=False,
             include=[],
             exclude=[],
-            full_files=None,
+            full_files=full_files,
             diff_file=None,
             pr=None,
             staged=False,
@@ -176,12 +195,16 @@ class TestAutoFullFilesOllama:
 
         request = review._build_request(args, settings)
 
-        assert request.payload_chars == len(diff)
-        assert request.user_prompt == "U_HUNK"
-        assert prompt_full_flags == [True, False]
+        assert request.payload_chars == len(diff) + (
+            len(reference) if keep_reference else 0
+        )
+        assert request.user_prompt == (
+            "U_FULL" + reference if keep_reference else "U_HUNK"
+        )
+        assert prompt_full_flags == ([True] if full_files else [True, keep_reference])
         err = capsys.readouterr().err
-        assert "reviewing hunks only" in err
-        assert "Full-file context: on" not in err
+        assert ("reviewing hunks only" in err) is not keep_reference
+        assert ("Full-file context: on" in err) is keep_reference
 
 
 class TestChangedFilePaths:

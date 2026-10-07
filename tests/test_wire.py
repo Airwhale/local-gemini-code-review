@@ -370,6 +370,7 @@ class TestOllamaWire:
             body = json.loads(req.content)
             # The native payload shape: options carry the tuning knobs.
             assert body["options"]["num_predict"] == 100
+            assert body["options"]["temperature"] == 0.3
             assert "num_ctx" not in body["options"]  # None -> omitted
             assert body["stream"] is False
             return _json_response(

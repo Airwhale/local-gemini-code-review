@@ -226,7 +226,7 @@ class TestMinFoundByPropagation:
     """
 
     def _ns(self, **kw: Any) -> argparse.Namespace:
-        base: dict[str, Any] = dict(
+        base: dict[str, object] = dict(
             base=None,
             pr=None,
             staged=False,

@@ -31,7 +31,9 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
       - name: Run tests
-        run: uv run --group dev pytest tests/ -v
+        run: uv run --group dev pytest tests/ -v --cov=code_review
+      - name: Require complete coverage of generation request contracts
+        run: uv run --group dev coverage report --include="*/generation.py" --fail-under=100
       - name: Build wheel and verify prompt assets ship inside it
         run: |
           uv build
