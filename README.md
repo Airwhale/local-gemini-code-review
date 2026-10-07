@@ -295,6 +295,11 @@ Three states:
 
 Auto is best-effort by design: it costs tokens, so it declines rather than errors. Whenever files are attached you'll see `Full-file context: on (changed files attached).` on stderr.
 
+For Ollama, auto mode also checks the estimated prompt against the resolved
+context window, including the advisory window when the model is not loaded.
+If it does not fit, the runner emits a `NOTE:` and reviews the diff hunks.
+Explicit `--full-files` keeps its strict behavior.
+
 **When files can't be attached, the prompt compensates.** Diff-mode reviews carry an *evidence-discipline* rule telling the model exactly what it can't see — that absence from a hunk is not absence from the file, that claims depending on unseen code must be prefixed `NEEDS-VERIFICATION:`, and that a suggestion identical to the shown code is not a finding. When full files *are* attached the rule flips (the changed files are visible; only unchanged files elsewhere are not), because telling a model a file is hidden when it isn't suppresses correct findings. The rule is review instruction, not safety framing, so `--no-context` does **not** strip it.
 
 **`--chunk`** (opt-in): when the payload exceeds the budget — 700K chars for cloud, or the Ollama window — the runner splits **at file boundaries** into sequential chunk reviews instead of erroring:

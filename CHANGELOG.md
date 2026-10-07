@@ -22,6 +22,7 @@ The changes fall into three groups: **remove the blind spot** (auto full-file co
 
 ### Fixed
 
+- Automatic full-file context now falls back to diff hunks when the estimated Ollama prompt exceeds its resolved window. Corrupt OpenRouter pricing entries, including oversized integers and non-finite values, no longer prevent reviews of models with valid cached data.
 - Gemini requests now omit deprecated sampling controls on both the direct API and OpenRouter `google/gemini-*` routes. Thinking uses the model default; no thinking budget is sent. CLI help, dry runs, and progress messages explain when temperature is ignored. Cloud request payloads are validated with Pydantic v2. The existing numeric JSON `temperature` field is preserved as the configured value. Non-Gemini sampling is unchanged.
 - The direct Gemini provider defaults to `gemini-3.8-flash`; Google restricts access to the former `gemini-2.5-pro` default for new users. Explicit model settings still take precedence. OpenRouter defaults and aliases are unchanged.
 - **`--min-found-by` was a silent no-op.** It was parsed and validated but never passed into the `Settings` constructor, so the panel filter read the dataclass default (1) and dropped nothing — the flag did exactly what not passing it did. Found by dogfooding this tool on its own diff.
