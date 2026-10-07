@@ -76,12 +76,12 @@ Three transport paths — two cloud, one local:
 | Provider | Endpoint | Required env var | Default model | Notes |
 |---|---|---|---|---|
 | `openrouter` (default) | `openrouter.ai/api/v1/chat/completions` | `OPENROUTER_API_KEY` | `google/gemini-2.5-pro` | OpenAI-compatible wire format. One bill for many vendors — this is what makes cross-model panels cheap. Optional `OPENROUTER_HTTP_REFERER` / `OPENROUTER_X_TITLE` set the attribution headers shown in OpenRouter's dashboard. |
-| `gemini` | `generativelanguage.googleapis.com/v1beta/…` | `GEMINI_API_KEY` | `gemini-2.5-pro` | Google AI Studio's `generateContent`, one less hop. |
+| `gemini` | `generativelanguage.googleapis.com/v1beta/…` | `GEMINI_API_KEY` | `gemini-3.8-flash` | Google AI Studio's `generateContent`, one less hop. |
 | `ollama` | `{OLLAMA_HOST}/api/chat` (default `http://localhost:11434`) | none — local server | `qwen3-coder:30b` | Native endpoint (per-request `num_ctx`, `prompt_eval_count` truncation detection). No API key, no token costs, code never leaves the machine. CPU inference is slower (1–5 min/review typical). |
 
 Set a per-environment default with `CODE_REVIEW_PROVIDER=<name>` so you don't pass `--provider` every call.
 
-**Known gotcha for the Gemini API path:** the free tier had zero per-day quota for `gemini-2.5-pro` as of late 2025 (verify against [Google's pricing page](https://ai.google.dev/pricing) if it matters) — the symptom is an immediate HTTP 429 (`RATE_LIMIT`, exit 11). Workarounds: `--model gemini-2.5-flash` (free tier allows flash, and it's ~3× faster), a paid AI Studio plan, or `--provider openrouter` (its own pro quota, billed directly).
+**Gemini model access and quota:** Google restricts Gemini 2.5 access for new users, so direct requests can return HTTP 404. The direct-provider default is now Gemini 3.8 Flash. Model availability and quota depend on your account; HTTP 429 means quota is exhausted and HTTP 503 means the provider is temporarily unavailable. See [Google's release notes](https://ai.google.dev/gemini-api/docs/changelog) and [rate limits](https://ai.google.dev/gemini-api/docs/rate-limits). OpenRouter uses separate routing and quota.
 
 ### When to use the Ollama (local) provider
 
@@ -138,7 +138,7 @@ Requesting the conservative 4K estimate in the unknown case would *shrink* a big
 
 **Ollama aliases**: `local` → `qwen3-coder:30b` (recommended CPU default), `local-pro` → `qwen3-coder-next` (80B/3B MoE, ~52 GB).
 
-**The `gemini` (direct-API) provider has no aliases** — it takes bare Gemini model names only (`gemini-2.5-pro`, `gemini-2.5-flash`). Raw slugs always pass through unchanged, so anything OpenRouter serves or anything pulled into Ollama works via `--model <slug>` without needing an alias.
+**The `gemini` (direct-API) provider has no aliases**; it takes bare Gemini model names such as `gemini-3.8-flash` and `gemini-3.1-pro-preview`. Raw slugs pass through unchanged, so a model available to your provider and account works via `--model <slug>` without needing an alias.
 
 ## Review modes
 
@@ -190,7 +190,7 @@ A 700,000-char (~175K-token) bundle cap is enforced pre-flight — conservative 
 
 ## Everyday flags
 
-- `--temperature <float>` (default `0.3`, env `CODE_REVIEW_TEMPERATURE`): sampling randomness — higher finds more per call but hallucinates more. The default was retuned twice on evidence: 0.2 was too conservative (1–2 findings/round, slow convergence), 0.5 produced a confident hallucination in cross-model testing, 0.3 is the compromise. The full story lives in the [runbook](./docs/llm-code-review-runbook.md#tuning-sampling---temperature-and---max-tokens); the [eval harness](#development) can settle retuning debates with data.
+- `--temperature <float>` (default `0.3`, env `CODE_REVIEW_TEMPERATURE`): sampling randomness for non-Gemini models on OpenRouter and for Ollama. **Ignored for Gemini**, both direct and OpenRouter (`google/gemini-*`), which uses model defaults. Dry runs and progress messages show when defaults apply. The historical tuning notes are in the [runbook](./docs/llm-code-review-runbook.md#tuning-sampling---temperature-and---max-tokens).
 - `--max-tokens <int>` (default `16000`, env `CODE_REVIEW_MAX_TOKENS`): output ceiling, not a target — you pay only for what's emitted. If the model hits it mid-review, the partial output still prints, with a `WARN: … truncated at max_tokens` stderr line so callers know the list may be incomplete.
 - `--min-severity <LEVEL>` (default `LOW` = no filter, env `CODE_REVIEW_MIN_SEVERITY`): report only findings at or above `MEDIUM`/`HIGH`/`CRITICAL` — a fast pre-commit gate vs. the thorough pre-PR pass. Asked of the model via a fork-owned prompt appendix (upstream prompt files stay untouched) **and enforced after parsing** wherever the runner synthesizes findings: `--format json` envelopes (including the baseline diff, so `resolved` can't fill with merely-filtered entries) and panel reports. Verbatim markdown output remains best-effort — the model's own text isn't rewritten. Findings whose severity couldn't be parsed are always kept.
 - `--no-project-config`: ignore any `.code-review.toml` found for the reviewed repo — recommended when auditing untrusted checkouts (see [Per-project configuration](#per-project-configuration-code-reviewtoml)).
@@ -202,6 +202,14 @@ A 700,000-char (~175K-token) bundle cap is enforced pre-flight — conservative 
 - `--version`: print the installed version and exit.
 
 After each successful call, a `[usage] prompt=… completion=… total=… tokens (provider/model)` stderr line reports what the provider billed (never estimated).
+
+Gemini requests omit `temperature`, `top_p`, `top_k`, and thinking configuration.
+Omitting thinking configuration uses the model default and avoids deprecated
+`thinking_budget` without requiring model-specific thinking levels. The existing
+`generateContent` endpoint remains supported. See the
+[migration decision](./docs/architecture/0001-gemini-generation-parameters.md).
+In JSON reports, `temperature` remains the configured numeric value for
+compatibility; it is not an effective Gemini sampling value.
 
 **Cost, before you spend it.** A `[cost] est ~$0.17 -- ceiling: prompt ~7,388 tok + completion <= 16,000 tok` line prints alongside "Reviewing…", and `--dry-run` reports the same as `est_cost`. It's an honest **ceiling**, not a prediction: the prompt side is estimated (chars/4 — no local tokenizer) and the completion side is bounded by `--max-tokens` rather than guessed. Panels sum every model. Prices come from OpenRouter's live feed (cached for a day in your config dir), so they can't silently go stale; Ollama reports `$0.00 (local)`. **When pricing can't be sourced the line is simply omitted** — for `--provider gemini` (no unauthenticated price feed), an unknown slug, or an unreachable feed. Same rule as `[usage]`: this tool never invents a number about money.
 
@@ -566,7 +574,7 @@ The most common symptoms, routed to their fix. Deeper operational gotchas (with 
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `ERROR: CONFIG [exit 2]` naming an API key | Key not set, or rejected by the provider (HTTP 401/403) | Set the env var for your provider ([Providers](#providers)); `.env` locations are in [Quick start](#quick-start) |
-| Immediate `RATE_LIMIT [exit 11]` on `--provider gemini` | Free-tier `gemini-2.5-pro` quota (zero per-day as of late 2025) | `--model gemini-2.5-flash`, or `--provider openrouter` |
+| Immediate `RATE_LIMIT [exit 11]` on `--provider gemini` | The selected model has no available quota for this API key | Check AI Studio quota/billing, select a model with available quota, or use `--provider openrouter` |
 | `CONTEXT_OVERFLOW [exit 12]` on Ollama | Prompt won't fit the model's loaded window — the [truncation guard](#context-window-truncation-guard) refused to run a silently-partial review | Raise `$OLLAMA_NUM_CTX` (RAM permitting), narrow the scope, or use `--chunk` |
 | `CONFIG` error mentioning `ollama serve` / connection refused | Local server not running (or WSL VM idled out) | [Setting up the Ollama provider](#setting-up-the-ollama-provider) |
 | `--pr N` reviewed a different project's PR | gh's default repo points elsewhere (common on forks) | Check the `[gh] reviewing PR #N: <url>` stderr line; pin with `--repo owner/name` |
@@ -601,8 +609,11 @@ Behavior-level changes should also run the **eval harness** — planted-bug fixt
 
 ```bash
 uv run evals/run.py --model flash                          # 4 fixtures × 1 model = 4 paid API calls
-uv run evals/run.py --model pro --temperature 0.2 --temperature 0.5   # sweep combinations
+uv run evals/run.py --model deepseek --temperature 0.2 --temperature 0.5   # non-Gemini sampling sweep
 ```
+
+The eval table's `T` column records the configured value. Gemini ignores it;
+use a single temperature when evaluating Gemini.
 
 It **spends real tokens**: it prints the planned call count and asks for confirmation unless `--yes` is passed. The `Evals` GitHub workflow is manual-dispatch only for the same reason. CI (`.github/workflows/ci.yml`) runs lint + type-check + tests on both OSes plus a wheel check proving the prompt assets ship inside the package.
 

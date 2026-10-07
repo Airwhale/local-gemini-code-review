@@ -225,7 +225,7 @@ class TestMinFoundByPropagation:
     """
 
     def _ns(self, **kw):
-        base = dict(
+        base: dict[str, object] = dict(
             base=None,
             pr=None,
             staged=False,

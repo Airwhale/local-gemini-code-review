@@ -1,0 +1,27 @@
+repos:
+  - repo: local
+    hooks:
+      - id: ruff
+        name: Ruff lint
+        entry: uv run --locked --group dev ruff check code_review tests evals review.py
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: ruff-format
+        name: Ruff format
+        entry: uv run --locked --group dev ruff format --check code_review tests evals review.py
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: mypy
+        name: Mypy
+        entry: uv run --locked --group dev mypy
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: pytest
+        name: Pytest and coverage
+        entry: uv run --locked --group dev pytest -q --cov=code_review
+        language: system
+        pass_filenames: false
+        always_run: true
