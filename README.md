@@ -186,6 +186,8 @@ code-review --codebase --exclude '**/test_*'        # widen then narrow
 
 File selection pipeline: `git ls-files` → user `--include` globs → user `--exclude` globs → built-in defensive excludes (lock files, minified output, binary/asset extensions, `dist/`, `build/`) → drop individual files over 100 KB (logged on stderr). Untracked new files need `git add -N <paths>` first to become visible.
 
+Local Git file lists use null delimiters, so Unicode, spaces, and embedded newlines in filenames remain intact in both codebase selection and changed-file reference gathering.
+
 A 700,000-char (~175K-token) bundle cap is enforced pre-flight — conservative against both Gemini 2.5 Pro (1M context) and Claude Sonnet 4.5 (200K), so one selection works for any `--model`. Over the cap, the runner exits listing the 10 largest files so you can target `--exclude` (or use [`--chunk`](#big-inputs---full-files-and---chunk)). Output is the same per-file findings shape as diff mode, with line numbers 1-indexed within each file.
 
 ## Everyday flags
@@ -269,7 +271,7 @@ Ranges are inclusive and use post-image (RIGHT-side) line numbers — the same c
 
 **`needs_verification`** is the companion field. The diff-mode prompt asks models to prefix a title `NEEDS-VERIFICATION:` when a finding depends on code they couldn't see; the parser lifts that into a boolean and strips the marker from `title`. Two consequences worth knowing: fingerprints stay stable whether or not the model hedged (so `--baseline` doesn't report a hedged re-run as a brand-new finding), and an agent can triage on the field instead of string-matching titles. Treat `needs_verification: true` as *check this against the file first* — it's the model telling you it guessed.
 
-`--baseline <prior.json>` compares current findings against a previous `--format json` run: each finding gets `status: "new" | "persisting"`, disappeared findings are listed under `resolved`, and a `[baseline] N finding(s): X new, Y persisting, Z resolved` line lands on stderr (markdown mode keeps stdout verbatim). The loop:
+`--baseline <prior.json>` compares current findings against a previous `--format json` run: each finding gets `status: "new" | "persisting"`, disappeared findings are listed under `resolved`, and a `[baseline] N finding(s): X new, Y persisting, Z resolved` line lands on stderr (markdown mode keeps stdout verbatim). If the current review is truncated, positive matches still get statuses, but `resolved` is omitted and stderr reports `resolution unknown (truncated review)`. Partial output cannot establish that an earlier issue disappeared. The loop:
 
 ```bash
 code-review --base main --format json --output round1.json
@@ -325,7 +327,7 @@ Runs the same review through several models (concurrently on cloud, capped at 4;
 
 - **Markdown**: `# Panel review (k/n models)` header, per-model one-line results, merged findings ordered by (consensus, severity, location) with `Found by:` lines, then every model's raw output verbatim in an appendix.
 - **JSON**: `models[]`, per-finding `found_by`, a `per_model[]` array (parse status, usage, truncation, or the typed error for failures), summed usage.
-- **Merging is deliberately conservative**: exact fingerprint, or same location *and* same severity — consensus must not be manufactured from two models disagreeing about the same hunk.
+- **Merging is deliberately conservative**: matching file, severity, and normalized title, with line numbers within 10 lines when both are present. Nearby findings with different titles remain separate, even at the same severity. Reworded descriptions of the same issue may therefore remain separate too; location alone cannot establish agreement.
 - **Exit contract**: ≥1 model succeeded → **exit 0** (failures as `WARN: [panel] <model> failed: …` stderr lines, machine-readable in `per_model`). All failed → one `ERROR:` block chosen by precedence `CONFIG > SAFETY_REFUSAL > CONTEXT_OVERFLOW > RATE_LIMIT > PROVIDER_HICCUP > TRANSPORT > UNKNOWN` (CLI-order ties).
 - **`--min-found-by N`** turns that signal into a filter: drop merged findings fewer than N models reported. `--min-found-by 2` keeps only what two models found *independently* — the highest-precision, lowest-effort noise filter available here. Applied after merging, to **both** formats (panel markdown is runner-synthesized too), with a `[panel] --min-found-by 2: dropped 7 finding(s)…` line on stderr; the per-model raw appendix still shows everything. Needs `--models` (a consensus count is meaningless for one model — asking for it alone is a typed `CONFIG` error). Env: `CODE_REVIEW_MIN_FOUND_BY`; also settable in `.code-review.toml`.
 - Mutually exclusive with `--model`; `--baseline` isn't supported with panels yet; per-model temperatures and streaming are out of scope.

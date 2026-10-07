@@ -217,7 +217,7 @@ class TestChangedFilePaths:
                 # so the per-mode command assertions stay focused).
                 return str(Path.cwd()) + "\n"
             calls.append(args)
-            return "one.py\ntwo.py\n"
+            return "one.py\0two.py\0"
 
         monkeypatch.setattr(sources, "_run_git", fake_run_git)
         return calls
@@ -226,19 +226,21 @@ class TestChangedFilePaths:
         calls = self._capture(monkeypatch)
         args = argparse.Namespace(pr=None, staged=True, base=None)
         assert changed_file_paths(args) == [Path("one.py"), Path("two.py")]
-        assert calls == [["git", "diff", "--cached", "--name-only"]]
+        assert calls == [["git", "diff", "--cached", "--name-only", "-z"]]
 
     def test_base(self, monkeypatch: pytest.MonkeyPatch):
         calls = self._capture(monkeypatch)
         args = argparse.Namespace(pr=None, staged=False, base="main")
         changed_file_paths(args)
-        assert calls == [["git", "diff", "--name-only", "main"]]
+        assert calls == [["git", "diff", "--name-only", "-z", "main"]]
 
     def test_default_merge_base(self, monkeypatch: pytest.MonkeyPatch):
         calls = self._capture(monkeypatch)
         args = argparse.Namespace(pr=None, staged=False, base=None)
         changed_file_paths(args)
-        assert calls == [["git", "diff", "--name-only", "--merge-base", "origin/HEAD"]]
+        assert calls == [
+            ["git", "diff", "--name-only", "-z", "--merge-base", "origin/HEAD"]
+        ]
 
 
 class TestRebaseRepoRelative:

@@ -71,7 +71,7 @@
     "resolved": {
       "type": "array",
       "items": { "type": "object" },
-      "description": "--baseline runs only: baseline findings nothing in this round matched (prior-round finding objects, verbatim)."
+      "description": "--baseline runs only: baseline findings nothing in this round matched (prior-round finding objects, verbatim). Omitted when the current review is truncated because incomplete output cannot establish resolution."
     },
     "per_model": {
       "type": "array",

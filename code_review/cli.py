@@ -1774,9 +1774,16 @@ def main() -> None:
             statuses, resolved = diff_against_baseline(parsed.findings, baseline_doc)
             new = statuses.count("new")
             persisting = statuses.count("persisting")
+            if result.truncated:
+                # Positive matches remain useful; absence in partial output
+                # cannot establish that a baseline finding was resolved.
+                resolved = None
+                resolution = "resolution unknown (truncated review)"
+            else:
+                resolution = f"{len(resolved)} resolved"
             sys.stderr.write(
                 f"[baseline] {len(parsed.findings)} finding(s): {new} new, "
-                f"{persisting} persisting, {len(resolved)} resolved\n"
+                f"{persisting} persisting, {resolution}\n"
             )
         else:
             sys.stderr.write(

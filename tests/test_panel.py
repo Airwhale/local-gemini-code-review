@@ -59,10 +59,27 @@ class TestPanelFindingsMatch:
     def test_same_title_same_place_matches(self):
         assert panel_findings_match(_finding("t"), _finding("t", line=15))
 
-    def test_reworded_title_same_location_same_severity_matches(self):
-        assert panel_findings_match(
+    def test_reworded_title_same_location_same_severity_stays_separate(self):
+        assert not panel_findings_match(
             _finding("retry loop lacks sleep"),
             _finding("missing backoff between retries", line=12),
+        )
+
+    def test_unrelated_issues_nearby_do_not_match(self):
+        assert not panel_findings_match(
+            _finding("SQL injection in user query", line=10),
+            _finding("File handle leak on exception", line=15),
+        )
+
+    def test_normalized_title_matches(self):
+        assert panel_findings_match(
+            _finding("Close `handle` on failure."),
+            _finding('close "handle" on failure', line=12),
+        )
+
+    def test_same_title_far_apart_does_not_match(self):
+        assert not panel_findings_match(
+            _finding("issue", line=10), _finding("issue", line=99)
         )
 
     def test_reworded_title_different_severity_no_match(self):
@@ -95,7 +112,7 @@ class TestMergePanelFindings:
         merged = merge_panel_findings(
             {
                 "model-a": _parsed([_finding("issue x")]),
-                "model-b": _parsed([_finding("issue x reworded", line=14)]),
+                "model-b": _parsed([_finding("Issue `x`.", line=14)]),
             }
         )
         assert len(merged) == 1
@@ -137,7 +154,7 @@ class TestMergePanelFindings:
                 "b": _parsed(
                     [
                         _finding(
-                            "shared medium reworded",
+                            "Shared medium.",
                             file="m.py",
                             line=12,
                             severity="MEDIUM",
