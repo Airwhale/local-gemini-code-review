@@ -134,7 +134,8 @@ def hunk_ranges(diff: str) -> dict[str, list[tuple[int, int]]]:
         if not m:
             continue
         try:
-            path = decode_patch_path(m.group(1)).removeprefix("b/")
+            # CRLF is a line ending; spaces can be part of a Git filename.
+            path = decode_patch_path(m.group(1).removesuffix("\r")).removeprefix("b/")
         except ConfigError:
             # An unrecognizable path means unknown evidence, not a failed review.
             continue

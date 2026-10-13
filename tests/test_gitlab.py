@@ -261,6 +261,18 @@ def test_quoted_unicode_hunk_evidence() -> None:
 
 
 @pytest.mark.parametrize(
+    "header,path",
+    [
+        ("b/x.py", "x.py"),
+        ('"b/caf\\303\\251.py"', "café.py"),
+        ("b/trailing space.py ", "trailing space.py "),
+    ],
+)
+def test_crlf_hunk_paths_preserve_filename_spaces(header: str, path: str) -> None:
+    assert hunk_ranges(f"+++ {header}\r\n@@ -1 +1 @@\r\n+x\r\n") == {path: [(1, 1)]}
+
+
+@pytest.mark.parametrize(
     "header", ['"a/old.py" "b/new.py"', 'a/old.py "b/new.py"', '"a/old.py" b/new.py']
 )
 def test_quoted_binary_headers(header: str) -> None:
