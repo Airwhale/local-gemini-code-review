@@ -13,13 +13,16 @@ rejected. Host selection comes only from the operator's CLI input.
 Metadata uses a Pydantic v2 boundary model for `iid`, `web_url`, `sha`, and
 optional `diff_refs`. Unknown API fields are ignored. The URL must match the
 requested repository and IID exactly. `sha` is the head authority because older
-MRs can have empty `diff_refs.head_sha`; populated diff refs must agree. Metadata
+MRs can have missing, empty, or null `diff_refs.head_sha`; populated diff refs must agree. Metadata
 is read before and after the raw patch to reject concurrent head changes.
 
 The exact validated URL is announced before model calls. The fetched patch and
 validated metadata are reused within the request, avoiding separate file-list
 fetches that could describe a newer revision. Destination path parsing supports
-C-quoted UTF-8, spaces, rename-only changes, and deletions. A shared decoder also
+C-quoted UTF-8, spaces, rename-only changes, and deletions. glab output is decoded
+from bytes without universal newline translation, and patch records are split
+only at LF. Control characters and Unicode separators inside hunk bodies cannot
+manufacture reference-file headers. A shared decoder also
 keeps hunk evidence aligned with quoted paths. Local context requires matching
 HEAD and paths contained within the local repository. Dirty trees warn, matching
 the existing GitHub policy. Automatic context falls back to hunks; explicit

@@ -53,13 +53,13 @@ def args(**overrides: object) -> argparse.Namespace:
 def glab(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
     calls: list[list[str]] = []
 
-    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
         calls.append(command)
-        assert kwargs["encoding"] == "utf-8"
+        assert kwargs["text"] is False
         assert kwargs["check"] is True
         assert "shell" not in kwargs
         return subprocess.CompletedProcess(
-            command, 0, PATCH if command[2] == "diff" else metadata()
+            command, 0, (PATCH if command[2] == "diff" else metadata()).encode("utf-8")
         )
 
     monkeypatch.setattr(sources.subprocess, "run", run)
@@ -187,9 +187,12 @@ def test_bad_metadata(monkeypatch: pytest.MonkeyPatch, output: str) -> None:
         sources.mr_metadata(7, REPO)
 
 
-def test_empty_diff_refs_use_sha(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("head_sha", [None, ""])
+def test_empty_diff_refs_use_sha(
+    monkeypatch: pytest.MonkeyPatch, head_sha: str | None
+) -> None:
     output = json.loads(metadata())
-    output["diff_refs"]["head_sha"] = ""
+    output["diff_refs"]["head_sha"] = head_sha
     monkeypatch.setattr(sources, "_run_glab", lambda *a: json.dumps(output))
     assert sources.mr_metadata(7, REPO).sha == SHA
 
@@ -249,6 +252,85 @@ def test_patch_paths() -> None:
         Path(p) for p in ["x.py", "café.py", "new name.py", "日本語.py", "image.png"]
     ]
     assert sources.mr_patch_paths(PATCH + "+++ b/fake.py\n") == [Path("x.py")]
+
+
+@pytest.mark.parametrize(
+    "separator", ["\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029", "\r"]
+)
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n"])
+def test_patch_content_cannot_add_unrelated_local_references(
+    separator: str,
+    line_ending: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "x.py").write_text("changed_file_marker = True\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("SENTINEL_SHOULD_STAY_LOCAL", encoding="utf-8")
+    patch = PATCH + f"+content{separator}diff --git a/.env b/.env\n"
+    patch = patch.replace("\n", line_ending)
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        assert kwargs["text"] is False
+        output = patch if command[2] == "diff" else metadata()
+        return subprocess.CompletedProcess(command, 0, output.encode("utf-8"))
+
+    def git(command: list[str]) -> str:
+        if command == ["git", "rev-parse", "HEAD"]:
+            return SHA
+        if command == ["git", "rev-parse", "--show-toplevel"]:
+            return str(tmp_path)
+        return ""
+
+    monkeypatch.setattr(sources.subprocess, "run", run)
+    monkeypatch.setattr(sources, "_run_git", git)
+    settings = Settings(
+        provider="openrouter",
+        model="m",
+        temperature=0.3,
+        max_tokens=16000,
+        retries=0,
+        min_severity="LOW",
+        context=None,
+        output=None,
+    )
+    request = cli._build_request(args(full_files=True), settings)
+    assert request.diff == patch
+    assert "<REFERENCE_FILES>" in request.user_prompt
+    assert "changed_file_marker" in request.user_prompt
+    assert "SENTINEL_SHOULD_STAY_LOCAL" not in request.user_prompt
+
+
+@pytest.mark.parametrize("full", [None, True])
+def test_unsafe_reference_auto_fallback(
+    monkeypatch: pytest.MonkeyPatch, full: bool | None
+) -> None:
+    monkeypatch.setattr(cli, "_read_diff_source", lambda a: PATCH)
+    monkeypatch.setattr(cli, "_guard_mr_full_files", lambda mr: None)
+    value = args(full_files=full)
+    value._gitlab_mr = sources.GitLabMergeRequest.model_validate_json(metadata())
+
+    def paths(unused: argparse.Namespace) -> list[Path]:
+        raise ConfigError("unsafe reference")
+
+    monkeypatch.setattr(cli, "changed_file_paths", paths)
+    settings = Settings(
+        provider="openrouter",
+        model="m",
+        temperature=0.3,
+        max_tokens=16000,
+        retries=0,
+        min_severity="LOW",
+        context=None,
+        output=None,
+    )
+    if full is True:
+        with pytest.raises(ConfigError, match="unsafe reference"):
+            cli._build_request(value, settings)
+    else:
+        assert (
+            "<REFERENCE_FILES>" not in cli._build_request(value, settings).user_prompt
+        )
 
 
 def test_quoted_unicode_hunk_evidence() -> None:

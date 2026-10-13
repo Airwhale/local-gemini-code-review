@@ -24,7 +24,7 @@ from code_review.prompts import MAX_INDIVIDUAL_FILE_BYTES, _format_size
 
 
 class GitLabDiffRefs(BaseModel):
-    head_sha: str = ""
+    head_sha: str | None = None
 
 
 class GitLabMergeRequest(BaseModel):
@@ -70,10 +70,10 @@ def _run_glab(args: list[str], repo: str) -> str:
         result = subprocess.run(
             command,
             capture_output=True,
-            text=True,
+            # Preserve lone CR bytes inside patch content. Text mode would
+            # translate them into LF and could manufacture file headers.
+            text=False,
             check=True,
-            encoding="utf-8",
-            errors="replace",
         )
     except FileNotFoundError as exc:
         raise ConfigError(
@@ -85,7 +85,7 @@ def _run_glab(args: list[str], repo: str) -> str:
             f"glab mr {args[0]} failed (exit {exc.returncode}). Check MR IID, "
             "--repo, connectivity, and glab authentication for the selected host."
         ) from exc
-    return result.stdout
+    return result.stdout.decode("utf-8", errors="replace")
 
 
 def mr_metadata(iid: int, repo: str) -> GitLabMergeRequest:
@@ -114,7 +114,10 @@ def mr_patch_paths(patch: str) -> list[Path]:
     paths: list[Path] = []
     current: str | None = None
     in_hunk = False
-    for line in [*patch.splitlines(), "diff --git "]:
+    # Git patch lines are LF-delimited. Unicode separators in added content
+    # must not reset the hunk state or introduce unrelated reference paths.
+    lines = (raw.removesuffix("\r") for raw in patch.split("\n"))
+    for line in [*lines, "diff --git "]:
         if line.startswith("diff --git "):
             in_hunk = False
             if current is not None:
