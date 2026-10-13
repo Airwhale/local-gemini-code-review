@@ -122,6 +122,15 @@ Requesting the conservative 4K estimate in the unknown case would *shrink* a big
 
 ## Model aliases
 
+**Prefer modern models for new reviews.** Aliases and defaults are compatibility
+shortcuts, not a current-model catalog. Before selecting models, check the vendor's
+current releases and the selected provider's live catalog, then pass verified
+provider-native slugs with `--model` or `--models`. Prefer the newest stable model
+suitable for code review, context size, and the user's budget. Honor explicit
+vendor restrictions; report unavailable models or budget failures rather than
+silently falling back to an older model. See the runbook's
+[model-selection policy](./docs/llm-code-review-runbook.md#model-selection).
+
 `--model` accepts any provider-native slug, plus curated short aliases scoped per provider. An alias used with the wrong `--provider` raises a typed `CONFIG` error naming the correct one.
 
 **OpenRouter aliases** (the default provider):
@@ -517,6 +526,12 @@ This tool is built to be invoked by AI coding agents as an iteration partner dur
 
 > **If you're an LLM agent, your canonical entry point is [`docs/llm-code-review-runbook.md`](./docs/llm-code-review-runbook.md)** — the operational manual, with accept/decline heuristics, hallucination patterns, per-round tracking templates, and known gotchas. The loop below is the fast-start summary.
 
+**Choose current models deliberately.** Verify release status and exact provider
+slugs before paid calls. Prefer modern, stable models over historical defaults or
+aliases, and honor the user's vendor preferences (including requests to exclude
+OpenAI models). For multiple opinions, choose distinct current models from
+different vendors. State the selected slugs and any justified older-model choice.
+
 1. **Pick a scope.** Diff mode for in-progress work (`--base origin/main`, `--pr <N>`, `--staged`); codebase mode for audits (`--codebase --include '…'`). Untracked files need `git add -N <paths>` first.
 2. **Run the review.** Prefer `--format json` when consuming findings programmatically.
 3. **For each finding, decide accept or decline.** Accept by default: CRITICAL/HIGH, MEDIUM correctness/concurrency, trivially-correct LOW. Decline: findings contradicting load-bearing design intent, test-untightening suggestions, pure style. Hedged findings ("if X, this is CRITICAL") are a verify-the-premise flag, not an instruction. Full heuristics with worked examples: [runbook](./docs/llm-code-review-runbook.md#accept--decline-heuristics).
@@ -528,7 +543,7 @@ This tool is built to be invoked by AI coding agents as an iteration partner dur
 **Three things that exist specifically for you:**
 
 - **`in_hunk` tells you what you can post.** Turning findings into GitHub review comments? Only `in_hunk: true` can carry an inline ```suggestion``` (GitHub 422s anything else); `false` belongs in the review body; `null` means verify first. See [Structured output](#structured-output---format-json-and-round-over-round-diffing---baseline). Don't re-parse the diff to work this out — it's in the envelope.
-- **Cross-model agreement is your cheapest precision filter.** A finding one model raises is usually noise; one two models raise independently is usually real. Prefer `--models pro,gpt,deepseek --format json` and read `found_by` — or just let the tool do it: **`--min-found-by 2`** drops everything below the consensus floor. Set `CODE_REVIEW_NO_TIPS=1` to silence the reminder in scripted runs.
+- **Cross-model agreement is your cheapest precision filter.** A finding one model raises is usually noise; one two models raise independently is usually real. Pass verified current cross-vendor slugs to `--models` with `--format json` and read `found_by`, or use **`--min-found-by 2`** to drop everything below the consensus floor. Set `CODE_REVIEW_NO_TIPS=1` to silence the reminder in scripted runs.
 - **`needs_verification: true` is the model admitting it guessed.** It means the finding rests on code outside the shown hunks. Check it against the file before spending a round on it — and note these are exactly the findings that turn out to be phantom "X is undefined / missing" claims.
 - **Know what the model could see.** Diff reviews carry an evidence-discipline rule, and changed files are auto-attached when they fit (`Full-file context: on` on stderr). If they *weren't* attached, treat "X is missing / undefined / never called" claims as unverified by construction — the model was looking at a keyhole. Findings prefixed `NEEDS-VERIFICATION:` are the model telling you it guessed; check them against the file before acting.
 
