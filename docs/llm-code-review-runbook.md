@@ -178,6 +178,22 @@ The runner's Ollama-specific errors are surgical: a connection refusal raises `C
 
 ### Tuning sampling: `--temperature` and `--max-tokens`
 
+For `deepseek/deepseek-v4.1-flash` on OpenRouter, the runner requests low
+reasoning effort and defaults to 65,536 combined reasoning/review tokens when no
+cap is configured. This also applies to suffixed IDs and individual panel slots;
+other models keep their existing defaults. Inspect `--dry-run` for resolved
+per-model caps and the `[reasoning]` line on a live call. A full-diff validation
+completed with 45,910 completion tokens, so 32,768 was insufficient for that run.
+
+CLI, environment, and project limits remain authoritative. For example,
+`CODE_REVIEW_MAX_TOKENS=32768` prevents the larger model default from applying.
+Remove the override or retry only the failed DeepSeek slot with
+`--max-tokens 65536`; do not rerun successful panel slots. If that profile still
+exhausts reasoning without a review, stop automatic budget escalation and narrow
+or chunk the input. Record the slot as incomplete. A panel's exit 0 does not
+mean every model succeeded: inspect each `per_model` entry's `error`, `parse_ok`,
+and `truncated` fields before claiming all reviewers are represented.
+
 Two runtime knobs control how much the model says and how exploratory it is:
 
 **Gemini sampling migration:** `--temperature` and `CODE_REVIEW_TEMPERATURE`
@@ -192,7 +208,7 @@ the review text is produced.
 | Flag | Default | What it controls | When to change |
 |---|---|---|---|
 | `--temperature <float>` | `0.3` (env: `CODE_REVIEW_TEMPERATURE`) | Sampling randomness. Higher = more exploration, more findings per call, more hallucinations. Lower = tighter, more conservative, fewer findings. | Drop to `0.2` for security-critical PRs where decline-comment overhead is expensive. Raise to `0.5–0.7` for first-pass audits where you want maximum coverage and can afford the false-positive rate. |
-| `--max-tokens <int>` | `16000` (env: `CODE_REVIEW_MAX_TOKENS`) | Ceiling on output token count. Not a target — you pay only for what the model actually emits. Default ensures a thorough review isn't truncated mid-finding. | Rarely needs changing. Drop to `4000` if you genuinely want short, focused output (e.g. CI-step where only critical findings matter). Raise if you see truncated `Suggested change:` blocks in very large reviews. |
+| `--max-tokens <int>` | `16000`; DeepSeek V4.1 Flash defaults to `65536` when unset (env: `CODE_REVIEW_MAX_TOKENS`) | Ceiling for reasoning plus visible review tokens. Explicit CLI/env/project caps override model defaults and apply to all panel slots. | Retry only a failed model with its recommended cap. Do not repeatedly double budgets after reasoning-only failures. |
 | `--min-severity <LEVEL>` | `LOW` (no filter; env: `CODE_REVIEW_MIN_SEVERITY`) | Severity floor: `MEDIUM`/`HIGH`/`CRITICAL` drop lower-severity findings. Asked of the model in the prompt AND enforced post-parse in `--format json` envelopes and panel reports (verbatim markdown stays best-effort). | `HIGH` for fast pre-commit gates; leave at `LOW` for the thorough pre-PR pass. |
 | `--retries <N>` | `0` (env: `CODE_REVIEW_RETRIES`) | Extra retry attempts beyond the built-in single transient retry; `N > 0` also retries RATE_LIMIT honoring `Retry-After` (clamped 300s). | Set `2–3` for unattended runs; keep `0` when your agent loop manages its own backoff. |
 

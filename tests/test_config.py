@@ -23,6 +23,7 @@ from code_review.cli import (
     load_command_prompt,
     load_skill,
 )
+from code_review.config import max_tokens_for_model
 
 
 @pytest.fixture(autouse=True)
@@ -349,6 +350,28 @@ def _args(**overrides) -> argparse.Namespace:
 
 
 class TestSettingsPrecedence:
+    @pytest.mark.parametrize(
+        "source,expected",
+        [("default", 65536), ("cli", 24000), ("env", 32000), ("project", 48000)],
+    )
+    def test_deepseek_default_budget_respects_explicit_caps(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        source: str,
+        expected: int,
+    ) -> None:
+        options = _args(model="deepseek/deepseek-v4.1-flash")
+        project = {}
+        if source == "cli":
+            options.max_tokens = expected
+        elif source == "env":
+            monkeypatch.setenv("CODE_REVIEW_MAX_TOKENS", str(expected))
+        elif source == "project":
+            project = {"max_tokens": expected}
+        settings = _resolve_settings(options, project)
+        assert settings.max_tokens_defaulted is (source == "default")
+        assert max_tokens_for_model(settings, settings.model) == expected
+
     def test_config_supplies_tunables(self):
         config = {
             "temperature": 0.7,

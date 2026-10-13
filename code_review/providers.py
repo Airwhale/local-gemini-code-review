@@ -39,6 +39,7 @@ from code_review.generation import (
     GeminiRequest,
     OpenRouterMessage,
     OpenRouterRequest,
+    openrouter_reasoning,
     uses_default_sampling,
 )
 
@@ -660,6 +661,7 @@ def call_openrouter(
     "Error model" section for the contract. ``main`` catches and formats
     them with the correct exit code.
     """
+    reasoning = openrouter_reasoning(model)
     payload = OpenRouterRequest(
         model=model,
         messages=[
@@ -668,7 +670,13 @@ def call_openrouter(
         ],
         temperature=None if uses_default_sampling("openrouter", model) else temperature,
         max_tokens=max_tokens,
+        reasoning=reasoning,
     )
+    if reasoning is not None:
+        sys.stderr.write(
+            f"[reasoning] model={model} effort={reasoning.effort} "
+            f"max_tokens={max_tokens} (reasoning and review combined)\n"
+        )
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",

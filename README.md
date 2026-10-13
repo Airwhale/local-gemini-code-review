@@ -149,6 +149,27 @@ silently falling back to an older model. See the runbook's
 
 **The `gemini` (direct-API) provider has no aliases**; it takes bare Gemini model names such as `gemini-3.8-flash` and `gemini-3.1-pro-preview`. Raw slugs pass through unchanged, so a model available to your provider and account works via `--model <slug>` without needing an alias.
 
+### DeepSeek V4.1 Flash generation defaults
+
+For `deepseek/deepseek-v4.1-flash` on OpenRouter, the runner requests low
+reasoning effort and defaults to **65,536 total output tokens**, including both
+thinking and the visible review. A full-diff validation needed 45,910 completion
+tokens, exceeding the former 32,768-token ceiling. This policy also applies to
+the model's suffixed IDs and to its slot in a panel; other models keep their
+existing defaults. `--dry-run` reports each model's resolved limit and effort.
+
+```bash
+code-review --provider openrouter --model deepseek/deepseek-v4.1-flash --base origin/main
+```
+
+An explicit `--max-tokens`, `CODE_REVIEW_MAX_TOKENS`, or project `max_tokens`
+always wins, even if smaller. A shared explicit panel limit applies to every
+model. If an existing 32,768-token override causes empty reasoning-only output,
+remove it to use model defaults or retry just DeepSeek once with
+`--max-tokens 65536`. If that profile still produces no review, narrow or chunk
+the input and record the model as incomplete rather than repeatedly increasing
+the ceiling. Reasoning-only output is never accepted as a clean review.
+
 ## Review modes
 
 One review source per run (mutually exclusive):
@@ -245,7 +266,7 @@ A 700,000-char (~175K-token) bundle cap is enforced pre-flight — conservative 
 ## Everyday flags
 
 - `--temperature <float>` (default `0.3`, env `CODE_REVIEW_TEMPERATURE`): sampling randomness for non-Gemini models on OpenRouter and for Ollama. **Ignored for Gemini**, both direct and OpenRouter (`google/gemini-*`), which uses model defaults. Dry runs and progress messages show when defaults apply. The historical tuning notes are in the [runbook](./docs/llm-code-review-runbook.md#tuning-sampling---temperature-and---max-tokens).
-- `--max-tokens <int>` (default `16000`, env `CODE_REVIEW_MAX_TOKENS`): output ceiling, not a target — you pay only for what's emitted. If the model hits it mid-review, the partial output still prints, with a `WARN: … truncated at max_tokens` stderr line so callers know the list may be incomplete.
+- `--max-tokens <int>` (env `CODE_REVIEW_MAX_TOKENS`): combined reasoning and review ceiling, not a target. Defaults to `16000`, except [DeepSeek V4.1 Flash](#deepseek-v41-flash-generation-defaults) uses `65536` when no cap is configured. An explicit cap overrides every model's default, including in panels. If the model hits it mid-review, partial output still prints with a truncation warning; empty reasoning-only output fails instead of reporting a clean review.
 - `--min-severity <LEVEL>` (default `LOW` = no filter, env `CODE_REVIEW_MIN_SEVERITY`): report only findings at or above `MEDIUM`/`HIGH`/`CRITICAL` — a fast pre-commit gate vs. the thorough pre-PR pass. Asked of the model via a fork-owned prompt appendix (upstream prompt files stay untouched) **and enforced after parsing** wherever the runner synthesizes findings: `--format json` envelopes (including the baseline diff, so `resolved` can't fill with merely-filtered entries) and panel reports. Verbatim markdown output remains best-effort — the model's own text isn't rewritten. Findings whose severity couldn't be parsed are always kept.
 - `--no-project-config`: ignore any `.code-review.toml` found for the reviewed repo — recommended when auditing untrusted checkouts (see [Per-project configuration](#per-project-configuration-code-reviewtoml)).
 - `--retries <N>` (default `0`, env `CODE_REVIEW_RETRIES`): extra attempts beyond the built-in single 2s transient retry, with exponential backoff (60s cap/wait). `N > 0` also enables rate-limit retries honoring `Retry-After` (clamped to 300s). See [Auto-retry behavior](#auto-retry-behavior).
@@ -593,6 +614,7 @@ Non-error stderr lines use a fixed prefix vocabulary — **no informational line
 | `Reviewing …` | Pre-call notice: payload size, model(s), provider, sampling settings |
 | `WARN: …` | Something degraded but the run continues (truncated output, clamped Retry-After, unknown Ollama window, unrecognized config keys, ignored flags) |
 | `[usage] …` | Token usage reported by the provider after a successful call |
+| `[reasoning] …` | The model-specific reasoning effort and combined output limit sent to OpenRouter |
 | `[retry] …` | An automatic retry is about to happen (category, attempt, delay) |
 | `[ollama] …` | Ollama context-window detection notice (`/api/ps`) |
 | `[config] …` | A `.code-review.toml` was found and loaded (path announced — a security property, since the file lives in the reviewed repo) |

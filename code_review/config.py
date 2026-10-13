@@ -20,6 +20,7 @@ from typing import Any
 from dotenv import load_dotenv
 
 from code_review.errors import ConfigError
+from code_review.generation import openrouter_default_max_tokens
 from code_review.prompts import _REPO_ROOT, DEFAULT_CONTEXT, SEVERITY_LEVELS
 from code_review.providers import (
     DEFAULT_MAX_TOKENS,
@@ -302,6 +303,17 @@ class Settings:
     ollama_host: str | None = None
     ollama_timeout: float | None = None
     ollama_num_ctx_env: int | None = None
+    # Only the resolver can opt into model defaults. Programmatic callers
+    # passing max_tokens retain that exact cap unless they explicitly opt in.
+    max_tokens_defaulted: bool = False
+
+
+def max_tokens_for_model(settings: Settings, model: str) -> int:
+    if settings.provider == "openrouter" and settings.max_tokens_defaulted:
+        override = openrouter_default_max_tokens(model)
+        if override is not None:
+            return override
+    return settings.max_tokens
 
 
 @dataclasses.dataclass
@@ -627,6 +639,7 @@ def _resolve_settings(
         model=model,
         temperature=temperature,
         max_tokens=max_tokens,
+        max_tokens_defaulted=max_raw is None,
         retries=retries,
         min_severity=min_severity,
         min_found_by=min_found_by,

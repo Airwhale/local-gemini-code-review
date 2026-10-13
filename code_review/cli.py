@@ -106,6 +106,7 @@ from code_review.config import (
     _resolve_model_name,
     _resolve_settings,
     _user_config_dir,
+    max_tokens_for_model,
 )
 
 # The split modules; cli re-exports the full surface so
@@ -121,7 +122,7 @@ from code_review.errors import (
     TransportError,
     _print_error,
 )
-from code_review.generation import uses_default_sampling
+from code_review.generation import openrouter_reasoning, uses_default_sampling
 from code_review.panel import (
     _CATEGORY_PRECEDENCE,
     _SEVERITY_RANK,
@@ -619,7 +620,9 @@ def _build_request(args: argparse.Namespace, settings: Settings) -> ReviewReques
                 # counts requested completion tokens against the window too
                 # (its 400 reads "169737 tokens (153737 of text input,
                 # 16000 in the output)").
-                est_tokens = (len(diff) + len(reference)) // 4 + settings.max_tokens
+                est_tokens = (len(diff) + len(reference)) // 4 + max_tokens_for_model(
+                    settings, settings.model
+                )
                 if est_tokens > window:
                     sys.stderr.write(
                         f"NOTE: full-file context would need ~{est_tokens:,} tokens "
@@ -746,7 +749,8 @@ def _estimate_cost_line(settings: Settings, prompt_chars: int) -> str | None:
 
     Deliberately a CEILING, and labelled as one: the prompt side is
     estimated (chars/4, no local tokenizer) and the completion side is
-    bounded by --max-tokens rather than predicted. Panels sum every model.
+    bounded by resolved per-model caps rather than predicted. Panels sum
+    every model; the displayed token ceiling is the largest per-model cap.
 
     Returns None -- rather than a guess -- whenever pricing is unavailable
     (Gemini publishes no unauthenticated feed; OpenRouter unreachable; an
@@ -756,9 +760,13 @@ def _estimate_cost_line(settings: Settings, prompt_chars: int) -> str | None:
     prompt_tokens = prompt_chars // 4
     models = list(settings.models) if settings.models is not None else [settings.model]
     total = 0.0
+    completion_limits = [max_tokens_for_model(settings, model) for model in models]
     for model in models:
         usd = estimate_cost_usd(
-            settings.provider, model, prompt_tokens, settings.max_tokens
+            settings.provider,
+            model,
+            prompt_tokens,
+            max_tokens_for_model(settings, model),
         )
         if usd is None:
             return None
@@ -766,7 +774,8 @@ def _estimate_cost_line(settings: Settings, prompt_chars: int) -> str | None:
     suffix = f" (x{len(models)} models)" if len(models) > 1 else ""
     return (
         f"{format_cost(total)}{suffix} -- ceiling: prompt ~{prompt_tokens:,} tok "
-        f"+ completion <= {settings.max_tokens:,} tok"
+        f"+ completion <= {max(completion_limits):,} tok"
+        + ("/model" if len(models) > 1 else "")
     )
 
 
@@ -912,6 +921,16 @@ def _temperature_summary(settings: Settings) -> str:
     return str(settings.temperature)
 
 
+def _max_tokens_summary(settings: Settings) -> str:
+    models = settings.models or (settings.model,)
+    limits = [max_tokens_for_model(settings, model) for model in models]
+    if len(set(limits)) == 1:
+        return str(limits[0])
+    return ", ".join(
+        f"{model}={limit}" for model, limit in zip(models, limits, strict=True)
+    )
+
+
 def _dry_run_report(
     settings: Settings, request: ReviewRequest, ollama_window: str | None = None
 ) -> str:
@@ -934,7 +953,7 @@ def _dry_run_report(
         model_line,
         f"mode:              {request.mode}",
         f"temperature:       {_temperature_summary(settings)}",
-        f"max_tokens:        {settings.max_tokens}",
+        f"max_tokens:        {_max_tokens_summary(settings)}",
         f"retries:           {settings.retries}",
         f"min_severity:      {settings.min_severity}",
         f"payload:           {request.payload_chars:,} chars",
@@ -943,6 +962,11 @@ def _dry_run_report(
         f"est_prompt_tokens: ~{prompt_chars // 4:,}",
     ]
     cost_line = _estimate_cost_line(settings, prompt_chars)
+    if settings.provider == "openrouter":
+        for model in settings.models or (settings.model,):
+            reasoning = openrouter_reasoning(model)
+            if reasoning is not None:
+                lines.append(f"reasoning:         {model}: {reasoning.effort}")
     if cost_line is not None:
         lines.append(f"est_cost:          {cost_line}")
     if ollama_window is not None:
@@ -992,7 +1016,7 @@ def _execute_call(
                 referer=referer,
                 title=title,
                 temperature=settings.temperature,
-                max_tokens=settings.max_tokens,
+                max_tokens=max_tokens_for_model(settings, model),
             ),
             label="openrouter",
             retries=settings.retries,
@@ -1445,12 +1469,11 @@ def main() -> None:
         metavar="N",
         dest="max_tokens",
         help=(
-            f"Maximum output tokens the model may emit. Default "
-            f"{DEFAULT_MAX_TOKENS} -- raised from the implicit ~8K "
-            "provider default so a thorough review isn't truncated "
-            "mid-finding. This is a ceiling, not a target: you pay only "
-            "for tokens actually emitted. Override with "
-            "$CODE_REVIEW_MAX_TOKENS."
+            f"Maximum combined reasoning and review tokens. Default "
+            f"{DEFAULT_MAX_TOKENS}; DeepSeek V4.1 Flash on OpenRouter uses "
+            "65536 when no CLI, environment, or project cap is set. An "
+            "explicit cap applies to every model in a panel and is never "
+            "silently raised. Override with $CODE_REVIEW_MAX_TOKENS."
         ),
     )
     parser.add_argument(
@@ -1655,13 +1678,13 @@ def main() -> None:
             f"Reviewing {len(request.files)} file(s) "
             f"({request.payload_chars:,} chars) with `{reviewer}` "
             f"via {settings.provider} (T={_temperature_summary(settings)}, "
-            f"max_tokens={settings.max_tokens})...\n"
+            f"max_tokens={_max_tokens_summary(settings)})...\n"
         )
     else:
         sys.stderr.write(
             f"Reviewing {request.payload_chars:,}-char diff with "
             f"`{reviewer}` via {settings.provider} "
-            f"(T={_temperature_summary(settings)}, max_tokens={settings.max_tokens})...\n"
+            f"(T={_temperature_summary(settings)}, max_tokens={_max_tokens_summary(settings)})...\n"
         )
 
     # Money before the spend, not after. Auto full-file context makes payloads
