@@ -15,6 +15,7 @@ A one-page map of how a review request flows through the runner, the design deci
   source modes (mutually exclusive)
   --base / --staged / (default merge-base) ──> git diff -U5 ─┐
   --pr N ──> gh pr diff ─────────────────────────────────────┤──> diff text
+  --mr IID --repo URL ──> glab mr diff --raw ────────────────┤
   --diff-file PATH|- ──> file/stdin ─────────────────────────┘      │
   --codebase ──> git ls-files + filters ──> numbered file bundle    │
                                                                     ▼
@@ -77,7 +78,8 @@ The import graph is acyclic, top to bottom:
 | `code_review/errors.py` | The typed error model: exception hierarchy → exit codes, and the `ERROR:` stderr block renderer. No project imports. |
 | `code_review/prompts.py` | Prompt assets and assembly: upstream skill/command loading (`_prompt_root` tiers), the safety-context + injection-guard wrapper, severity ladder + `--min-severity` appendix, payload caps, file bundling/numbering, the `<REFERENCE_FILES>` block. |
 | `code_review/providers.py` | The wire layer: `_make_client` seam, the three `call_*` functions, HTTP-error classification, retry policy, model aliases/defaults, and the Ollama window machinery (probe → guard → post-call verify). |
-| `code_review/sources.py` | What gets reviewed: git/gh subprocess plumbing (repo-pinned PR calls + the `[gh]` announce), `--diff-file`/stdin, codebase gathering/filtering, subdirectory path re-basing. |
+| `code_review/sources.py` | What gets reviewed: git/gh/glab subprocess plumbing, repository pinning and URL announcements for PRs/MRs, validated GitLab metadata and raw patch paths, `--diff-file`/stdin, codebase gathering/filtering, subdirectory path re-basing. |
+| `code_review/patch_paths.py` | Shared decoder for Git's C-quoted UTF-8 paths, used by GitLab reference gathering and structured hunk evidence. |
 | `code_review/parser.py` | Structured output: the markdown findings parser (fence-aware state machine), fingerprints, `--baseline` diffing, severity enforcement, and the single/chunked JSON envelopes. |
 | `code_review/panel.py` | Panel pure logic: consensus matching/merge, the panel markdown report and envelope, all-failed exit precedence. |
 | `code_review/chunking.py` | `--chunk`: lossless file-boundary splitting, next-fit packing, and the per-chunk budget math (bundle cap / enforced Ollama window). |
@@ -86,7 +88,7 @@ The import graph is acyclic, top to bottom:
 | `review.py` | 11-line back-compat shim so `uv run review.py` keeps working from a checkout. Not an API surface. |
 | `code_review/__init__.py` | `__version__` from package metadata. |
 | `skills/`, `commands/` | Prompt assets at the repo root (upstream files byte-identical; `code-review-codebase` is fork-added). Force-included into the wheel as package data. |
-| `tests/` | Offline suite: `test_review.py` (pure logic + error contract), `test_parser.py` (+ frozen real-model outputs under `tests/fixtures/`), `test_panel.py`, `test_biginput.py`, `test_config.py`, `test_wire.py` (canned HTTP through `_make_client`). |
+| `tests/` | Offline suite: `test_review.py` (pure logic + error contract), `test_parser.py` (+ frozen real-model outputs under `tests/fixtures/`), `test_panel.py`, `test_biginput.py`, `test_config.py`, `test_wire.py` (canned HTTP through `_make_client`), `test_gitlab.py` (mocked glab metadata/diffs, context guards, and patch-content isolation). |
 | `evals/` | Paid, manual scoring harness: planted-bug fixtures + a clean-diff control, recall/noise table. |
 | `.github/workflows/` | `ci.yml` (lint + type-check + tests on ubuntu/windows + wheel-content check), `evals.yml` (manual dispatch, spends tokens). |
 

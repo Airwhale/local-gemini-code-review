@@ -10,6 +10,8 @@ The changes fall into three groups: **remove the blind spot** (auto full-file co
 
 ### Added
 
+- **GitLab merge request reviews** with `--mr IID --repo https://HOST/group/project`, using read-only `glab` metadata and raw patch commands. A full HTTPS repository URL is required, nested groups are supported, and the exact validated MR URL is announced before model calls. Requires glab authentication for the selected host. GitHub PR and local diff modes retain their existing behavior, output schema, provider choices, and exit codes.
+- **GitLab changed-file context** with remote head consistency checks and the existing automatic/strict full-file modes. Explicit `--full-files` requires local HEAD to match the MR head; automatic context falls back to hunks when the checkout cannot be verified. Renamed, deleted, Unicode, and space-containing paths are handled without changing the review target.
 - **`--min-found-by N`** (panel mode): drop merged findings fewer than N models reported. The tool already knew cross-model agreement was "the strongest cheap filter for plausible-but-wrong findings" — this makes it a flag instead of a post-processing chore. Applied after merging, to both markdown and JSON, with a stderr count of what was dropped; the per-model raw appendix still shows everything. Requires `--models` (a consensus count for one model is meaningless — asking is a typed `CONFIG` error). Env `CODE_REVIEW_MIN_FOUND_BY`; also a `.code-review.toml` key.
 - **Pre-call cost ceiling**: a `[cost] est ~$0.17 -- ceiling: prompt ~7,388 tok + completion <= 16,000 tok` line next to "Reviewing…", and `est_cost` in `--dry-run`. Honest by construction: the prompt side is estimated (chars/4) and the completion side is *bounded* by `--max-tokens`, so it's a ceiling, not a prediction; panels sum every model. Prices come from OpenRouter's live feed (cached a day in the user config dir) rather than a hardcoded table that would silently go stale — and when pricing can't be sourced (Gemini has no unauthenticated feed, unknown slug, feed unreachable) the line is **omitted rather than guessed**, matching the existing "never estimate usage" rule. Ollama reports `$0.00 (local)`. This matters more now that auto full-file context makes payloads several times larger than the bare diff.
 - **`needs_verification` on every finding**: the evidence rule asks models to prefix a title `NEEDS-VERIFICATION:` when a finding rests on unseen code; the parser now lifts that into a boolean and strips the marker from `title`. Callers triage on a field instead of string-matching titles, and fingerprints stay stable whether or not the model hedged (so `--baseline` doesn't report a hedged re-run as a new finding). Additive to the schema.
@@ -22,6 +24,8 @@ The changes fall into three groups: **remove the blind spot** (auto full-file co
 
 ### Fixed
 
+- GitLab metadata tolerates missing, empty, or null `diff_refs.head_sha` while validating the top-level head SHA and checking populated diff refs for consistency.
+- Hunk evidence decodes Git's quoted UTF-8 paths and handles CRLF line endings without trimming spaces that belong to filenames.
 - Truncated baseline reviews retain `new`/`persisting` statuses but omit `resolved` and report that resolution is unknown. A partial response no longer claims unseen prior findings were fixed.
 - Panel consensus now requires matching normalized issue fingerprints and compatible line locations. Unrelated nearby findings at the same severity no longer combine to pass `--min-found-by`.
 - Local Git file enumeration uses null delimiters for codebase and full-file context. Unicode and other Git-quoted filenames are no longer silently omitted; embedded CR/LF characters are preserved.
@@ -36,8 +40,14 @@ The changes fall into three groups: **remove the blind spot** (auto full-file co
 
 ### Changed
 
+- Agent documentation now prefers modern stable coding models, verified against current vendor releases and provider catalogs. Agents should use exact provider slugs when aliases lag, honor vendor exclusions, and disclose any older-model choice. Existing runtime defaults and aliases remain compatible.
 - **`--full-files` is now on by default (auto).** Hunk-only context is the single largest source of false findings, so changed files are attached whenever the payload fits under the 700K cap. Three states: *auto* (default — attach if it fits, otherwise fall back to hunks-only with a `NOTE:`), `--full-files` (strict — typed error if it doesn't fit, i.e. today's behavior), `--no-full-files` (off). Auto is best-effort by design: it costs tokens, so it declines rather than fails a review you never opted into — including when git can't resolve changed files (shallow clones, detached CI checkouts) or `--pr` isn't checked out at the PR head. `--diff-file` is excluded from auto entirely: a handed-in diff has no verifiable relationship to the local tree, so attaching local bodies could pair the review with unrelated content.
 - **Module split**: the single-file `code_review/cli.py` (~5,000 lines) is now nine focused modules (`errors`, `prompts`, `providers`, `sources`, `parser`, `panel`, `chunking`, `config`, plus a slimmed orchestrating `cli`). No behavior change; `from code_review.cli import X` keeps working (cli re-exports the full surface) and the console entry point is unchanged. See the code map in `docs/architecture.md`.
+
+### Security
+
+- GitLab repository URLs reject credentials, query strings, fragments, and non-HTTPS schemes. MR identity and head metadata are validated before model calls; local reference paths must remain inside the repository, including through symlinks. Raw glab transport errors are suppressed to avoid exposing credential-bearing diagnostics.
+- GitLab patch bytes are decoded as UTF-8 without newline translation, and records are split only at LF. Unicode separators and control characters in hunk bodies cannot fabricate file headers and attach unrelated local files to the review context. Regression tests use synthetic local markers, never actual credentials.
 
 ## [0.2.0] — 2026-07-07
 
