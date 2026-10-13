@@ -17,6 +17,7 @@ import re
 
 from code_review.chunking import split_diff_by_file
 from code_review.errors import ConfigError
+from code_review.patch_paths import decode_patch_path
 from code_review.prompts import SEVERITY_LEVELS
 from code_review.providers import CallResult
 
@@ -109,7 +110,7 @@ def _split_needs_verification(title: str) -> tuple[str, bool]:
 # append a timestamp -- `+++ b/x.py\t2026-07-16 10:00:00`. Without this the
 # path captures the timestamp too and matches nothing, silently degrading
 # every finding in that file to `in_hunk: null`.
-_DIFF_NEW_PATH_RE = re.compile(r"^\+\+\+ (?:b/)?([^\t\n]+)", re.M)
+_DIFF_NEW_PATH_RE = re.compile(r"^\+\+\+ ([^\t\n]+)", re.M)
 # `@@ -old,n +new,m @@` -- only the post-image side matters: GitHub anchors
 # review comments on RIGHT-side line numbers. The count is optional (`+12`
 # means a one-line hunk).
@@ -132,7 +133,11 @@ def hunk_ranges(diff: str) -> dict[str, list[tuple[int, int]]]:
         m = _DIFF_NEW_PATH_RE.search(part)
         if not m:
             continue
-        path = m.group(1).strip()
+        try:
+            path = decode_patch_path(m.group(1)).removeprefix("b/")
+        except ConfigError:
+            # An unrecognizable path means unknown evidence, not a failed review.
+            continue
         if path == "/dev/null":
             continue
         spans = ranges.setdefault(path, [])

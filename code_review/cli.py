@@ -236,6 +236,7 @@ from code_review.sources import (
     _filter_reviewable,
     _gh_pr_view_field,
     _glob_match,
+    _guard_mr_full_files,
     _guard_pr_full_files,
     _read_diff_source,
     _rebase_repo_relative,
@@ -244,6 +245,7 @@ from code_review.sources import (
     changed_file_paths,
     gather_codebase_files,
     git_diff_local,
+    gitlab_repo,
     pr_changed_files,
     pr_diff,
     pr_head_sha,
@@ -517,7 +519,14 @@ def _build_request(args: argparse.Namespace, settings: Settings) -> ReviewReques
         # already a typed CONFIG error; this covers the auto path.)
         if args.full_files is not False and args.diff_file is None:
             attach = True
-            if args.pr:
+            if getattr(args, "mr", None) is not None:
+                try:
+                    _guard_mr_full_files(args._gitlab_mr)
+                except ConfigError:
+                    if explicit_full:
+                        raise
+                    attach = False
+            elif args.pr:
                 # --full-files reads bodies from the LOCAL checkout, so it is
                 # only safe when HEAD is the PR head; otherwise the model gets
                 # file content unrelated to the diff. Explicit asks get the
@@ -845,6 +854,11 @@ def _validate_flag_combos(args: argparse.Namespace) -> None:
     Each pair is a deliberate scope decision, not an oversight; see the
     messages (and the README) for the workarounds.
     """
+    mr = getattr(args, "mr", None)
+    if mr is not None:
+        if mr <= 0:
+            raise ConfigError("--mr must be a positive merge request IID.")
+        gitlab_repo(args.repo)
     if args.chunk and args.models:
         raise ConfigError(
             "--chunk and --models are not supported together (a panel of "
@@ -880,12 +894,11 @@ def _validate_flag_combos(args: argparse.Namespace) -> None:
     if args.full_files and args.diff_file is not None:
         raise ConfigError(
             "--full-files needs the diff to come from this working tree "
-            "(git/gh); a --diff-file diff has no local files to reference."
+            "(git/gh/glab); a --diff-file diff has no local files to reference."
         )
-    if args.repo is not None and not args.pr:
+    if args.repo is not None and not args.pr and mr is None:
         raise ConfigError(
-            "--repo only applies to --pr (it pins which repository the "
-            "PR number refers to). Drop it, or add --pr N."
+            "--repo only applies to --pr or --mr (it pins the repository)."
         )
 
 
@@ -1210,6 +1223,12 @@ def main() -> None:
     )
     source = parser.add_mutually_exclusive_group()
     source.add_argument(
+        "--mr",
+        type=int,
+        metavar="IID",
+        help="GitLab MR IID (uses glab; requires --repo https://HOST/group/project).",
+    )
+    source.add_argument(
         "--base",
         help="Base ref to diff against (e.g. main, origin/main).",
     )
@@ -1227,9 +1246,10 @@ def main() -> None:
     parser.add_argument(
         "--repo",
         default=None,
-        metavar="OWNER/NAME",
+        metavar="REPOSITORY",
         help=(
-            "Pin the GitHub repository for --pr (passed to every gh "
+            "Required full HTTPS GitLab repository URL for --mr, or "
+            "pin the GitHub repository for --pr (passed to every gh "
             "call). Recommended on forks, where gh's default "
             "(`gh repo set-default`) often points at the upstream repo "
             "and a bare --pr N would review the wrong project's PR."
@@ -1544,7 +1564,7 @@ def main() -> None:
             "Resolve config, gather the diff / bundle, build the "
             "prompts, print a report, and exit without calling the "
             "model. No tokens are spent, but read-only subprocesses "
-            "(git, gh) and the read-only Ollama /api/ps window probe "
+            "(git, gh, glab) and the read-only Ollama /api/ps window probe "
             "still run -- the probe keeps exit-12 behavior identical "
             "to a live run. The best way to debug --include/--exclude."
         ),

@@ -150,8 +150,51 @@ One review source per run (mutually exclusive):
 | `--base <ref>` | Diff: vs an explicit base ref (**includes uncommitted changes**, so iterative loops work without committing each pass). Warns when the base has moved ahead — see [base drift](#base-drift-when-base-has-moved-ahead). |
 | `--pr <N>` | Diff: pulls a GitHub PR diff via `gh pr diff` (requires `gh auth login`). **Add `--repo owner/name` on forks**: a bare PR number resolves through gh's default-repo logic (`gh repo set-default`), which often points at the upstream repo — the runner announces the resolved PR URL on stderr (`[gh] reviewing PR #N: <url>`, also during `--dry-run`) so a wrong target is visible before tokens are spent. |
 | `--staged` | Diff: staged changes only — pre-commit style. |
+| `--mr <IID> --repo <https://HOST/group/project>` | GitLab MR via read-only `glab` commands. A full HTTPS repository URL is required; nested groups and self-hosted instances are supported. The resolved MR URL is printed before any model call. |
 | `--diff-file <path>` | Diff: review a unified diff read from a file (`-` reads stdin) instead of invoking git — for piping diffs from other tools, replaying saved diffs, and the eval harness. Not combinable with `--full-files` (a handed-in diff has no local files to reference). |
 | `--codebase` | Whole codebase: bundles tracked files (via `git ls-files`) and reviews them all. Narrow with `--include` / `--exclude` globs. |
+
+### GitLab merge requests
+
+Install `glab` on PATH and authenticate to your GitLab host with an account
+that can read the target project and MR. If needed, run
+`glab auth login --hostname gitlab.example.com` yourself; the reviewer never
+changes authentication or account configuration. Use the scopes required by
+your instance and glab, and keep tokens in glab's credential storage or trusted
+process environment, never in repository configuration or command examples.
+Tested CLI version: glab 1.121.0.
+
+```bash
+code-review --mr 42 --repo https://gitlab.example.com/group/project --dry-run
+code-review --mr 42 --repo https://gitlab.example.com/group/subgroup/project --provider ollama
+code-review --mr 42 --repo https://gitlab.example.com/group/project --full-files --format json
+code-review --mr 42 --repo https://gitlab.example.com/group/project --no-full-files
+```
+
+Use the project-local **IID**, not GitLab's global MR ID. A bare `--mr 42`
+fails with CONFIG (exit 2). Every glab call receives the explicit full
+repository URL `https://gitlab.example.com/group/project`, regardless of glab's
+default host/repository. For MR mode, `--repo` requires a full HTTPS URL;
+bare namespace paths and credential-bearing URLs are rejected. The host is
+selected explicitly in that URL, with no hardcoded organization or instance.
+Replace `gitlab.example.com` with your host. GitHub `--pr` behavior stays
+the same. MR mode is mutually exclusive with all other review sources.
+
+The runner reads `glab mr view <IID> --output json` and
+`glab mr diff <IID> --raw`, validates the returned `iid`, `web_url`, and
+`sha`, checks a populated `diff_refs.head_sha` against `sha`, and rechecks
+metadata after fetching the diff to detect concurrent pushes. It announces
+`[glab] reviewing MR !42: https://gitlab.example.com/group/project/-/merge_requests/42`
+on stderr, including dry runs. Changed-file references use destination paths
+from that same patch, including renamed files, Unicode, and spaces; deleted
+files have no reference body. References cannot escape the local repository.
+
+Automatic full-file context attaches only when local HEAD matches the MR head;
+otherwise it reviews hunks only. Explicit `--full-files` fails on a wrong head.
+Check out the MR head yourself before using it. A matching dirty checkout warns
+that reference bodies may differ. Provider selection, JSON output, panels,
+chunking, and exit codes retain their existing contracts. No comments, approvals,
+checkouts, or merges are performed automatically.
 
 ### Base drift: when `--base` has moved ahead
 
@@ -292,7 +335,7 @@ Three states:
 | You pass | Behavior | On failure (too big / no local checkout / git can't resolve) |
 |---|---|---|
 | *(nothing)* — **default** | **Auto**: attach when it fits under the 700K cap | Silently falls back to hunks-only with a `NOTE:` — a review you didn't opt into never fails because of an extra |
-| `--full-files` | **Strict**: you asked for it | Typed error (`CONTEXT_OVERFLOW`, or `CONFIG` for `--pr` off the PR head) — you asked, so you're told |
+| `--full-files` | **Strict**: you asked for it | Typed error (`CONTEXT_OVERFLOW`, or `CONFIG` for `--pr`/`--mr` off the remote head) |
 | `--no-full-files` | **Off**: hunks only | — cheaper in tokens; expect more false "X is missing" findings |
 
 Auto is best-effort by design: it costs tokens, so it declines rather than errors. Whenever files are attached you'll see `Full-file context: on (changed files attached).` on stderr.
@@ -597,7 +640,7 @@ Deliberate boundaries, so contributions and reviews don't relitigate them:
 
 - **Not an agent.** One deterministic request per model per chunk; no tool-calling loops, no letting the model run git, no auto-applying suggested fixes. The tool's value is a hard contract (typed exits, stable stderr, predictable cost) that agents and scripts compose — the moment it gets agentic it competes with Claude Code / gemini-cli and loses the predictability that makes it worth calling from them.
 - **Upstream prompts are never edited.** `skills/code-review-commons/SKILL.md` and `commands/code-review.toml` stay byte-identical to upstream. Fork-owned prompt content is appended at runtime in Python or lives in fork-added files. Structured output is recovered by *parsing*, never by prompting for JSON.
-- **Thin dependency surface.** `httpx` + `python-dotenv`, stdlib for everything else. No Pydantic (isinstance guards at the JSON boundaries suffice), no Typer/Rich, no platformdirs.
+- **Thin dependency surface.** `httpx`, `python-dotenv`, and Pydantic v2 for validated boundary records, with stdlib for remaining plumbing. The existing CLI uses argparse; no platformdirs dependency.
 - **Curated alias tables stay small.** Aliases are for models that earned a place as second-opinion reviewers; everything else works via raw `--model` slugs.
 - **API keys come from the environment only** — never from per-project config, which lives in potentially untrusted repos.
 

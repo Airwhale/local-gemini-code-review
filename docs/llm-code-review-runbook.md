@@ -6,6 +6,50 @@ The runner is a thin Python wrapper around the upstream `gemini-cli-extensions/c
 
 ---
 
+## GitLab MR reviews
+
+Always pass the project-local MR IID and a full HTTPS repository URL that
+includes the host and namespace path. Nested groups work. Do not infer the repository from the current
+checkout or from glab's default repository. The runner rejects a missing
+`--repo`, bare namespace paths, and URLs containing credentials, queries, or fragments.
+
+Prerequisites: `glab` on PATH (tested with 1.121.0), authentication for
+your selected GitLab host, and permission to read the project and MR. The operator can
+run `glab auth login --hostname gitlab.example.com` when authentication is needed;
+coding agents should report missing access instead of changing account settings.
+Use the token scopes required by glab and your GitLab instance. Never print
+credentials, put tokens in command arguments, or save them in project config.
+Replace the documentation placeholder `gitlab.example.com` with your host.
+
+```bash
+code-review --mr 42 --repo https://gitlab.example.com/group/subgroup/project --dry-run --no-full-files
+code-review --mr 42 --repo https://gitlab.example.com/group/subgroup/project --format json --output mr-review.json
+code-review --mr 42 --repo https://gitlab.example.com/group/subgroup/project --provider ollama
+```
+
+Inspect the `[glab] reviewing MR !42: <exact URL>` stderr line before relying on
+the result. The tool emits it before any paid model call. It reads MR metadata
+through `glab mr view 42 --output json` and the raw patch through
+`glab mr diff 42 --raw`; every call is pinned with
+`--repo https://gitlab.example.com/group/subgroup/project`. Metadata fields used are
+`iid`, `web_url`, `sha`, and optional `diff_refs.head_sha`. A changed head during
+fetching or inconsistent populated diff refs causes CONFIG (exit 2); retry once
+GitLab has prepared a stable diff.
+
+Automatic reference context requires local HEAD to equal the MR head. With a
+different checkout, automatic mode reviews only the patch. Explicit `--full-files`
+fails and asks the operator to check out the MR head. At a matching head, dirty
+tracked files warn. Rename destination paths are used; deleted files have no
+reference body. Unicode, spaces, and Git's quoted paths are preserved. If local
+context is unwanted, use `--no-full-files`.
+
+Missing glab, authentication, connectivity, invalid repository/IID, and malformed
+metadata produce CONFIG (exit 2). Raw glab transport errors are suppressed to
+avoid leaking credential-bearing URLs. Diagnose access directly with glab in a
+private terminal. The runner only reads; it never comments, approves, checks out,
+or merges. Provider, severity, panel, chunking, JSON, and baseline behavior is
+shared with GitHub PR and local diff modes.
+
 ## Setup
 
 ```
