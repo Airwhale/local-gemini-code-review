@@ -22,8 +22,10 @@ fetches that could describe a newer revision. Destination path parsing supports
 C-quoted UTF-8, spaces, rename-only changes, and deletions. glab output is decoded
 from bytes without universal newline translation, and patch records are split
 only at LF. Control characters and Unicode separators inside hunk bodies cannot
-manufacture reference-file headers. A shared decoder also
-keeps hunk evidence aligned with quoted paths. Local context requires matching
+manufacture reference-file headers. Unquoted binary headers must contain an unambiguous pair
+of paths or matching source/destination paths. Rename/copy metadata resolves
+ambiguous headers; absent destination metadata is an error, never a guessed path.
+The shared C-quoted UTF-8 decoder keeps hunk evidence aligned with quoted paths. Local context requires matching
 HEAD and paths contained within the local repository. Dirty trees warn, matching
 the existing GitHub policy. Automatic context falls back to hunks; explicit
 full-file requests fail when context cannot be verified.

@@ -255,6 +255,78 @@ def test_patch_paths() -> None:
 
 
 @pytest.mark.parametrize(
+    "name", ["foo b/.env", "foo b/bar.txt", "nested/with spaces.bin"]
+)
+def test_real_binary_patch_does_not_select_unrelated_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"\0synthetic binary content\n")
+    (tmp_path / ".env").write_text("LOCAL_SENTINEL_NOT_FOR_REVIEW", encoding="utf-8")
+
+    def git(*arguments: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(tmp_path), *arguments],
+            check=True,
+            capture_output=True,
+            encoding="utf-8",
+        ).stdout
+
+    git("init")
+    git("add", "--", name)
+    patch = git("diff", "--cached", "--no-ext-diff")
+    assert "Binary files" in patch
+    assert sources.mr_patch_paths(patch) == [Path(name)]
+
+    def read(options: argparse.Namespace) -> str:
+        options._gitlab_mr = sources.GitLabMergeRequest.model_validate_json(metadata())
+        options._gitlab_patch = patch
+        return patch
+
+    def local_git(command: list[str]) -> str:
+        if command == ["git", "rev-parse", "HEAD"]:
+            return SHA
+        if command == ["git", "rev-parse", "--show-toplevel"]:
+            return str(tmp_path)
+        return ""
+
+    monkeypatch.setattr(cli, "_read_diff_source", read)
+    monkeypatch.setattr(sources, "_run_git", local_git)
+    settings = Settings(
+        provider="openrouter",
+        model="m",
+        temperature=0.3,
+        max_tokens=16000,
+        retries=0,
+        min_severity="LOW",
+        context=None,
+        output=None,
+    )
+    request = cli._build_request(args(full_files=True), settings)
+    assert "LOCAL_SENTINEL_NOT_FOR_REVIEW" not in request.user_prompt
+
+
+@pytest.mark.parametrize("operation", ["rename", "copy"])
+def test_binary_destination_metadata_resolves_ambiguous_headers(operation: str) -> None:
+    patch = f"diff --git a/old b/name b/new b/name\n{operation} from old b/name\n{operation} to new b/name\nBinary files differ\n"
+    assert sources.mr_patch_paths(patch) == [Path("new b/name")]
+
+
+def test_ambiguous_binary_header_without_metadata_fails_closed() -> None:
+    with pytest.raises(ConfigError, match="Ambiguous"):
+        sources.mr_patch_paths(
+            "diff --git a/old name b/new name\nBinary files differ\n"
+        )
+    assert sources.mr_patch_paths("diff --git a/old b/new\nBinary files differ\n") == [
+        Path("new")
+    ]
+
+
+@pytest.mark.parametrize(
     "separator", ["\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029", "\r"]
 )
 @pytest.mark.parametrize("line_ending", ["\n", "\r\n"])

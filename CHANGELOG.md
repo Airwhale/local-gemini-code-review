@@ -47,6 +47,7 @@ The changes fall into three groups: **remove the blind spot** (auto full-file co
 
 ### Security
 
+- Unquoted GitLab binary patch headers now resolve repeated source/destination paths without splitting inside legal filenames containing ` b/`. Rename/copy metadata resolves differing paths; ambiguous headers without destination metadata fail closed, preventing unrelated local reference files from being selected.
 - GitLab repository URLs reject credentials, query strings, fragments, and non-HTTPS schemes. MR identity and head metadata are validated before model calls; local reference paths must remain inside the repository, including through symlinks. Raw glab transport errors are suppressed to avoid exposing credential-bearing diagnostics.
 - GitLab patch bytes are decoded as UTF-8 without newline translation, and records are split only at LF. Unicode separators and control characters in hunk bodies cannot fabricate file headers and attach unrelated local files to the review context. Regression tests use synthetic local markers, never actual credentials.
 

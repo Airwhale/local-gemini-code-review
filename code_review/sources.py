@@ -114,11 +114,16 @@ def mr_patch_paths(patch: str) -> list[Path]:
     paths: list[Path] = []
     current: str | None = None
     in_hunk = False
+    ambiguous_header = False
     # Git patch lines are LF-delimited. Unicode separators in added content
     # must not reset the hunk state or introduce unrelated reference paths.
     lines = (raw.removesuffix("\r") for raw in patch.split("\n"))
     for line in [*lines, "diff --git "]:
         if line.startswith("diff --git "):
+            if ambiguous_header:
+                raise ConfigError(
+                    "Ambiguous GitLab patch header without destination metadata."
+                )
             in_hunk = False
             if current is not None:
                 path = Path(current)
@@ -132,6 +137,7 @@ def mr_patch_paths(patch: str) -> list[Path]:
                     paths.append(path)
             header = line[len("diff --git ") :]
             current = None
+            ambiguous_header = False
             if header:
                 if header.startswith('"') or ' "b/' in header:
                     match = re.fullmatch(
@@ -141,18 +147,35 @@ def mr_patch_paths(patch: str) -> list[Path]:
                         raise ConfigError("Invalid file header in GitLab patch.")
                     current = decode_patch_path(match[2]).removeprefix("b/")
                 else:
-                    current = header.rsplit(" b/", 1)[-1]
+                    # Spaces, including " b/", are legal in unquoted paths.
+                    # Regular changes repeat the same path on both sides.
+                    path_length = (len(header) - 5) // 2
+                    candidate = header[2 : 2 + path_length]
+                    if header == f"a/{candidate} b/{candidate}":
+                        current = candidate
+                    elif match := re.fullmatch(r"a/(\S+) b/(\S+)", header):
+                        current = match[2]
+                    else:
+                        # Renames/copies and text hunks provide definitive
+                        # destination metadata below. Never guess a path.
+                        ambiguous_header = True
         elif line.startswith("@@"):
             in_hunk = True
         elif in_hunk:
             continue
         elif line.startswith("rename to "):
             current = decode_patch_path(line[len("rename to ") :])
+            ambiguous_header = False
+        elif line.startswith("copy to "):
+            current = decode_patch_path(line[len("copy to ") :])
+            ambiguous_header = False
         elif line.startswith("+++ "):
             value = decode_patch_path(line[4:].split("\t", 1)[0])
             current = None if value == "/dev/null" else value.removeprefix("b/")
+            ambiguous_header = False
         elif line.startswith("deleted file mode "):
             current = None
+            ambiguous_header = False
     return paths
 
 
