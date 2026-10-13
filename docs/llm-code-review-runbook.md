@@ -6,6 +6,50 @@ The runner is a thin Python wrapper around the upstream `gemini-cli-extensions/c
 
 ---
 
+## GitLab MR reviews
+
+Always pass the project-local MR IID and a full HTTPS repository URL that
+includes the host and namespace path. Nested groups work. Do not infer the repository from the current
+checkout or from glab's default repository. The runner rejects a missing
+`--repo`, bare namespace paths, and URLs containing credentials, queries, or fragments.
+
+Prerequisites: `glab` on PATH (tested with 1.121.0), authentication for
+your selected GitLab host, and permission to read the project and MR. The operator can
+run `glab auth login --hostname gitlab.example.com` when authentication is needed;
+coding agents should report missing access instead of changing account settings.
+Use the token scopes required by glab and your GitLab instance. Never print
+credentials, put tokens in command arguments, or save them in project config.
+Replace the documentation placeholder `gitlab.example.com` with your host.
+
+```bash
+code-review --mr 42 --repo https://gitlab.example.com/group/subgroup/project --dry-run --no-full-files
+code-review --mr 42 --repo https://gitlab.example.com/group/subgroup/project --format json --output mr-review.json
+code-review --mr 42 --repo https://gitlab.example.com/group/subgroup/project --provider ollama
+```
+
+Inspect the `[glab] reviewing MR !42: <exact URL>` stderr line before relying on
+the result. The tool emits it before any paid model call. It reads MR metadata
+through `glab mr view 42 --output json` and the raw patch through
+`glab mr diff 42 --raw`; every call is pinned with
+`--repo https://gitlab.example.com/group/subgroup/project`. Metadata fields used are
+`iid`, `web_url`, `sha`, and optional `diff_refs.head_sha`. A changed head during
+fetching or inconsistent populated diff refs causes CONFIG (exit 2); retry once
+GitLab has prepared a stable diff.
+
+Automatic reference context requires local HEAD to equal the MR head. With a
+different checkout, automatic mode reviews only the patch. Explicit `--full-files`
+fails and asks the operator to check out the MR head. At a matching head, dirty
+tracked files warn. Rename destination paths are used; deleted files have no
+reference body. Unicode, spaces, and Git's quoted paths are preserved. If local
+context is unwanted, use `--no-full-files`.
+
+Missing glab, authentication, connectivity, invalid repository/IID, and malformed
+metadata produce CONFIG (exit 2). Raw glab transport errors are suppressed to
+avoid leaking credential-bearing URLs. Diagnose access directly with glab in a
+private terminal. The runner only reads; it never comments, approves, checks out,
+or merges. Provider, severity, panel, chunking, JSON, and baseline behavior is
+shared with GitHub PR and local diff modes.
+
 ## Setup
 
 ```
@@ -92,7 +136,7 @@ The two paths have **different failure modes**, not a strict quality ordering:
 
 **Use Ollama (local) when:** you're offline; the code is sensitive enough you don't want it leaving the machine; you want a free sanity check; the cloud providers are rate-limited / down; you want a second-opinion pass after a cloud review (different blind spots catch different things).
 
-**For high-stakes PRs**, run both and reconcile — or better, run an OpenRouter panel (`--models pro,claude,deepseek`): different vendors surface different bugs, and cross-model agreement is a high-precision signal (see "Panels for high-stakes reviews" below).
+**For high-stakes PRs**, run both and reconcile, or run an OpenRouter panel with verified current cross-vendor model slugs: different vendors surface different bugs, and cross-model agreement is a high-precision signal (see "Panels for high-stakes reviews" below).
 
 ### Setting up Ollama (when `--provider ollama` is right)
 
@@ -125,9 +169,11 @@ The runner's Ollama-specific errors are surgical: a connection refusal raises `C
 
 `--model <slug>` overrides the default. Aliases are **scoped per provider** — each one only resolves under its declared `--provider`; the wrong pairing raises a typed `CONFIG` error naming the right one. The full alias tables are canonical in the README's "Model aliases" section; the operational shorthand:
 
-- **Iterate with `flash`** (~3× faster than `pro`, some quality loss), **finish with `pro`**.
-- **Second opinion: `claude`** — the strongest cross-vendor complement to a Gemini round; `deepseek` is the cheap third opinion, `gpt` the independent one.
-- **Local: `local`** (`qwen3-coder:30b`); `local-pro` if disk and patience allow.
+- **Prefer modern models.** For new reviews, select the newest stable models suitable for coding, the required context window, and the user's budget. Do not treat the installed aliases, defaults, or old examples as evidence that a model is current.
+- **Verify before paying.** Check the vendor's current release documentation and the selected provider's live catalog. For OpenRouter, the public [models endpoint](https://openrouter.ai/api/v1/models) lists exact slugs, context limits, and pricing. Confirm endpoint compatibility and availability; catalog listing does not guarantee account access. Use verified raw slugs with `--model` or `--models` when aliases lag behind.
+- **Respect user preferences.** Honor requested vendors and exclusions, including a preference for non-OpenAI models. For independent opinions, choose distinct current models from different vendors. A faster current model can handle iteration and a stronger current model can handle the final pass; explain that choice instead of silently using legacy aliases.
+- **Keep choices explicit.** Announce exact model slugs before calls and record them in the review summary. Use previews or older models only for a stated reason, such as explicit user selection, reproducibility, hardware constraints, or unavailable current models. If availability or budget blocks a run, report it rather than silently downgrading or changing providers.
+- **Local models:** choose a current coding model that fits available hardware and is installed in Ollama; the `local` and `local-pro` aliases remain compatibility shortcuts.
 - The `gemini` direct-API provider has **no aliases** — bare Gemini model names only. Raw slugs always pass through on every provider, so unaliased models work via `--model <slug>`.
 
 ### Tuning sampling: `--temperature` and `--max-tokens`

@@ -10,12 +10,165 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import os
+import re
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from code_review.errors import ConfigError
+from code_review.patch_paths import decode_patch_path
 from code_review.prompts import MAX_INDIVIDUAL_FILE_BYTES, _format_size
+
+
+class GitLabDiffRefs(BaseModel):
+    head_sha: str | None = None
+
+
+class GitLabMergeRequest(BaseModel):
+    """Validated subset of glab's API-shaped JSON output."""
+
+    model_config = ConfigDict(extra="ignore", strict=True)
+    iid: int = Field(gt=0)
+    web_url: str
+    sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    diff_refs: GitLabDiffRefs | None = None
+
+
+def gitlab_repo(repo: str | None) -> str:
+    """Require a namespace and pin the host independently of glab defaults."""
+    message = "--mr requires --repo https://HOST/group/project (nested groups allowed)."
+    if repo is None or any(char.isspace() for char in repo):
+        raise ConfigError(message)
+    try:
+        url = urlsplit(repo)
+        port = url.port
+    except ValueError as exc:
+        raise ConfigError(message) from exc
+    if (
+        url.scheme != "https"
+        or not url.hostname
+        or not re.fullmatch(r"[A-Za-z0-9.-]+", url.hostname)
+        or url.username is not None
+        or url.password is not None
+        or url.query
+        or url.fragment
+        or not re.fullmatch(r"/[\w.-]+(?:/[\w.-]+)+", url.path)
+        or any(part in {".", ".."} for part in url.path.split("/"))
+        or (port is not None and port == 0)
+    ):
+        raise ConfigError(message)
+    host = url.hostname + (f":{port}" if port is not None else "")
+    return f"https://{host}{url.path}"
+
+
+def _run_glab(args: list[str], repo: str) -> str:
+    command = ["glab", "mr", *args, "--repo", gitlab_repo(repo)]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            # Preserve lone CR bytes inside patch content. Text mode would
+            # translate them into LF and could manufacture file headers.
+            text=False,
+            check=True,
+        )
+    except FileNotFoundError as exc:
+        raise ConfigError(
+            "`glab` not found on PATH. Install GitLab CLI to use --mr."
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        # Do not echo transport diagnostics, which can contain credential URLs.
+        raise ConfigError(
+            f"glab mr {args[0]} failed (exit {exc.returncode}). Check MR IID, "
+            "--repo, connectivity, and glab authentication for the selected host."
+        ) from exc
+    return result.stdout.decode("utf-8", errors="replace")
+
+
+def mr_metadata(iid: int, repo: str) -> GitLabMergeRequest:
+    try:
+        mr = GitLabMergeRequest.model_validate_json(
+            _run_glab(["view", str(iid), "--output", "json"], repo)
+        )
+    except ValidationError as exc:
+        raise ConfigError(
+            "glab returned invalid MR metadata; expected iid, web_url, sha."
+        ) from exc
+    expected = f"{gitlab_repo(repo)}/-/merge_requests/{iid}"
+    if mr.iid != iid or mr.web_url != expected:
+        raise ConfigError(
+            "glab resolved a different MR URL or IID; refusing to review."
+        )
+    if mr.diff_refs and mr.diff_refs.head_sha and mr.diff_refs.head_sha != mr.sha:
+        raise ConfigError(
+            "GitLab MR diff head differs from sha; retry after diff preparation."
+        )
+    return mr
+
+
+def mr_patch_paths(patch: str) -> list[Path]:
+    """Collect destination paths, including rename-only and binary changes."""
+    paths: list[Path] = []
+    current: str | None = None
+    in_hunk = False
+    # Git patch lines are LF-delimited. Unicode separators in added content
+    # must not reset the hunk state or introduce unrelated reference paths.
+    lines = (raw.removesuffix("\r") for raw in patch.split("\n"))
+    for line in [*lines, "diff --git "]:
+        if line.startswith("diff --git "):
+            in_hunk = False
+            if current is not None:
+                path = Path(current)
+                if (
+                    PurePosixPath(current).is_absolute()
+                    or ".." in path.parts
+                    or (os.name == "nt" and ("\\" in current or ":" in current))
+                ):
+                    raise ConfigError("Unsafe file path in GitLab patch.")
+                if path not in paths:
+                    paths.append(path)
+            header = line[len("diff --git ") :]
+            current = None
+            if header:
+                if header.startswith('"') or ' "b/' in header:
+                    match = re.fullmatch(
+                        r'("(?:\\.|[^"\\])*"|a/.*?) ("(?:\\.|[^"\\])*"|b/.*)', header
+                    )
+                    if match is None:
+                        raise ConfigError("Invalid file header in GitLab patch.")
+                    current = decode_patch_path(match[2]).removeprefix("b/")
+                else:
+                    current = header.rsplit(" b/", 1)[-1]
+        elif line.startswith("@@"):
+            in_hunk = True
+        elif in_hunk:
+            continue
+        elif line.startswith("rename to "):
+            current = decode_patch_path(line[len("rename to ") :])
+        elif line.startswith("+++ "):
+            value = decode_patch_path(line[4:].split("\t", 1)[0])
+            current = None if value == "/dev/null" else value.removeprefix("b/")
+        elif line.startswith("deleted file mode "):
+            current = None
+    return paths
+
+
+def _guard_mr_full_files(mr: GitLabMergeRequest) -> None:
+    local = _run_git(["git", "rev-parse", "HEAD"]).strip()
+    if local != mr.sha:
+        raise ConfigError(
+            f"--full-files with --mr requires local HEAD ({local[:12]}) to match "
+            f"MR !{mr.iid} head ({mr.sha[:12]}). Check out the MR head first, "
+            "or drop --full-files."
+        )
+    if _run_git(["git", "status", "--porcelain", "--untracked-files=no"]).strip():
+        sys.stderr.write(
+            "WARN: working tree has uncommitted changes; reference content may differ from the MR head.\n"
+        )
+
 
 BUILTIN_CODEBASE_EXCLUDES: tuple[str, ...] = (
     # Lock files for various package managers.
@@ -309,6 +462,12 @@ def changed_file_paths(args: argparse.Namespace) -> list[Path]:
     Mirrors ``git_diff_local`` / ``pr_diff`` argument-for-argument so the
     reference set always matches the diff the model reviews.
     """
+    if getattr(args, "mr", None) is not None:
+        paths = _rebase_repo_relative(mr_patch_paths(args._gitlab_patch))
+        root = Path(_run_git(["git", "rev-parse", "--show-toplevel"]).strip()).resolve()
+        if any(not path.resolve().is_relative_to(root) for path in paths):
+            raise ConfigError("GitLab reference path escapes the local repository.")
+        return paths
     if args.pr:
         return _rebase_repo_relative(pr_changed_files(args.pr, args.repo))
     if args.staged:
@@ -414,6 +573,17 @@ def _filter_reviewable(paths: list[Path]) -> list[Path]:
 
 def _read_diff_source(args: argparse.Namespace) -> str:
     """Fetch the diff for the active diff mode (git, gh, file, or stdin)."""
+    if getattr(args, "mr", None) is not None:
+        mr = mr_metadata(args.mr, args.repo)
+        sys.stderr.write(f"[glab] reviewing MR !{mr.iid}: {mr.web_url}\n")
+        patch = _run_glab(["diff", str(args.mr), "--raw"], args.repo)
+        if mr_metadata(args.mr, args.repo).sha != mr.sha:
+            raise ConfigError(
+                "MR head changed while fetching the diff; retry the review."
+            )
+        args._gitlab_mr = mr
+        args._gitlab_patch = patch
+        return patch
     if args.diff_file is not None:
         if args.diff_file == "-":
             if sys.stdin.isatty():

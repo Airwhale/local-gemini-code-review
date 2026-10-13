@@ -34,7 +34,9 @@ There is no other data egress: no telemetry, no crash reporting, no update check
 
 ### Subprocesses and network
 
-- Local subprocesses are limited to read-only `git` (diffs, file listings) and `gh` (PR diffs/metadata). Nothing from the model or from reviewed repos is passed to a shell.
+- Local subprocesses are limited to read-only `git` (diffs, file listings), `gh` (PR diffs/metadata), and `glab` (MR diffs/metadata). Nothing from the model or from reviewed repos is passed to a shell.
+- GitLab mode requires a full HTTPS repository URL and pins every call to that explicit host and namespace. Credential-bearing URLs, query strings, and fragments are rejected. Returned MR URL/IID and head metadata are validated before model calls. Local reference paths cannot escape the repository, including through symlinks. glab failure messages omit raw transport diagnostics, which could contain credential URLs. Authentication is operator-managed; the tool never logs in or changes account configuration.
+- GitLab patch bytes are decoded as UTF-8 without newline translation. Only LF separates patch records; control characters and Unicode separators inside hunk content cannot fabricate file headers and add unrelated local files to reference context.
 - HTTP requests go only to the selected provider endpoint (plus the local Ollama `/api/ps` probe). Retry-After sleep values from providers are clamped (300s max) so a hostile header can't stall a pipeline indefinitely.
 
 ## Hardening tips for CI

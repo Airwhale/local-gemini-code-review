@@ -49,6 +49,11 @@ A one-page map of how a review request flows through the runner, the design deci
 
 ## Design decisions
 
+GitLab MRs use `--mr IID --repo https://HOST/group/project` with read-only glab
+metadata and raw diff access pinned to the explicit repository URL. Exact URL validation, before/after
+head checks, Pydantic boundary validation, and local context containment are
+documented in [ADR 0002](architecture/0002-gitlab-mr-source.md).
+
 **Deterministic primitive, not an agent.** One request per model per chunk; no tool-calling, no retry-with-reworded-prompt, no auto-fix. Model output is printed or parsed — never executed. Complex behavior (iterate-until-clean loops, panels of panels) belongs in the *caller*, which is usually an LLM agent following the runbook. See the README's Non-goals.
 
 **Parse, don't prompt.** Structured output comes from parsing the rigid upstream markdown format locally, never from asking the model for JSON. The upstream prompts stay byte-identical (clean upstream merges, unchanged model behavior), and a model that drifts from the format degrades to `parse_ok: false` + raw text instead of a hard failure — a paid-for review is never destroyed by a formatting quirk.
