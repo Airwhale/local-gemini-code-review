@@ -22,20 +22,22 @@ class OpenRouterMessage(BaseModel):
 
 
 class OpenRouterReasoning(BaseModel):
+    """The explicit non-thinking policy used by the V4.1 Flash profile."""
+
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    effort: Literal["low", "high", "max"]
+    enabled: Literal[False]
 
 
 def openrouter_reasoning(model: str) -> OpenRouterReasoning | None:
-    """Use V4.1 Flash's supported low effort for code reviews."""
+    """Avoid V4.1 Flash spending its entire review allowance on thinking."""
     if model.partition(":")[0] == DEEPSEEK_V41_FLASH:
-        return OpenRouterReasoning(effort="low")
+        return OpenRouterReasoning(enabled=False)
     return None
 
 
 def openrouter_default_max_tokens(model: str) -> int | None:
-    """Leave room for reasoning plus a review when no cap was configured."""
+    """Preserve V4.1 Flash's output allowance when no cap was configured."""
     return 65_536 if model.partition(":")[0] == DEEPSEEK_V41_FLASH else None
 
 

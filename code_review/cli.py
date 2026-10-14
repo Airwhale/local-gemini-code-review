@@ -966,7 +966,7 @@ def _dry_run_report(
         for model in settings.models or (settings.model,):
             reasoning = openrouter_reasoning(model)
             if reasoning is not None:
-                lines.append(f"reasoning:         {model}: {reasoning.effort}")
+                lines.append(f"reasoning:         {model}: disabled")
     if cost_line is not None:
         lines.append(f"est_cost:          {cost_line}")
     if ollama_window is not None:

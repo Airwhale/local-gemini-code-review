@@ -178,19 +178,23 @@ The runner's Ollama-specific errors are surgical: a connection refusal raises `C
 
 ### Tuning sampling: `--temperature` and `--max-tokens`
 
-For `deepseek/deepseek-v4.1-flash` on OpenRouter, the runner requests low
-reasoning effort and defaults to 65,536 combined reasoning/review tokens when no
-cap is configured. This also applies to suffixed IDs and individual panel slots;
-other models keep their existing defaults. Inspect `--dry-run` for resolved
-per-model caps and the `[reasoning]` line on a live call. A full-diff validation
-completed with 45,910 completion tokens, so 32,768 was insufficient for that run.
+For `deepseek/deepseek-v4.1-flash` on OpenRouter, the runner explicitly disables
+thinking (`reasoning.enabled=false`) and retains the 65,536-token output ceiling
+when no cap is configured. Repeated low-effort calls exhausted that full budget
+without a review, including with reduced input. More tokens did not reliably
+solve the problem. Non-thinking mode produces the review directly and can
+change finding quality, so verify findings against source. This policy also
+applies to suffixed IDs and individual panel slots; other models are unchanged.
 
 CLI, environment, and project limits remain authoritative. For example,
 `CODE_REVIEW_MAX_TOKENS=32768` prevents the larger model default from applying.
-Remove the override or retry only the failed DeepSeek slot with
-`--max-tokens 65536`; do not rerun successful panel slots. If that profile still
-exhausts reasoning without a review, stop automatic budget escalation and narrow
-or chunk the input. Record the slot as incomplete. A panel's exit 0 does not
+Before retrying an older failure, verify that `--dry-run` reports reasoning
+`disabled` and a live run prints `[reasoning] ... enabled=false max_tokens=...`.
+If it still says `effort=low`, update the checkout or installed tool first.
+Retry only the failed DeepSeek slot; retain successful panel results. If the
+current profile still fails, narrow or chunk the input and record the slot as
+incomplete. There is no automatic fallback or budget escalation that spends
+another call. Do not keep increasing `--max-tokens`. A panel's exit 0 does not
 mean every model succeeded: inspect each `per_model` entry's `error`, `parse_ok`,
 and `truncated` fields before claiming all reviewers are represented.
 
@@ -299,7 +303,7 @@ The runner exits with **typed exit codes** so an LLM caller can react differentl
 | 2 | CONFIG | fix env / CLI flag; don't retry |
 | 10 | SAFETY_REFUSAL | retry with `--model claude` |
 | 11 | RATE_LIMIT | wait 60s; switch provider if persistent |
-| 12 | CONTEXT_OVERFLOW | narrow scope; don't retry as-is (if max_tokens was hit before any content: raise `--max-tokens`; if the Ollama guard/post-verify fired: raise `$OLLAMA_NUM_CTX` — requested per call, RAM permitting) |
+| 12 | CONTEXT_OVERFLOW | Narrow scope; do not retry unchanged. For reasoning-only output, check supported thinking controls and the configured ceiling before retrying; do not repeatedly raise the budget. For the Ollama guard/post-verify, raise `$OLLAMA_NUM_CTX` (requested per call, RAM permitting). |
 | 13 | PROVIDER_HICCUP | retry; runner already auto-retried once |
 | 14 | TRANSPORT | exponential backoff; escalate after 3 |
 | 1 | UNKNOWN | read stderr; escalate |

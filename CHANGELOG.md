@@ -24,7 +24,7 @@ The changes fall into three groups: **remove the blind spot** (auto full-file co
 
 ### Fixed
 
-- DeepSeek V4.1 Flash on OpenRouter now requests low reasoning effort and defaults to 65,536 combined reasoning/review tokens when no cap is configured. Explicit CLI, environment, and project caps remain authoritative; other panel models keep their existing defaults. Dry runs, progress messages, context guards, and cost estimates use resolved per-model limits. Agent guidance stops repeated budget escalation after a reasoning-only failure at the recommended profile.
+- DeepSeek V4.1 Flash on OpenRouter now explicitly disables optional thinking. Low effort could still exhaust the entire 65,536-token allowance without producing a review, even with reduced input. The existing output ceiling and explicit CLI/environment/project caps remain authoritative; other models keep their generation settings. Dry runs and progress report the disabled setting. Reasoning-only failures still return exit 12 without automatic retries, and error guidance no longer encourages repeated budget escalation.
 - GitLab metadata tolerates missing, empty, or null `diff_refs.head_sha` while validating the top-level head SHA and checking populated diff refs for consistency.
 - Hunk evidence decodes Git's quoted UTF-8 paths and handles CRLF line endings without trimming spaces that belong to filenames.
 - Truncated baseline reviews retain `new`/`persisting` statuses but omit `resolved` and report that resolution is unknown. A partial response no longer claims unseen prior findings were fixed.

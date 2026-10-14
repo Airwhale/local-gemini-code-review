@@ -94,10 +94,9 @@ class ContextOverflow(ReviewError):
         "Narrow the diff scope: ``--include`` / ``--exclude`` in codebase "
         "mode, or a smaller ``--base`` ref in diff mode. Do not retry "
         "without reducing scope -- a second call with the same payload "
-        "will hit the same limit. Exception: if the message says "
-        "max_tokens was hit before any content appeared (reasoning "
-        "models can spend the whole budget thinking), raise "
-        "``--max-tokens`` instead of narrowing scope."
+        "will hit the same limit. For reasoning-only output, check the "
+        "model's supported thinking controls and the configured output "
+        "ceiling before retrying. Do not repeatedly raise the budget."
     )
 
 

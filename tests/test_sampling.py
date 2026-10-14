@@ -132,7 +132,7 @@ def test_deepseek_reasoning_in_mixed_panel(
         expected_limit = 65536 if defaulted and model in models[2:4] else max_tokens
         assert body["max_tokens"] == expected_limit
         if model in models[2:4]:
-            assert body["reasoning"] == {"effort": "low"}
+            assert body["reasoning"] == {"enabled": False}
         else:
             assert "reasoning" not in body
         if model == models[1]:
@@ -169,15 +169,19 @@ def test_deepseek_reasoning_in_mixed_panel(
     assert tuple(results) == models
     stderr = capsys.readouterr().err
     deepseek_limit = 65536 if defaulted else max_tokens
-    assert f"effort=low max_tokens={deepseek_limit}" in stderr
+    assert f"enabled=false max_tokens={deepseek_limit}" in stderr
     assert stderr.count("[reasoning]") == 2
 
 
-def test_deepseek_empty_reasoning_response_is_not_a_review(
+def test_deepseek_ignored_disable_is_not_a_review_or_retried(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    calls = 0
+
     def handle(request: httpx.Request) -> httpx.Response:
-        assert json.loads(request.content)["reasoning"] == {"effort": "low"}
+        nonlocal calls
+        calls += 1
+        assert json.loads(request.content)["reasoning"] == {"enabled": False}
         return httpx.Response(
             200,
             json={
@@ -199,17 +203,24 @@ def test_deepseek_empty_reasoning_response_is_not_a_review(
         "_make_client",
         lambda timeout: httpx.Client(transport=httpx.MockTransport(handle)),
     )
-    with pytest.raises(ContextOverflow, match="before producing content"):
-        providers.call_openrouter(
-            model="deepseek/deepseek-v4.1-flash",
-            system_prompt="s",
-            user_prompt="u",
-            api_key="test-key",
-            referer="test",
-            title="test",
-            temperature=0.3,
-            max_tokens=16000,
+    settings = Settings(
+        provider="openrouter",
+        model="deepseek/deepseek-v4.1-flash",
+        temperature=0.3,
+        max_tokens=16000,
+        retries=3,
+        min_severity="LOW",
+        context=None,
+        output=None,
+        api_key="test-key",
+        referer="test",
+        title="test",
+    )
+    with pytest.raises(ContextOverflow, match="reasoning was requested disabled"):
+        cli._execute_call(
+            settings, system_prompt="s", user_prompt="u", model=settings.model
         )
+    assert calls == 1
 
 
 def test_dry_run_shows_deepseek_reasoning(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -227,15 +238,24 @@ def test_dry_run_shows_deepseek_reasoning(monkeypatch: pytest.MonkeyPatch) -> No
         output=None,
     )
     report = _dry_run_report(settings, ReviewRequest("s", "u", "diff", 1))
-    assert "reasoning:         deepseek/deepseek-v4.1-flash: low" in report
+    assert "reasoning:         deepseek/deepseek-v4.1-flash: disabled" in report
     assert "max_tokens:        16000" in report
 
 
-def test_reasoning_schema_rejects_unsupported_controls() -> None:
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"effort": "low"},
+        {"enabled": True},
+        {"enabled": "false"},
+        {"enabled": False, "effort": "low"},
+        {"enabled": False, "max_tokens": 4096},
+    ],
+)
+def test_reasoning_schema_rejects_unsupported_controls(payload: object) -> None:
     with pytest.raises(ValidationError):
-        OpenRouterReasoning.model_validate({"effort": "medium"})
-    with pytest.raises(ValidationError):
-        OpenRouterReasoning.model_validate({"effort": "low", "max_tokens": 4096})
+        OpenRouterReasoning.model_validate(payload)
 
 
 def test_defaulted_panel_limits_match_cost_and_reports(

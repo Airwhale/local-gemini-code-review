@@ -151,12 +151,14 @@ silently falling back to an older model. See the runbook's
 
 ### DeepSeek V4.1 Flash generation defaults
 
-For `deepseek/deepseek-v4.1-flash` on OpenRouter, the runner requests low
-reasoning effort and defaults to **65,536 total output tokens**, including both
-thinking and the visible review. A full-diff validation needed 45,910 completion
-tokens, exceeding the former 32,768-token ceiling. This policy also applies to
-the model's suffixed IDs and to its slot in a panel; other models keep their
-existing defaults. `--dry-run` reports each model's resolved limit and effort.
+For `deepseek/deepseek-v4.1-flash` on OpenRouter, the runner explicitly disables
+thinking with `reasoning.enabled=false` and retains its **65,536-token output
+ceiling**. Low effort still exhausted that entire budget without producing a
+review on repeated runs, including with full-file attachments removed. The
+non-thinking mode uses the same model to produce the review directly. Review
+quality can differ from thinking mode; verify findings against source as usual.
+This policy also applies to suffixed IDs and individual panel slots. Other
+models keep their existing generation settings.
 
 ```bash
 code-review --provider openrouter --model deepseek/deepseek-v4.1-flash --base origin/main
@@ -164,11 +166,14 @@ code-review --provider openrouter --model deepseek/deepseek-v4.1-flash --base or
 
 An explicit `--max-tokens`, `CODE_REVIEW_MAX_TOKENS`, or project `max_tokens`
 always wins, even if smaller. A shared explicit panel limit applies to every
-model. If an existing 32,768-token override causes empty reasoning-only output,
-remove it to use model defaults or retry just DeepSeek once with
-`--max-tokens 65536`. If that profile still produces no review, narrow or chunk
-the input and record the model as incomplete rather than repeatedly increasing
-the ceiling. Reasoning-only output is never accepted as a clean review.
+model. `--dry-run` reports `reasoning: ...: disabled`; a live run prints
+`[reasoning] model=deepseek/deepseek-v4.1-flash enabled=false max_tokens=...`.
+If it still reports `effort=low`, update the checkout or installed tool before
+retrying. Retry only the failed model, retaining successful panel results. If
+the current profile still produces no review, narrow or chunk the input and
+record the model as incomplete instead of repeatedly raising the ceiling.
+Reasoning-only output is never accepted as a clean review, and no automatic
+fallback or budget escalation adds another paid call.
 
 ## Review modes
 
@@ -580,7 +585,7 @@ If you're calling this tool in a loop, here's the contract.
 | **2** | CONFIG | Missing or rejected API key (HTTP 401/403), invalid CLI / env / config value, or `--full-files --pr` with a checkout that isn't at the PR head | **Do not retry without fixing.** Read stderr, correct config, re-run. |
 | **10** | SAFETY_REFUSAL | Model refused (content filter or provider moderation fired) | Retry with `--model claude` (least refusal-prone on security/policy code). If refused across models, escalate to a human. |
 | **11** | RATE_LIMIT | HTTP 429 from the provider | Wait 30–60s (or the `Retry-After` echoed in the message), then retry — or pass `--retries N` and let the runner do it. Per-key daily limits: switch `--provider` or `--model`. |
-| **12** | CONTEXT_OVERFLOW | Payload exceeded the model's budget, the 700K-char bundle cap, or the Ollama window guard/post-verify | Narrow scope (`--include`/`--exclude`, smaller `--base`) or use `--chunk`. **Do not retry unchanged.** Exceptions: max_tokens hit before any content (reasoning models thinking) → raise `--max-tokens`; Ollama guard → raise `$OLLAMA_NUM_CTX` (requested per call, RAM permitting). |
+| **12** | CONTEXT_OVERFLOW | Payload exceeded the model's budget, the 700K-char bundle cap, or the Ollama window guard/post-verify | Narrow scope (`--include`/`--exclude`, smaller `--base`) or use `--chunk`. **Do not retry unchanged.** For reasoning-only output, check supported thinking controls and the configured output ceiling before retrying; do not repeatedly raise the budget. Ollama guard: raise `$OLLAMA_NUM_CTX` (requested per call, RAM permitting). |
 | **13** | PROVIDER_HICCUP | Null content with no clear cause, or a non-JSON / malformed provider response | The runner already auto-retried once. Wait a few seconds and retry; if persistent, switch provider. |
 | **14** | TRANSPORT | HTTP 5xx, timeout, or connection error | Runner already retried once at 2s. Exponential backoff (4s, 8s); escalate after 3 failures. |
 | **1** | UNKNOWN | Catchall — an unexpected exception inside the runner (traceback in the `Detail:` line) | Read stderr; escalate if unclear. |
@@ -614,7 +619,7 @@ Non-error stderr lines use a fixed prefix vocabulary — **no informational line
 | `Reviewing …` | Pre-call notice: payload size, model(s), provider, sampling settings |
 | `WARN: …` | Something degraded but the run continues (truncated output, clamped Retry-After, unknown Ollama window, unrecognized config keys, ignored flags) |
 | `[usage] …` | Token usage reported by the provider after a successful call |
-| `[reasoning] …` | The model-specific reasoning effort and combined output limit sent to OpenRouter |
+| `[reasoning] …` | The model-specific thinking control and output limit sent to OpenRouter |
 | `[retry] …` | An automatic retry is about to happen (category, attempt, delay) |
 | `[ollama] …` | Ollama context-window detection notice (`/api/ps`) |
 | `[config] …` | A `.code-review.toml` was found and loaded (path announced — a security property, since the file lives in the reviewed repo) |

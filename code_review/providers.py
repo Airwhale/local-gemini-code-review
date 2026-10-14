@@ -674,7 +674,7 @@ def call_openrouter(
     )
     if reasoning is not None:
         sys.stderr.write(
-            f"[reasoning] model={model} effort={reasoning.effort} "
+            f"[reasoning] model={model} enabled=false "
             f"max_tokens={max_tokens} (reasoning and review combined)\n"
         )
     headers = {
@@ -805,9 +805,15 @@ def call_openrouter(
             provider="openrouter",
         )
     if finish_reasons & {"length", "max_tokens"}:
+        recovery = (
+            "; reasoning was requested disabled. Narrow or chunk the input "
+            "instead of repeatedly raising the output limit"
+            if reasoning is not None
+            else ""
+        )
         raise ContextOverflow(
             f"Hit max_tokens ({max_tokens}) before producing content "
-            f"(finish_reasons={sorted(finish_reasons)!r})",
+            f"(finish_reasons={sorted(finish_reasons)!r}){recovery}",
             detail=str(data)[:1000],
             model=model,
             provider="openrouter",
