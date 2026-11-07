@@ -5,6 +5,11 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 DEEPSEEK_V41_FLASH = "deepseek/deepseek-v4.1-flash"
+# Optional reasoning, on by default (OpenRouter catalog: mandatory=false).
+# Left on, it spent the whole 16K and 32K output allowance thinking on
+# ~60K-175K-token review prompts and returned no review.
+QWEN38_FLASH = "qwen/qwen3.8-flash"
+_REASONING_DISABLED_MODELS = frozenset({DEEPSEEK_V41_FLASH, QWEN38_FLASH})
 
 
 def uses_default_sampling(provider: str, model: str) -> bool:
@@ -30,8 +35,12 @@ class OpenRouterReasoning(BaseModel):
 
 
 def openrouter_reasoning(model: str) -> OpenRouterReasoning | None:
-    """Avoid V4.1 Flash spending its entire review allowance on thinking."""
-    if model.partition(":")[0] == DEEPSEEK_V41_FLASH:
+    """Avoid flash models spending their entire review allowance on thinking.
+
+    Applies to DeepSeek V4.1 Flash and Qwen 3.8 Flash (any ``:variant``).
+    Only DeepSeek also gets a larger default output allowance.
+    """
+    if model.partition(":")[0] in _REASONING_DISABLED_MODELS:
         return OpenRouterReasoning(enabled=False)
     return None
 

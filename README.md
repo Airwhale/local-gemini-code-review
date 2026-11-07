@@ -214,6 +214,13 @@ record the model as incomplete instead of repeatedly raising the ceiling.
 Reasoning-only output is never accepted as a clean review, and no automatic
 fallback or budget escalation adds another paid call.
 
+`qwen/qwen3.8-flash` gets the same `reasoning.enabled=false` request (its
+reasoning is optional but on by default). In this repository's own reviews it
+spent the entire 16,000- and 32,768-token allowance on reasoning and returned
+nothing. Its output ceiling is **not** raised; the normal default applies.
+Other Qwen models are unchanged. `z-ai/glm-5.3` cannot disable reasoning (it is
+mandatory there), so it keeps its default settings.
+
 ## Review modes
 
 One review source per run (mutually exclusive):

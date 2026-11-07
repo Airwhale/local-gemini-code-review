@@ -27,6 +27,7 @@ The changes fall into three groups: **remove the blind spot** (auto full-file co
 
 ### Fixed
 
+- Qwen 3.8 Flash on OpenRouter now disables its optional (default-on) reasoning with the same `reasoning.enabled=false` profile. It previously spent the whole 16K and 32K output allowance on reasoning and returned no review. Its output ceiling is not raised, and other Qwen models are unchanged.
 - DeepSeek V4.1 Flash on OpenRouter now explicitly disables optional thinking. Low effort could still exhaust the entire 65,536-token allowance without producing a review, even with reduced input. The existing output ceiling and explicit CLI/environment/project caps remain authoritative; other models keep their generation settings. Dry runs and progress report the disabled setting. Reasoning-only failures still return exit 12 without automatic retries, and error guidance no longer encourages repeated budget escalation.
 - GitLab metadata tolerates missing, empty, or null `diff_refs.head_sha` while validating the top-level head SHA and checking populated diff refs for consistency.
 - Hunk evidence decodes Git's quoted UTF-8 paths and handles CRLF line endings without trimming spaces that belong to filenames.

@@ -173,6 +173,57 @@ def test_deepseek_reasoning_in_mixed_panel(
     assert stderr.count("[reasoning]") == 2
 
 
+@pytest.mark.parametrize("defaulted", [True, False])
+def test_qwen_flash_reasoning_disabled_without_raising_limit(
+    monkeypatch: pytest.MonkeyPatch, defaulted: bool
+) -> None:
+    models = (
+        "qwen/qwen3.8-flash",
+        "qwen/qwen3.8-flash:nitro",
+        "qwen/qwen3.8-max-prime",
+        "z-ai/glm-5.3",
+    )
+    seen: dict[str, dict] = {}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen[body["model"]] = body
+        return httpx.Response(
+            200,
+            json={"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}]},
+        )
+
+    monkeypatch.setattr(
+        providers,
+        "_make_client",
+        lambda timeout: httpx.Client(transport=httpx.MockTransport(handle)),
+    )
+    settings = Settings(
+        provider="openrouter",
+        model=models[0],
+        models=models,
+        temperature=0.3,
+        max_tokens=16000,
+        max_tokens_defaulted=defaulted,
+        retries=0,
+        min_severity="LOW",
+        context=None,
+        output=None,
+        api_key="test-key",
+        referer="test",
+        title="test",
+    )
+    results, failures = _run_panel(settings, ReviewRequest("s", "u", "diff", 1))
+    assert not failures and tuple(results) == models
+    for model in models[:2]:
+        assert seen[model]["reasoning"] == {"enabled": False}
+        # Unlike DeepSeek V4.1 Flash, the output allowance is not raised.
+        assert seen[model]["max_tokens"] == 16000
+    for model in models[2:]:
+        assert "reasoning" not in seen[model]
+        assert seen[model]["max_tokens"] == 16000
+
+
 def test_deepseek_ignored_disable_is_not_a_review_or_retried(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
