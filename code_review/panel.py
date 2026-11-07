@@ -88,13 +88,27 @@ def merge_panel_findings(
     return clusters
 
 
-def _panel_max_workers(provider: str, n_models: int) -> int:
+def _panel_max_workers(provider: str, n_models: int, sequential: bool = False) -> int:
     """Concurrency for a panel: cloud providers run in parallel (capped);
     ollama runs strictly sequentially -- two local models can't share
-    RAM, and interleaved requests just thrash model swaps."""
-    if provider == "ollama":
+    RAM, and interleaved requests just thrash model swaps. ``sequential``
+    (``--sequential``) opts any provider into one-at-a-time execution."""
+    if sequential or provider == "ollama":
         return 1
     return min(n_models, 4)
+
+
+def panel_execution_mode(provider: str, n_models: int, sequential: bool) -> str:
+    """Human-readable execution mode for --dry-run and progress lines.
+
+    Derived from ``_panel_max_workers`` so the report can never disagree
+    with what ``_run_panel`` actually does.
+    """
+    workers = _panel_max_workers(provider, n_models, sequential)
+    if workers > 1:
+        return f"concurrent (up to {workers} models at once)"
+    reason = "--sequential" if sequential else "ollama default"
+    return f"sequential ({reason}): one model at a time, in the order given"
 
 
 def _panel_exit_error(failures: list[tuple[str, ReviewError]]) -> ReviewError:

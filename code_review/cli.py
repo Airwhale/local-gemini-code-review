@@ -30,6 +30,13 @@ providers selectable at the command line:
       review; trade-off is quality and speed depending on local model
       size and CPU/GPU.
 
+  --provider claude-code (opt-in)
+      Runs the locally installed Claude Code CLI (``claude -p``) on its
+      existing sign-in, read-only: no tools, no MCP, safe mode, no session
+      persistence, empty temporary working directory. Defaults to the
+      pinned ``claude-sonnet-5-5``. Never logs in and strips API-key billing
+      selectors from its environment. See ``code_review/claude_code.py``.
+
 Provider defaults: openrouter -> ``google/gemini-2.5-pro``, gemini ->
 ``gemini-3.8-flash``, ollama -> ``qwen3-coder:30b`` (the MoE coder model
 with ~3.3B active params, the quality/speed sweet spot on CPU). The
@@ -93,6 +100,11 @@ from code_review.chunking import (
     partition_diffs,
     split_diff_by_file,
 )
+from code_review.claude_code import (
+    call_claude_code,
+    cancel_running_calls,
+    reset_cancellation,
+)
 from code_review.config import (
     _PROJECT_CONFIG_KEYS,
     _PROJECT_CONFIG_NAME,
@@ -131,6 +143,7 @@ from code_review.panel import (
     _panel_max_workers,
     build_panel_envelope,
     merge_panel_findings,
+    panel_execution_mode,
     panel_findings_match,
     render_panel_markdown,
 )
@@ -324,6 +337,7 @@ __all__ = [
     "build_reference_section",
     "BUILTIN_CODEBASE_EXCLUDES",
     "bundle_codebase",
+    "call_claude_code",
     "call_gemini",
     "call_ollama",
     "call_openrouter",
@@ -369,6 +383,7 @@ __all__ = [
     "OLLAMA_PS_TIMEOUT",
     "OLLAMA_WINDOW_FILL",
     "OPENROUTER_URL",
+    "panel_execution_mode",
     "panel_findings_match",
     "parse_review_markdown",
     "parse_review_markdown_safe",
@@ -912,6 +927,8 @@ def _validate_flag_combos(args: argparse.Namespace) -> None:
 
 
 def _temperature_summary(settings: Settings) -> str:
+    if settings.provider == "claude-code":
+        return "not sent (the Claude Code CLI has no sampling control)"
     models = settings.models or (settings.model,)
     defaults = [uses_default_sampling(settings.provider, model) for model in models]
     if all(defaults):
@@ -922,6 +939,8 @@ def _temperature_summary(settings: Settings) -> str:
 
 
 def _max_tokens_summary(settings: Settings) -> str:
+    if settings.provider == "claude-code":
+        return "not sent (Claude Code manages its output limit)"
     models = settings.models or (settings.model,)
     limits = [max_tokens_for_model(settings, model) for model in models]
     if len(set(limits)) == 1:
@@ -945,12 +964,17 @@ def _dry_run_report(
     prompt_chars = len(request.system_prompt) + len(request.user_prompt)
     if settings.models is not None:
         model_line = f"models:            {', '.join(settings.models)} (panel)"
+        execution = panel_execution_mode(
+            settings.provider, len(settings.models), settings.sequential
+        )
     else:
         model_line = f"model:             {settings.model}"
+        execution = "single model call"
     lines = [
         "DRY RUN -- no model call made, no tokens spent.",
         f"provider:          {settings.provider}",
         model_line,
+        f"execution:         {execution}",
         f"mode:              {request.mode}",
         f"temperature:       {_temperature_summary(settings)}",
         f"max_tokens:        {_max_tokens_summary(settings)}",
@@ -971,6 +995,17 @@ def _dry_run_report(
         lines.append(f"est_cost:          {cost_line}")
     if ollama_window is not None:
         lines.append(f"ollama_window:     {ollama_window}")
+    if settings.provider == "claude-code":
+        assert settings.claude_command is not None
+        assert settings.claude_timeout is not None
+        lines += [
+            f"claude_executable: {settings.claude_command[0]}",
+            f"claude_timeout:    {settings.claude_timeout:.0f}s",
+            "claude_auth:       existing Claude Code sign-in (never logs in; "
+            "paid API-key/cloud selectors are removed from its environment)",
+            "claude_isolation:  read-only: no tools, no MCP, safe mode, "
+            "no session persistence, empty temp working directory",
+        ]
     if request.files is not None:
         lines.append(f"files:             {len(request.files)}")
         for p in request.files:
@@ -1039,6 +1074,25 @@ def _execute_call(
             label="gemini",
             retries=settings.retries,
         )
+    if settings.provider == "claude-code":
+        command = settings.claude_command
+        claude_timeout = settings.claude_timeout
+        assert command is not None
+        assert claude_timeout is not None
+        # auto_retry=False: each attempt spends subscription quota and can
+        # run for minutes, so only an explicit --retries N re-runs it.
+        return _call_with_retries(
+            lambda: call_claude_code(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model=model,
+                command=command,
+                timeout=claude_timeout,
+            ),
+            label="claude-code",
+            retries=settings.retries,
+            auto_retry=False,
+        )
     # ollama
     host = settings.ollama_host
     timeout = settings.ollama_timeout
@@ -1083,7 +1137,13 @@ def _run_panel(
     settings: Settings, request: ReviewRequest
 ) -> tuple[dict[str, CallResult], list[tuple[str, ReviewError]]]:
     """Run the panel: one ``_execute_call`` per model, concurrently for
-    cloud providers, sequentially for ollama (see ``_panel_max_workers``).
+    cloud providers, sequentially for ollama or with ``--sequential``
+    (see ``_panel_max_workers``).
+
+    Every model receives the same ``request`` independently in both
+    modes -- no model ever sees another's output -- so aggregation is
+    identical; only scheduling differs. Sequential runs call the models
+    one after another in CLI order on this thread.
 
     Returns ``(results_by_model, failures)`` -- results keyed in CLI
     order; each failure is that model's typed error, collected rather
@@ -1094,8 +1154,15 @@ def _run_panel(
     are single ``write()`` calls to limit interleaving.
     """
     assert settings.models is not None
-    workers = _panel_max_workers(settings.provider, len(settings.models))
-    if settings.provider == "ollama" and len(settings.models) > 1:
+    workers = _panel_max_workers(
+        settings.provider, len(settings.models), settings.sequential
+    )
+    if settings.sequential:
+        sys.stderr.write(
+            f"[panel] --sequential: {len(settings.models)} models run one at "
+            "a time, in the order given\n"
+        )
+    elif settings.provider == "ollama" and len(settings.models) > 1:
         sys.stderr.write(
             "[panel] ollama models run sequentially (model-swap "
             "thrashing / RAM pressure)\n"
@@ -1117,9 +1184,23 @@ def _run_panel(
         return model, result
 
     outcomes: dict[str, CallResult | ReviewError] = {}
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for model, outcome in pool.map(_one, settings.models):
-            outcomes[model] = outcome
+    if workers == 1:
+        for panel_model in settings.models:
+            _model, outcome = _one(panel_model)
+            outcomes[panel_model] = outcome
+    else:
+        reset_cancellation()
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            try:
+                for model, outcome in pool.map(_one, settings.models):
+                    outcomes[model] = outcome
+            except BaseException:
+                # Ctrl+C reaches only this thread; the pool's exit would
+                # otherwise wait for every worker's call to finish. Stop any
+                # in-flight Claude Code processes (HTTP calls end on their
+                # own timeouts as before).
+                cancel_running_calls()
+                raise
 
     results_by_model: dict[str, CallResult] = {}
     failures: list[tuple[str, ReviewError]] = []
@@ -1340,7 +1421,11 @@ def main() -> None:
             "``ollama`` posts to a local Ollama server's native chat "
             "endpoint (no API key; configure with ``--ollama-host`` / "
             "$OLLAMA_HOST / $OLLAMA_MODEL / $OLLAMA_TIMEOUT / "
-            "$OLLAMA_NUM_CTX). Override with $CODE_REVIEW_PROVIDER."
+            "$OLLAMA_NUM_CTX). ``claude-code`` (opt-in) runs the "
+            "installed Claude Code CLI read-only on its existing sign-in "
+            "(no API key; never logs in; default model claude-sonnet-5-5; "
+            "$CODE_REVIEW_CLAUDE_BIN / $CODE_REVIEW_CLAUDE_TIMEOUT). "
+            "Override with $CODE_REVIEW_PROVIDER."
         ),
     )
     parser.add_argument(
@@ -1436,6 +1521,18 @@ def main() -> None:
             "succeeds. Mutually exclusive with --model. Panels shine "
             "with --provider openrouter (one key, many vendors); "
             "ollama panels run sequentially."
+        ),
+    )
+    parser.add_argument(
+        "--sequential",
+        action="store_true",
+        help=(
+            "Panel mode (--models) only: run the panel models one at a "
+            "time, in the order given, instead of concurrently. Each "
+            "model still reviews the same payload independently (no "
+            "model sees another's findings); merging, consensus, usage "
+            "and exit codes are unchanged. Default: concurrent for cloud "
+            "providers (ollama is always sequential)."
         ),
     )
     parser.add_argument(
@@ -1705,7 +1802,11 @@ def main() -> None:
     # under-discovered: it lives behind --models while --model is the
     # obvious flag, so the default path is also the noisiest one.
     # Suppress with CODE_REVIEW_NO_TIPS=1 for scripted/agent callers.
-    if settings.models is None and not os.environ.get("CODE_REVIEW_NO_TIPS"):
+    if (
+        settings.models is None
+        and settings.provider != "claude-code"
+        and not os.environ.get("CODE_REVIEW_NO_TIPS")
+    ):
         sys.stderr.write(
             "TIP: --models pro,gpt,deepseek cross-checks several models and "
             "flags agreement; findings only one model raises are usually "

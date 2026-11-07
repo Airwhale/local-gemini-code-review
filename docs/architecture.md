@@ -27,8 +27,12 @@ A one-page map of how a review request flows through the runner, the design deci
         <SEVERITY_FILTER>       --min-severity request to the model
     --chunk splits at file boundaries BEFORE this step (one request per chunk)
                                                                     ▼
-  _execute_call  (also the thread target for --models panels)
+  _execute_call  (per model; panels run it concurrently, or one at a time
+                  in CLI order for ollama / --sequential — same prompt each)
     provider dispatch ──> call_openrouter | call_gemini | call_ollama
+                          | call_claude_code (bounded `claude --print` subprocess,
+                            stdin payload, no tools, empty temp cwd, JSON envelope
+                            validated before the result reaches the parser)
     every HTTP client built by _make_client()   ← single seam; wire tests
     (and the Ollama /api/ps probe)                mock ALL transport here
     retries: _call_with_retries — built-in single 2s retry on hiccup/transport;
@@ -78,6 +82,7 @@ The import graph is acyclic, top to bottom:
 | `code_review/errors.py` | The typed error model: exception hierarchy → exit codes, and the `ERROR:` stderr block renderer. No project imports. |
 | `code_review/prompts.py` | Prompt assets and assembly: upstream skill/command loading (`_prompt_root` tiers), the safety-context + injection-guard wrapper, severity ladder + `--min-severity` appendix, payload caps, file bundling/numbering, the `<REFERENCE_FILES>` block. |
 | `code_review/providers.py` | The wire layer: `_make_client` seam, the three `call_*` functions, HTTP-error classification, retry policy, model aliases/defaults, and the Ollama window machinery (probe → guard → post-call verify). |
+| `code_review/claude_code.py` | `--provider claude-code`: argv/env construction for a read-only `claude --print` call, bounded subprocess runner (timeout, output caps, process-tree cleanup), Pydantic v2 result-envelope validation, failure classification and redaction. See [ADR 0004](architecture/0004-sequential-panels-and-claude-code.md). |
 | `code_review/sources.py` | What gets reviewed: git/gh/glab subprocess plumbing, repository pinning and URL announcements for PRs/MRs, validated GitLab metadata and raw patch paths, `--diff-file`/stdin, codebase gathering/filtering, subdirectory path re-basing. |
 | `code_review/patch_paths.py` | Shared decoder for Git's C-quoted UTF-8 paths, used by GitLab reference gathering and structured hunk evidence. |
 | `code_review/parser.py` | Structured output: the markdown findings parser (fence-aware state machine), fingerprints, `--baseline` diffing, severity enforcement, and the single/chunked JSON envelopes. |
@@ -88,7 +93,7 @@ The import graph is acyclic, top to bottom:
 | `review.py` | 11-line back-compat shim so `uv run review.py` keeps working from a checkout. Not an API surface. |
 | `code_review/__init__.py` | `__version__` from package metadata. |
 | `skills/`, `commands/` | Prompt assets at the repo root (upstream files byte-identical; `code-review-codebase` is fork-added). Force-included into the wheel as package data. |
-| `tests/` | Offline suite: `test_review.py` (pure logic + error contract), `test_parser.py` (+ frozen real-model outputs under `tests/fixtures/`), `test_panel.py`, `test_biginput.py`, `test_config.py`, `test_wire.py` (canned HTTP through `_make_client`), `test_gitlab.py` (mocked glab metadata/diffs, context guards, and patch-content isolation). |
+| `tests/` | Offline suite: `test_review.py` (pure logic + error contract), `test_parser.py` (+ frozen real-model outputs under `tests/fixtures/`), `test_panel.py`, `test_biginput.py`, `test_config.py`, `test_wire.py` (canned HTTP through `_make_client`), `test_gitlab.py` (mocked glab metadata/diffs, context guards, and patch-content isolation), `test_sequential.py` (panel scheduling and aggregation equivalence), `test_claude_code.py` (a fake Claude executable under `tests/fixtures/fake_claude.py`). |
 | `evals/` | Paid, manual scoring harness: planted-bug fixtures + a clean-diff control, recall/noise table. |
 | `.github/workflows/` | `ci.yml` (lint + type-check + tests on ubuntu/windows + wheel-content check), `evals.yml` (manual dispatch, spends tokens). |
 
