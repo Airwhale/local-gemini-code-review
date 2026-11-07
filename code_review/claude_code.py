@@ -63,7 +63,7 @@ from code_review.providers import CallResult, _usage_int
 
 PROVIDER = "claude-code"
 
-# Wall-clock ceiling for one review call. A large review on Sonnet with
+# Wall-clock ceiling for one review call. A large review on Opus with
 # adaptive thinking can take several minutes; past this the process tree
 # is stopped and the call fails as TRANSPORT. Override with
 # $CODE_REVIEW_CLAUDE_TIMEOUT (seconds).
@@ -182,7 +182,7 @@ class ClaudeCodeResultEnvelope(BaseModel):
 
 
 def validate_claude_model(model: str) -> str:
-    """Require a full, pinned Claude model ID (e.g. ``claude-sonnet-5-5``).
+    """Require a full, pinned Claude model ID (e.g. ``claude-opus-5-5``).
 
     Claude Code's own aliases (``sonnet``, ``opus``...) resolve to whatever
     model is newest, so a review run with them is not reproducible.
@@ -191,12 +191,12 @@ def validate_claude_model(model: str) -> str:
         raise ConfigError(
             f"Model {model!r} is a floating Claude Code alias. --provider "
             "claude-code needs a full model ID so the reviewer is pinned, "
-            "e.g. --model claude-sonnet-5-5."
+            "e.g. --model claude-opus-5-5."
         )
     if not _MODEL_ID_RE.fullmatch(model):
         raise ConfigError(
             f"Model {model!r} is not a native Claude model ID. --provider "
-            "claude-code takes IDs like claude-sonnet-5-5 (not OpenRouter "
+            "claude-code takes IDs like claude-opus-5-5 (not OpenRouter "
             "slugs such as anthropic/claude-sonnet-4.5)."
         )
     return model

@@ -122,7 +122,7 @@ Secrets are configured once (per-user or checkout `.env` — see Setup) and work
 | `openrouter` *  | `OPENROUTER_API_KEY`    | `google/gemini-2.5-pro`  | Default. Reliable quota; recommended for iterative work.                                |
 | `gemini`        | `GEMINI_API_KEY`        | `gemini-3.8-flash`       | Direct to Google AI Studio. Access and quota depend on your account. |
 | `ollama`        | *(none — local)*        | `qwen3-coder:30b`        | Offline / no API key / no token cost. CPU inference is slower (1–5 min per review typical). Different failure mode than cloud — see "Local vs cloud" below. |
-| `claude-code`   | *(none — existing Claude Code sign-in)* | `claude-sonnet-5-5` | Opt-in. Read-only `claude --print` call (no tools/MCP/hooks/CLAUDE.md). Use for the separate final review after fixing panel findings. Exit 2 means sign in yourself (`claude`); exit 11 means a usage limit. Never retried automatically. |
+| `claude-code`   | *(none — existing Claude Code sign-in)* | `claude-opus-5-5` | Opt-in. Read-only `claude --print` call (no tools/MCP/hooks/CLAUDE.md). Use for the separate final review after fixing panel findings. Exit 2 means sign in yourself (`claude`); exit 11 means a usage limit. Never retried automatically. |
 
 \* default
 
@@ -332,7 +332,7 @@ Chain rounds with `--output round1.json` then `--baseline round1.json`: findings
 
 **`--min-found-by 2` applies that filter for you** — merged findings below the floor are dropped (both formats), with a `[panel] --min-found-by 2: dropped N finding(s)` line on stderr and the per-model raw appendix still showing everything. This is the cheapest precision lever available: reach for it before spending rounds triaging singletons by hand. It requires `--models` (a consensus count for one model is meaningless — asking alone is a typed `CONFIG` error). Panel exit contract: ≥1 model succeeded → exit 0 with per-model failures as `WARN: [panel] …` lines and `per_model[].error` entries; all failed → one typed error chosen by `CONFIG > SAFETY_REFUSAL > CONTEXT_OVERFLOW > RATE_LIMIT > PROVIDER_HICCUP > TRANSPORT > UNKNOWN`.
 
-**Regular panel, then a final Sonnet pass.** Run the regular reviewers as a panel (`--models qwen/qwen3.8-flash,z-ai/glm-5.3`, add `--sequential` to call them one at a time in that order). Verify each finding, fix confirmed bugs, and rerun the affected checks. Only then run a separate final review of the current code with `--provider claude-code --model claude-sonnet-5-5`. Never feed one model's findings into another's prompt; each run reviews the code independently. Exact commands are in the README's "Review workflow" section.
+**Regular panel, then a final Claude pass.** Run the regular reviewers as a panel (`--models qwen/qwen3.8-flash,z-ai/glm-5.3`, add `--sequential` to call them one at a time in that order). Verify each finding, fix confirmed bugs, and rerun the affected checks. Only then run a separate final review of the current code with `--provider claude-code --model claude-opus-5-5` (or `claude-sonnet-5-5` for a faster, lighter pass). Never feed one model's findings into another's prompt; each run reviews the code independently. Exact commands are in the README's "Review workflow" section.
 
 ## Scaling scope (`--full-files`, `--chunk`)
 

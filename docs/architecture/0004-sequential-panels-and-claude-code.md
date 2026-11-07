@@ -7,7 +7,8 @@ Status: accepted. Date: 2026-11-07.
 A common agent workflow uses two inexpensive models for regular review
 rounds (for example `qwen/qwen3.8-flash` and `z-ai/glm-5.3` on OpenRouter).
 The coding agent verifies their findings, fixes confirmed bugs and reruns
-checks. A separate final review of the fixed code then uses Claude Sonnet 5.5.
+checks. A separate final review of the fixed code then uses a stronger
+Claude model (Opus 5.5 by default; Sonnet 5.5 for a faster, lighter pass).
 The final reviewer should run on the user's existing Claude Code sign-in
 rather than a separately billed API key.
 
@@ -34,7 +35,9 @@ and easier-to-follow logs, without changing what the panel reports.
 
 - Opt-in provider that runs the installed `claude` executable in `--print`
   mode with `--output-format json`. The default model is the native, pinned
-  ID `claude-sonnet-5-5`. Floating CLI aliases (`sonnet`, `opus`, ...) and
+  ID `claude-opus-5-5` (changed from `claude-sonnet-5-5` during review:
+  the final pass runs once per change, so the stronger model is worth the
+  extra quota). Floating CLI aliases (`sonnet`, `opus`, ...) and
   non-native IDs are rejected.
 - Read-only by construction: `--tools ""`, `--disallowedTools "mcp__*"`,
   `--strict-mcp-config`, `--safe-mode`, `--disable-slash-commands`,
@@ -85,7 +88,7 @@ and easier-to-follow logs, without changing what the panel reports.
   provider the file's `model`, `models` and `retries` keys are ignored,
   because they decide how many subscription-billed calls run and which model
   is billed. The executable and timeout are environment-only.
-- The Sonnet review is a separate invocation, not an automatic third panel
+- The final Claude review is a separate invocation, not an automatic third panel
   member. It is meant to run after the coding agent has fixed the regular
   reviewers' findings.
 

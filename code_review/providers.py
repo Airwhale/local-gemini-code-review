@@ -86,11 +86,11 @@ MAX_RETRY_SLEEP = 300.0
 # Severity ladder used by --min-severity (and, in M2+, finding sorting).
 # Order matters: index position defines rank.
 PROVIDERS = ("openrouter", "gemini", "ollama", "claude-code")
-# Native Claude API ID for Claude Sonnet 5.5. Dateless Claude IDs from the
+# Native Claude API ID for Claude Opus 5.5. Dateless Claude IDs from the
 # 4.6 generation on are pinned snapshots (platform.claude.com model
 # overview), unlike the Claude Code CLI's floating aliases (``sonnet``,
 # ``opus``) which move to newer models silently.
-CLAUDE_CODE_DEFAULT_MODEL = "claude-sonnet-5-5"
+CLAUDE_CODE_DEFAULT_MODEL = "claude-opus-5-5"
 DEFAULT_MODEL_BY_PROVIDER: dict[str, str] = {
     "openrouter": "google/gemini-2.5-pro",
     "gemini": "gemini-3.8-flash",

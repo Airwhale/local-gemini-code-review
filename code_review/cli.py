@@ -34,7 +34,7 @@ providers selectable at the command line:
       Runs the locally installed Claude Code CLI (``claude -p``) on its
       existing sign-in, read-only: no tools, no MCP, safe mode, no session
       persistence, empty temporary working directory. Defaults to the
-      pinned ``claude-sonnet-5-5``. Never logs in and strips API-key billing
+      pinned ``claude-opus-5-5``. Never logs in and strips API-key billing
       selectors from its environment. See ``code_review/claude_code.py``.
 
 Provider defaults: openrouter -> ``google/gemini-2.5-pro``, gemini ->
@@ -1423,7 +1423,7 @@ def main() -> None:
             "$OLLAMA_HOST / $OLLAMA_MODEL / $OLLAMA_TIMEOUT / "
             "$OLLAMA_NUM_CTX). ``claude-code`` (opt-in) runs the "
             "installed Claude Code CLI read-only on its existing sign-in "
-            "(no API key; never logs in; default model claude-sonnet-5-5; "
+            "(no API key; never logs in; default model claude-opus-5-5; "
             "$CODE_REVIEW_CLAUDE_BIN / $CODE_REVIEW_CLAUDE_TIMEOUT). "
             "Override with $CODE_REVIEW_PROVIDER."
         ),

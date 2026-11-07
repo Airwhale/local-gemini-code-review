@@ -34,7 +34,7 @@ from code_review.errors import (
 from code_review.providers import CallResult
 
 FAKE_SOURCE = Path(__file__).parent / "fixtures" / "fake_claude.py"
-MODEL = "claude-sonnet-5-5"
+MODEL = "claude-opus-5-5"
 
 
 @pytest.fixture
@@ -665,10 +665,10 @@ class TestSettings:
         ):
             monkeypatch.delenv(name, raising=False)
 
-    def test_defaults_to_pinned_sonnet(self):
+    def test_defaults_to_pinned_opus(self):
         settings = _resolve_settings(_args())
         assert settings.provider == "claude-code"
-        assert settings.model == "claude-sonnet-5-5"
+        assert settings.model == "claude-opus-5-5"
         assert settings.claude_command == ("claude-fake",)
         assert settings.claude_timeout == cc.DEFAULT_CLAUDE_TIMEOUT
         assert settings.api_key is None
@@ -709,7 +709,7 @@ class TestSettings:
             },
         )
         assert settings.models is None
-        assert settings.model == "claude-sonnet-5-5"
+        assert settings.model == "claude-opus-5-5"
         assert settings.retries == 0
         assert settings.min_severity == "HIGH"  # review-shaping keys still apply
         assert "ignores .code-review.toml keys model, models, retries" in (
@@ -846,7 +846,7 @@ class TestCliEndToEnd:
     ):
         monkeypatch.setattr(sys, "argv", ["code-review", "--list-models"])
         cli.main()
-        assert "--provider claude-code   (default: claude-sonnet-5-5)" in (
+        assert "--provider claude-code   (default: claude-opus-5-5)" in (
             capsys.readouterr().out
         )
 

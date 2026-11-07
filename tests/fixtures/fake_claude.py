@@ -42,7 +42,7 @@ def envelope(**overrides: Any) -> dict[str, Any]:
             "cache_read_input_tokens": 5,
             "output_tokens": 42,
         },
-        "modelUsage": {"claude-sonnet-5-5": {"inputTokens": 120}},
+        "modelUsage": {"claude-opus-5-5": {"inputTokens": 120}},
         "permission_denials": [],
         "some_future_field": {"ignored": True},
     }

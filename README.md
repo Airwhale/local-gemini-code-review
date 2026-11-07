@@ -78,7 +78,7 @@ Four transport paths — two cloud APIs, one local server, and one opt-in local 
 | `openrouter` (default) | `openrouter.ai/api/v1/chat/completions` | `OPENROUTER_API_KEY` | `google/gemini-2.5-pro` | OpenAI-compatible wire format. One bill for many vendors — this is what makes cross-model panels cheap. Optional `OPENROUTER_HTTP_REFERER` / `OPENROUTER_X_TITLE` set the attribution headers shown in OpenRouter's dashboard. |
 | `gemini` | `generativelanguage.googleapis.com/v1beta/…` | `GEMINI_API_KEY` | `gemini-3.8-flash` | Google AI Studio's `generateContent`, one less hop. |
 | `ollama` | `{OLLAMA_HOST}/api/chat` (default `http://localhost:11434`) | none — local server | `qwen3-coder:30b` | Native endpoint (per-request `num_ctx`, `prompt_eval_count` truncation detection). No API key, no token costs, code never leaves the machine. CPU inference is slower (1–5 min/review typical). |
-| `claude-code` (opt-in) | the installed `claude` CLI (`claude --print`) | none — uses Claude Code's existing sign-in | `claude-sonnet-5-5` | Read-only single call with tools, MCP, hooks, plugins and `CLAUDE.md` disabled. Never logs in; strips API-key billing selectors from its environment. See [Claude Code provider](#claude-code-provider---provider-claude-code). |
+| `claude-code` (opt-in) | the installed `claude` CLI (`claude --print`) | none — uses Claude Code's existing sign-in | `claude-opus-5-5` | Read-only single call with tools, MCP, hooks, plugins and `CLAUDE.md` disabled. Never logs in; strips API-key billing selectors from its environment. See [Claude Code provider](#claude-code-provider---provider-claude-code). |
 
 Set a per-environment default with `CODE_REVIEW_PROVIDER=<name>` so you don't pass `--provider` every call.
 
@@ -123,13 +123,13 @@ Requesting the conservative 4K estimate in the unknown case would *shrink* a big
 
 ### Claude Code provider (`--provider claude-code`)
 
-Runs the review through the locally installed [Claude Code](https://code.claude.com/docs/en/setup) CLI in print mode, on whatever sign-in that CLI already has (for example a Claude subscription). It is meant for a separate final pass; see [Review workflow](#review-workflow-regular-panel-fixes-then-a-final-sonnet-review).
+Runs the review through the locally installed [Claude Code](https://code.claude.com/docs/en/setup) CLI in print mode, on whatever sign-in that CLI already has (for example a Claude subscription). It is meant for a separate final pass; see [Review workflow](#review-workflow-regular-panel-fixes-then-a-final-claude-review).
 
 ```bash
-code-review --base origin/main --provider claude-code --model claude-sonnet-5-5
+code-review --base origin/main --provider claude-code --model claude-opus-5-5
 ```
 
-- **Pinned model.** The default is `claude-sonnet-5-5`, the native Claude model ID for Sonnet 5.5 (dateless Claude IDs are pinned snapshots). Claude Code's floating aliases (`sonnet`, `opus`, `fable`, …) and OpenRouter slugs are rejected as `CONFIG` errors. Override with `--model` or `$CODE_REVIEW_CLAUDE_MODEL`.
+- **Pinned model.** The default is `claude-opus-5-5`, the native Claude model ID for Opus 5.5 (dateless Claude IDs are pinned snapshots). Use `--model claude-sonnet-5-5` for a faster pass that uses less of your plan's quota. Claude Code's floating aliases (`sonnet`, `opus`, `fable`, …) and OpenRouter slugs are rejected as `CONFIG` errors. Override with `--model` or `$CODE_REVIEW_CLAUDE_MODEL`.
 - **Read-only by construction.** One `claude --print --output-format json` process with `--tools ""`, `--disallowedTools "mcp__*"`, `--strict-mcp-config`, `--safe-mode` (no `CLAUDE.md`, skills, plugins, hooks, MCP servers or auto memory), `--disable-slash-commands`, `--permission-mode dontAsk`, `--permission-prompts none` and `--no-session-persistence`. The review system prompt replaces Claude Code's default agent prompt via `--system-prompt-file`. The process runs in a fresh, empty temporary directory, so the reviewed repository's `.claude/` settings, `.mcp.json` and `CLAUDE.md` are not in its working tree. `--dangerously-skip-permissions` is never used.
 - **Payload over stdin.** The review prompt is piped to stdin (Claude Code's 10 MB stdin cap is checked first). Arguments are an argv list with no shell, so Windows paths with spaces work.
 - **Existing sign-in only.** The runner never logs in, switches accounts, reads credential stores, buys credits or enables extra usage. `--bare` is deliberately not used: it skips subscription/OAuth sign-in and would require an API key. To keep a review from silently billing pay-per-token, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `AWS_BEARER_TOKEN_BEDROCK`, `ANTHROPIC_FOUNDRY_API_KEY` and the `CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` / `_FOUNDRY` selectors are removed from the child environment. A `NOTE:` names any that were set; values are never printed. Claude Code's *user* settings file can still configure an `apiKeyHelper` or an API key in its `env` block; the runner cannot override that, so it prints a `WARN:` naming the setting (never its value). This tool's own keys (`OPENROUTER_API_KEY`, `GEMINI_API_KEY`, forge tokens) are removed too.
@@ -432,7 +432,7 @@ Runs the same review through several models (concurrently on cloud, capped at 4;
 - **`--sequential`** runs the panel models one at a time, in the order given, instead of concurrently. Each model still gets the identical prompt independently; no model sees another's findings. Merging, `found_by`, per-model usage, failure handling and the exit contract are the same as the concurrent default. Use it to keep provider load and rate-limit pressure low, or to make long runs easier to follow. `--dry-run` shows the mode on its `execution:` line. It needs a panel (`--models`, or a `models` list from `.code-review.toml`); without one it is a typed `CONFIG` error.
 - Mutually exclusive with `--model`; `--baseline` isn't supported with panels yet; per-model temperatures and streaming are out of scope.
 
-## Review workflow: regular panel, fixes, then a final Sonnet review
+## Review workflow: regular panel, fixes, then a final Claude review
 
 A two-stage loop for agent-driven work. The tool stays read-only throughout: it never edits the reviewed repository and never approves, comments on, or merges a PR or MR.
 
@@ -450,10 +450,10 @@ A two-stage loop for agent-driven work. The tool stays read-only throughout: it 
 
 2. **The coding agent** verifies each finding against the code, fixes confirmed bugs, and reruns the affected checks. Repeat step 1 as needed; `--min-found-by 2` keeps only findings both models raised.
 
-3. **A separate final review** of the *current* code with Claude Sonnet 5.5 through Claude Code. This is a new invocation after the fixes, not a third panel member:
+3. **A separate final review** of the *current* code with Claude Opus 5.5 through Claude Code. This is a new invocation after the fixes, not a third panel member (swap in `--model claude-sonnet-5-5` for a faster, lighter pass):
 
    ```bash
-   code-review --base origin/main --provider claude-code --model claude-sonnet-5-5 --format json --output review-final-sonnet.json
+   code-review --base origin/main --provider claude-code --model claude-opus-5-5 --format json --output review-final-opus.json
    ```
 
 The same commands work with `--pr 123 --repo OWNER/REPO` or `--mr 45 --repo https://gitlab.example.com/group/project` in place of `--base origin/main`. Add `--dry-run` to any of them to check the resolved provider, models, execution mode and payload size without calling a model.
