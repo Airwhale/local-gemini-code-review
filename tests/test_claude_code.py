@@ -381,6 +381,15 @@ class TestEndToEndProcess:
     ):
         assert "Empty input" in _call(fake, temp_parent, "warning_line").content
 
+    def test_stray_line_after_envelope_tolerated(
+        self, fake: tuple[str, ...], temp_parent: Path
+    ):
+        assert "Empty input" in _call(fake, temp_parent, "trailing_line").content
+
+    def test_timeout_message_states_the_real_bounds(self):
+        with pytest.raises(ConfigError, match="greater than 0 and at most 86400"):
+            cc.resolve_claude_timeout("0", "$X")
+
     def test_truncated_review_warns(
         self,
         fake: tuple[str, ...],

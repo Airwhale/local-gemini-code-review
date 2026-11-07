@@ -37,6 +37,13 @@ providers selectable at the command line:
       pinned ``claude-opus-5-5``. Never logs in and strips API-key billing
       selectors from its environment. See ``code_review/claude_code.py``.
 
+  --provider codex (opt-in)
+      Runs the locally installed OpenAI Codex CLI (``codex exec``) on its
+      existing ChatGPT sign-in: read-only sandbox, approvals denied, user
+      config ignored, empty temporary working directory, and the run is
+      stopped and discarded if it starts any tool. Defaults to
+      ``gpt-6.1-sol``. See ``code_review/codex_cli.py``.
+
 Provider defaults: openrouter -> ``google/gemini-2.5-pro``, gemini ->
 ``gemini-3.8-flash``, ollama -> ``qwen3-coder:30b`` (the MoE coder model
 with ~3.3B active params, the quality/speed sweet spot on CPU). The
@@ -105,6 +112,7 @@ from code_review.claude_code import (
     cancel_running_calls,
     reset_cancellation,
 )
+from code_review.codex_cli import call_codex
 from code_review.config import (
     _PROJECT_CONFIG_KEYS,
     _PROJECT_CONFIG_NAME,
@@ -338,6 +346,7 @@ __all__ = [
     "BUILTIN_CODEBASE_EXCLUDES",
     "bundle_codebase",
     "call_claude_code",
+    "call_codex",
     "call_gemini",
     "call_ollama",
     "call_openrouter",
@@ -929,6 +938,8 @@ def _validate_flag_combos(args: argparse.Namespace) -> None:
 def _temperature_summary(settings: Settings) -> str:
     if settings.provider == "claude-code":
         return "not sent (the Claude Code CLI has no sampling control)"
+    if settings.provider == "codex":
+        return "not sent (the Codex CLI has no sampling control)"
     models = settings.models or (settings.model,)
     defaults = [uses_default_sampling(settings.provider, model) for model in models]
     if all(defaults):
@@ -941,6 +952,8 @@ def _temperature_summary(settings: Settings) -> str:
 def _max_tokens_summary(settings: Settings) -> str:
     if settings.provider == "claude-code":
         return "not sent (Claude Code manages its output limit)"
+    if settings.provider == "codex":
+        return "not sent (Codex manages its output limit)"
     models = settings.models or (settings.model,)
     limits = [max_tokens_for_model(settings, model) for model in models]
     if len(set(limits)) == 1:
@@ -1005,6 +1018,18 @@ def _dry_run_report(
             "paid API-key/cloud selectors are removed from its environment)",
             "claude_isolation:  read-only: no tools, no MCP, safe mode, "
             "no session persistence, empty temp working directory",
+        ]
+    if settings.provider == "codex":
+        assert settings.codex_command is not None
+        assert settings.codex_timeout is not None
+        lines += [
+            f"codex_executable:  {settings.codex_command[0]}",
+            f"codex_timeout:     {settings.codex_timeout:.0f}s",
+            "codex_auth:        existing Codex ChatGPT sign-in (forced; never "
+            "logs in; API-key variables are removed from its environment)",
+            "codex_isolation:   read-only sandbox, approvals denied, user config "
+            "and rules ignored, empty temp working directory; any tool call "
+            "stops the run and fails the review",
         ]
     if request.files is not None:
         lines.append(f"files:             {len(request.files)}")
@@ -1090,6 +1115,25 @@ def _execute_call(
                 timeout=claude_timeout,
             ),
             label="claude-code",
+            retries=settings.retries,
+            auto_retry=False,
+        )
+    if settings.provider == "codex":
+        codex_command = settings.codex_command
+        codex_timeout = settings.codex_timeout
+        assert codex_command is not None
+        assert codex_timeout is not None
+        # Same policy as claude-code: subscription quota per attempt, so
+        # only an explicit --retries N re-runs a call.
+        return _call_with_retries(
+            lambda: call_codex(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model=model,
+                command=codex_command,
+                timeout=codex_timeout,
+            ),
+            label="codex",
             retries=settings.retries,
             auto_retry=False,
         )
@@ -1433,6 +1477,10 @@ def main() -> None:
             "installed Claude Code CLI read-only on its existing sign-in "
             "(no API key; never logs in; default model claude-opus-5-5; "
             "$CODE_REVIEW_CLAUDE_BIN / $CODE_REVIEW_CLAUDE_TIMEOUT). "
+            "``codex`` (opt-in) runs the installed OpenAI Codex CLI "
+            "the same way on its ChatGPT sign-in (default model "
+            "gpt-6.1-sol; $CODE_REVIEW_CODEX_BIN / "
+            "$CODE_REVIEW_CODEX_TIMEOUT). "
             "Override with $CODE_REVIEW_PROVIDER."
         ),
     )
@@ -1812,7 +1860,7 @@ def main() -> None:
     # Suppress with CODE_REVIEW_NO_TIPS=1 for scripted/agent callers.
     if (
         settings.models is None
-        and settings.provider != "claude-code"
+        and settings.provider not in ("claude-code", "codex")
         and not os.environ.get("CODE_REVIEW_NO_TIPS")
     ):
         sys.stderr.write(

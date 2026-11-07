@@ -123,6 +123,7 @@ Secrets are configured once (per-user or checkout `.env` — see Setup) and work
 | `gemini`        | `GEMINI_API_KEY`        | `gemini-3.8-flash`       | Direct to Google AI Studio. Access and quota depend on your account. |
 | `ollama`        | *(none — local)*        | `qwen3-coder:30b`        | Offline / no API key / no token cost. CPU inference is slower (1–5 min per review typical). Different failure mode than cloud — see "Local vs cloud" below. |
 | `claude-code`   | *(none — existing Claude Code sign-in)* | `claude-opus-5-5` | Opt-in. Read-only `claude --print` call (no tools/MCP/hooks/CLAUDE.md). Use for the separate final review after fixing panel findings. Exit 2 means sign in yourself (`claude`); exit 11 means a usage limit. Never retried automatically. |
+| `codex`         | *(none — existing Codex ChatGPT sign-in)* | `gpt-6.1-sol` | Opt-in OpenAI counterpart: `codex exec` in a read-only sandbox; a run that starts any tool is stopped and fails with exit 1. Exit 2 means sign in yourself (`codex login`). Never retried automatically. |
 
 \* default
 

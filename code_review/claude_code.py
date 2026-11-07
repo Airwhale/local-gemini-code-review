@@ -44,7 +44,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import IO, Any, Literal
 
@@ -148,6 +148,7 @@ class ProcessOutcome:
     stdout_overflow: bool = False
     stderr_overflow: bool = False
     cancelled: bool = False
+    stopped_early: bool = False
 
 
 class ClaudeCodeResultEnvelope(BaseModel):
@@ -279,8 +280,8 @@ def resolve_claude_timeout(raw: str | None, source: str) -> float:
         ) from exc
     if not 0 < timeout <= MAX_CLAUDE_TIMEOUT:
         raise ConfigError(
-            f"claude_timeout={timeout} (from {source}) must be between 0 and "
-            f"{MAX_CLAUDE_TIMEOUT:.0f} seconds."
+            f"claude_timeout={timeout} (from {source}) must be greater than 0 "
+            f"and at most {MAX_CLAUDE_TIMEOUT:.0f} seconds."
         )
     return timeout
 
@@ -376,6 +377,8 @@ def _secret_values(parent: Mapping[str, str]) -> list[str]:
 
 _REDACTIONS = (
     re.compile(r"sk-ant-[A-Za-z0-9_\-]{8,}"),
+    # OpenAI-style keys (sk-..., sk-proj-...), for the codex provider.
+    re.compile(r"\bsk-[A-Za-z0-9_\-]{20,}"),
     re.compile(r"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"),
     re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=\-]{8,}"),
 )
@@ -488,6 +491,7 @@ def run_bounded(
     timeout: float,
     max_stdout_bytes: int = MAX_STDOUT_BYTES,
     max_stderr_bytes: int = MAX_STDERR_BYTES,
+    stop_on_stdout_line: Callable[[bytes], bool] | None = None,
 ) -> ProcessOutcome:
     """Run ``argv`` with stdin piped in, bounded in time and output size.
 
@@ -496,6 +500,10 @@ def run_bounded(
     longer be trusted); stderr just stops being collected. On timeout,
     overflow, or any exception (including KeyboardInterrupt) the whole
     process tree is stopped before returning or re-raising.
+
+    ``stop_on_stdout_line`` sees each complete stdout line as it arrives;
+    returning True stops the process tree at once and marks the outcome
+    ``stopped_early`` (used to halt a run the moment it starts a tool).
     """
     kwargs: dict[str, Any] = {}
     if sys.platform == "win32":
@@ -516,10 +524,23 @@ def run_bounded(
     assert proc.stderr is not None
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
     overflow = {"stdout": False, "stderr": False}
+    stopped = threading.Event()
+
+    def _check_lines(sink: bytearray, scanned: int) -> int:
+        """Run the stop hook on newly completed lines; return the new offset."""
+        assert stop_on_stdout_line is not None
+        while (end := sink.find(b"\n", scanned)) != -1:
+            line = bytes(sink[scanned:end])
+            scanned = end + 1
+            if not stopped.is_set() and stop_on_stdout_line(line):
+                stopped.set()
+                _kill_tree(proc)
+        return scanned
 
     def _reader(name: str, stream: IO[bytes], cap: int) -> None:
         sink = buffers[name]
         fd = stream.fileno()
+        scanned = 0
         try:
             # os.read returns whatever is available; a buffered read(n) would
             # hold a small envelope back until n bytes or EOF, and a helper
@@ -535,6 +556,8 @@ def run_bounded(
                         _kill_tree(proc)
                 else:
                     sink.extend(chunk)
+                if name == "stdout" and stop_on_stdout_line is not None:
+                    scanned = _check_lines(sink, scanned)
         except (OSError, ValueError):
             pass
 
@@ -606,6 +629,7 @@ def run_bounded(
         stdout_overflow=overflow["stdout"],
         stderr_overflow=overflow["stderr"],
         cancelled=cancelled,
+        stopped_early=stopped.is_set(),
     )
 
 
@@ -763,13 +787,14 @@ _API_FAILURE_LINE = re.compile(
 def _parse_envelope(stdout_text: str) -> ClaudeCodeResultEnvelope | None:
     """Validate the outer JSON envelope; ``None`` when it is not one.
 
-    Tolerates a stray non-JSON line before the object by retrying on the
-    last non-empty line (the result object is always printed last).
+    Tolerates stray non-JSON lines before or after the object (a notice or
+    banner) by also trying each line on its own, last line first. Only an
+    object that validates as a ``result`` envelope is accepted.
     """
     candidates = [stdout_text]
     lines = [line for line in stdout_text.splitlines() if line.strip()]
     if len(lines) > 1:
-        candidates.append(lines[-1])
+        candidates.extend(reversed(lines))
     for candidate in candidates:
         try:
             data = json.loads(candidate)

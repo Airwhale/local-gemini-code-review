@@ -86,6 +86,9 @@ def main() -> int:
     elif scenario == "warning_line":
         sys.stdout.write("Note: something informational\n")
         emit(envelope())
+    elif scenario == "trailing_line":
+        emit(envelope())
+        sys.stdout.write("A newer version is available\n")
     elif scenario == "truncated_review":
         emit(envelope(stop_reason="max_tokens", result=REVIEW[:80]))
     elif scenario == "empty_max_tokens":

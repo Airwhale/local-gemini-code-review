@@ -24,6 +24,11 @@ from code_review.claude_code import (
     resolve_claude_timeout,
     validate_claude_model,
 )
+from code_review.codex_cli import (
+    resolve_codex_command,
+    resolve_codex_timeout,
+    validate_codex_model,
+)
 from code_review.errors import ConfigError
 from code_review.generation import openrouter_default_max_tokens
 from code_review.prompts import _REPO_ROOT, DEFAULT_CONTEXT, SEVERITY_LEVELS
@@ -126,6 +131,7 @@ def _resolve_model(args: argparse.Namespace, project_config: dict | None = None)
         "gemini": "GEMINI_MODEL",
         "ollama": "OLLAMA_MODEL",
         "claude-code": "CODE_REVIEW_CLAUDE_MODEL",
+        "codex": "CODE_REVIEW_CODEX_MODEL",
     }
     if args.model is not None:
         name = args.model
@@ -190,7 +196,8 @@ _PROJECT_CONFIG_KEYS = frozenset(
 )
 
 
-# Project-config keys ignored under --provider claude-code: they decide how
+# Project-config keys ignored under the local CLI providers (claude-code,
+# codex): they decide how
 # many subscription-billed calls run and which model is billed.
 _CLAUDE_CODE_OPERATOR_KEYS = frozenset({"model", "models", "retries"})
 
@@ -323,6 +330,9 @@ class Settings:
     # --provider claude-code: launcher argv prefix and per-call timeout.
     claude_command: tuple[str, ...] | None = None
     claude_timeout: float | None = None
+    # --provider codex: launcher argv prefix and per-call timeout.
+    codex_command: tuple[str, ...] | None = None
+    codex_timeout: float | None = None
 
 
 def max_tokens_for_model(settings: Settings, model: str) -> int:
@@ -382,24 +392,24 @@ def _resolve_settings(
             "(check $CODE_REVIEW_PROVIDER / .code-review.toml). Use one "
             "of: " + ", ".join(PROVIDERS) + "."
         )
-    if provider == "claude-code" and provider_source == _PROJECT_CONFIG_NAME:
+    if provider in ("claude-code", "codex") and provider_source == _PROJECT_CONFIG_NAME:
         # The reviewed repo must not be able to make this tool launch a
         # local agent CLI on the user's subscription; that choice belongs
         # to the operator (CLI flag or environment).
         raise ConfigError(
-            f"provider 'claude-code' cannot be selected by {_PROJECT_CONFIG_NAME} "
-            "(it lives in the reviewed repo). Pass --provider claude-code "
+            f"provider {provider!r} cannot be selected by {_PROJECT_CONFIG_NAME} "
+            f"(it lives in the reviewed repo). Pass --provider {provider} "
             "explicitly, or set $CODE_REVIEW_PROVIDER."
         )
-    if provider == "claude-code":
-        # Each Claude Code call spends the operator's subscription quota, so
+    if provider in ("claude-code", "codex"):
+        # Each local agent CLI call spends the operator's subscription quota, so
         # how many calls run (models/retries) and which model is billed must
         # not come from the reviewed repo either. Its other review-shaping
         # keys (severity, format, include/exclude...) still apply.
         dropped = sorted(_CLAUDE_CODE_OPERATOR_KEYS & set(config))
         if dropped:
             sys.stderr.write(
-                f"NOTE: --provider claude-code ignores {_PROJECT_CONFIG_NAME} "
+                f"NOTE: --provider {provider} ignores {_PROJECT_CONFIG_NAME} "
                 f"keys {', '.join(dropped)} (quota is the operator's choice; "
                 "use CLI flags or environment variables).\n"
             )
@@ -474,6 +484,9 @@ def _resolve_settings(
     if provider == "claude-code":
         for name in models or (model,):
             validate_claude_model(name)
+    elif provider == "codex":
+        for name in models or (model,):
+            validate_codex_model(name)
 
     # Temperature.
     temp_raw, temp_source = _layered(
@@ -604,8 +617,18 @@ def _resolve_settings(
     ollama_num_ctx_env: int | None = None
     claude_command: tuple[str, ...] | None = None
     claude_timeout: float | None = None
+    codex_command: tuple[str, ...] | None = None
+    codex_timeout: float | None = None
 
-    if args.provider == "claude-code":
+    if args.provider == "codex":
+        # Like claude-code: the CLI's own ChatGPT sign-in, no API key, and
+        # machine-local executable/timeout never read from project config.
+        codex_command = resolve_codex_command()
+        codex_raw, codex_source = _layered(
+            None, "CODE_REVIEW_CODEX_TIMEOUT", "codex_timeout", {}
+        )
+        codex_timeout = resolve_codex_timeout(codex_raw, codex_source)
+    elif args.provider == "claude-code":
         # No API key: Claude Code uses its own existing sign-in. Executable
         # and timeout are machine-local, so (like ollama_*) they are never
         # read from the reviewed repo's project config.
@@ -718,4 +741,6 @@ def _resolve_settings(
         sequential=sequential,
         claude_command=claude_command,
         claude_timeout=claude_timeout,
+        codex_command=codex_command,
+        codex_timeout=codex_timeout,
     )

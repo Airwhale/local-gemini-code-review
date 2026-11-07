@@ -85,12 +85,18 @@ MAX_RETRY_SLEEP = 300.0
 
 # Severity ladder used by --min-severity (and, in M2+, finding sorting).
 # Order matters: index position defines rank.
-PROVIDERS = ("openrouter", "gemini", "ollama", "claude-code")
+PROVIDERS = ("openrouter", "gemini", "ollama", "claude-code", "codex")
+# Providers that run a locally installed agent CLI on the user's own
+# sign-in (subscription quota), rather than an HTTP API with a key.
+LOCAL_CLI_PROVIDERS = ("claude-code", "codex")
 # Native Claude API ID for Claude Opus 5.5. Dateless Claude IDs from the
 # 4.6 generation on are pinned snapshots (platform.claude.com model
 # overview), unlike the Claude Code CLI's floating aliases (``sonnet``,
 # ``opus``) which move to newer models silently.
 CLAUDE_CODE_DEFAULT_MODEL = "claude-opus-5-5"
+# Codex model slug offered to ChatGPT sign-ins: the catalog's top-priority
+# "latest workhorse model for coding" (`codex debug models`).
+CODEX_DEFAULT_MODEL = "gpt-6.1-sol"
 DEFAULT_MODEL_BY_PROVIDER: dict[str, str] = {
     "openrouter": "google/gemini-2.5-pro",
     "gemini": "gemini-3.8-flash",
@@ -103,6 +109,9 @@ DEFAULT_MODEL_BY_PROVIDER: dict[str, str] = {
     # Opt-in only: runs the locally installed Claude Code CLI on the
     # user's existing sign-in (see code_review/claude_code.py).
     "claude-code": CLAUDE_CODE_DEFAULT_MODEL,
+    # Opt-in only: runs the locally installed Codex CLI on its existing
+    # ChatGPT sign-in (see code_review/codex_cli.py).
+    "codex": CODEX_DEFAULT_MODEL,
 }
 DEFAULT_PROVIDER = "openrouter"
 

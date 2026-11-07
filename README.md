@@ -71,7 +71,7 @@ uv run --project /path/to/local-gemini-code-review /path/to/local-gemini-code-re
 
 ## Providers
 
-Four transport paths — two cloud APIs, one local server, and one opt-in local CLI:
+Five transport paths — two cloud APIs, one local server, and two opt-in local agent CLIs:
 
 | Provider | Endpoint | Required env var | Default model | Notes |
 |---|---|---|---|---|
@@ -79,6 +79,7 @@ Four transport paths — two cloud APIs, one local server, and one opt-in local 
 | `gemini` | `generativelanguage.googleapis.com/v1beta/…` | `GEMINI_API_KEY` | `gemini-3.8-flash` | Google AI Studio's `generateContent`, one less hop. |
 | `ollama` | `{OLLAMA_HOST}/api/chat` (default `http://localhost:11434`) | none — local server | `qwen3-coder:30b` | Native endpoint (per-request `num_ctx`, `prompt_eval_count` truncation detection). No API key, no token costs, code never leaves the machine. CPU inference is slower (1–5 min/review typical). |
 | `claude-code` (opt-in) | the installed `claude` CLI (`claude --print`) | none — uses Claude Code's existing sign-in | `claude-opus-5-5` | Read-only single call with tools, MCP, hooks, plugins and `CLAUDE.md` disabled. Never logs in; strips API-key billing selectors from its environment. See [Claude Code provider](#claude-code-provider---provider-claude-code). |
+| `codex` (opt-in) | the installed OpenAI `codex` CLI (`codex exec`) | none — uses Codex's existing ChatGPT sign-in | `gpt-6.1-sol` | Read-only sandbox, approvals denied, user config ignored; any tool call stops the run and fails the review. Forces ChatGPT sign-in, never API-key billing. See [Codex provider](#codex-provider---provider-codex). |
 
 Set a per-environment default with `CODE_REVIEW_PROVIDER=<name>` so you don't pass `--provider` every call.
 
@@ -140,6 +141,23 @@ code-review --base origin/main --provider claude-code --model claude-opus-5-5
 - **Executable lookup:** `claude` in an *absolute* `PATH` entry, or `$CODE_REVIEW_CLAUDE_BIN` with an absolute path. The current directory and relative `PATH` entries are never searched, so a reviewed repo cannot plant its own `claude.exe` (Windows' default lookup would otherwise find it first). A `.cmd`/`.bat` shim is refused if an argument contains characters `cmd.exe` would reinterpret; point the variable at `claude.exe` instead.
 - **Operator's choice only:** `--provider claude-code` or `$CODE_REVIEW_PROVIDER`. A reviewed repo's `.code-review.toml` cannot select it, and with this provider its `model`, `models` and `retries` keys are ignored (with a `NOTE:`), since they decide how many subscription-billed calls run and which model is billed.
 - **Known limits:** `--safe-mode` still applies admin-managed policy settings, and Claude Code user-level settings outside the customizations listed above still load. On Windows, a helper process that outlives Claude Code is not killed, but it cannot block the review: output collection stops after a short grace period. Claude Code's own client-side cost estimate is not surfaced.
+
+### Codex provider (`--provider codex`)
+
+The OpenAI counterpart of the Claude Code provider: runs the review through the locally installed [Codex CLI](https://github.com/openai/codex) (`npm install -g @openai/codex`, 0.167 or later) in non-interactive `codex exec` mode, on its existing ChatGPT sign-in.
+
+```bash
+code-review --base origin/main --provider codex --model gpt-6.1-sol
+```
+
+- **Model.** The default is `gpt-6.1-sol`, the top-priority coding model in the catalog a ChatGPT sign-in offers (`codex debug models` lists yours). Override with `--model` or `$CODE_REVIEW_CODEX_MODEL`. Slugs ending in `-latest` and OpenRouter-style `vendor/model` slugs are rejected.
+- **ChatGPT sign-in only.** `forced_login_method='chatgpt'` is set, and `OPENAI_API_KEY`, `CODEX_API_KEY` and `AZURE_OPENAI_API_KEY` are removed from the child environment, so a review never bills an API key. The runner never logs in or reads credential stores; if Codex is signed out the run fails as `CONFIG` (exit 2): sign in yourself with `codex login`.
+- **Weaker isolation than Claude Code, handled explicitly.** Codex CLI 0.167 has no switch that removes every tool. The call uses `--sandbox read-only` and `approval_policy='never'` (no file writes or network from tools; anything needing approval is denied), `--ignore-user-config` and `--ignore-rules` (no user `config.toml`, MCP servers, profiles or exec-policy rules), `--ephemeral`, an empty temporary working directory, and disables every tool feature 0.167 exposes a switch for (shell, unified exec, code-mode host, browser, computer use, apps, plugins, multi-agent, image tools, hooks, goals, memories and others). `model_instructions_file` replaces Codex's built-in agent instructions with the review system prompt.
+- **Any tool call fails the review.** The model can still see a few tools (`apply_patch`, sub-agent and MCP-resource tools; the JavaScript `exec` tool fails closed). The runner reads the `--json` event stream as it arrives and stops the process the moment an item other than a message, reasoning or Codex diagnostic starts. The review is then discarded with exit 1. Output from a run that used tools is never reported as a review.
+- **Still loaded:** your global `~/.codex/AGENTS.md` and the skills list. They cannot be turned off without replacing `CODEX_HOME`, which would mean copying credentials.
+- **Success** needs exit 0, a `turn.completed` event and a non-empty final `agent_message`; event lines are validated with Pydantic v2. `turn.failed` / `error` events and nonzero exits map to the same exit codes as Claude Code (sign-in or billing → 2, usage limit → 11, context → 12, malformed or truncated stream → 13, timeout or stream failure → 14). Codex's own diagnostics (for example ignored settings) are shown as `WARN: codex reported: …`.
+- **Bounded and operator-controlled** exactly like Claude Code: `$CODE_REVIEW_CODEX_TIMEOUT` (default 900 s, at most 86,400 s), an 8 MB output cap, interruptible waits and process-tree cleanup; no automatic retry; executable from an absolute `PATH` entry or an absolute `$CODE_REVIEW_CODEX_BIN`, never the current directory. A reviewed repo's `.code-review.toml` cannot select it, and its `model`, `models` and `retries` keys are ignored under it. npm's `codex.cmd` launcher works on Windows: every `-c` override is a single-quoted TOML string, so no argument needs `cmd.exe` quoting.
+- **Not applicable:** `--temperature` and `--max-tokens` are not sent, there is no cost estimate, and Codex reports no output-limit stop, so `truncated` stays `false`.
 
 ## Model aliases
 
@@ -456,6 +474,8 @@ A two-stage loop for agent-driven work. The tool stays read-only throughout: it 
    code-review --base origin/main --provider claude-code --model claude-opus-5-5 --format json --output review-final-opus.json
    ```
 
+For an OpenAI final pass instead, use `--provider codex --model gpt-6.1-sol` in step 3.
+
 The same commands work with `--pr 123 --repo OWNER/REPO` or `--mr 45 --repo https://gitlab.example.com/group/project` in place of `--base origin/main`. Add `--dry-run` to any of them to check the resolved provider, models, execution mode and payload size without calling a model.
 
 ## Per-project configuration (`.code-review.toml`)
@@ -477,7 +497,7 @@ exclude = ["generated/**", "**/*_pb2.py"]
 - Loading one is always announced on stderr (`[config] loaded <path>`).
 - **API keys are never read from it** — credentials come from the environment only.
 - **`context` is never read from it.** The safety context is injected as trusted operator framing *ahead* of the prompt-injection guard; accepting it from the repo under review would let that repo instruct its own reviewer. Set per-project context via `$CODE_REVIEW_CONTEXT` or `--context` instead.
-- **`provider = "claude-code"` is refused from it**; under that provider its `model`, `models` and `retries` keys are ignored, and the Claude Code executable and timeout are environment-only. The reviewed repo must not be able to make the tool launch a local agent CLI on your subscription.
+- **`provider = "claude-code"` and `provider = "codex"` are refused from it**; under those providers its `model`, `models` and `retries` keys are ignored, and their executables and timeouts are environment-only. The reviewed repo must not be able to make the tool launch a local agent CLI on your subscription.
 - **`ollama_host` / `ollama_num_ctx` / `ollama_timeout` are never read from it.** The full diff is POSTed to `ollama_host` — a hostile value would exfiltrate the code under review — and the rest are machine-local hardware facts. Configure them via env or CLI.
 - `--no-project-config` skips the file entirely — recommended when auditing untrusted checkouts, since even `exclude` can hide a file from a `--codebase` review.
 
