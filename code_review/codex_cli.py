@@ -214,14 +214,21 @@ def resolve_codex_timeout(raw: str | None, source: str) -> float:
 # ---------------------------------------------------------------------------
 
 
-def _toml_literal(value: str) -> str:
-    """A TOML literal string. Refuses values that cannot be one."""
-    if "'" in value or "\n" in value or "\r" in value:
-        raise ConfigError(
-            f"Path {value!r} cannot be passed to Codex as a TOML literal string "
-            "(it contains a quote or newline). Use a temp directory without them."
-        )
-    return f"'{value}'"
+def _toml_string(value: str) -> str:
+    """Encode ``value`` as a TOML string for a ``-c key=value`` override.
+
+    A single-quoted literal string when possible: it needs no escaping and
+    no double quotes, so it survives npm's ``codex.cmd`` launcher. A value
+    containing ``'`` or a line break cannot be a literal string, so it is
+    sent as an escaped basic (double-quoted) string instead; that works with
+    the native executable, and ``_check_batch_shim`` refuses it for a
+    ``.cmd`` launcher with a pointer to the native one.
+    """
+    if not any(ch in value for ch in "'\r\n"):
+        return f"'{value}'"
+    # JSON string escapes are a subset of TOML basic-string escapes;
+    # ensure_ascii=False keeps astral characters out of \\u surrogate pairs.
+    return json.dumps(value, ensure_ascii=False)
 
 
 def build_codex_argv(
@@ -236,7 +243,7 @@ def build_codex_argv(
         "skills.bundled.enabled": "false",
         "web_search": "'disabled'",
         "hide_agent_reasoning": "true",
-        "model_instructions_file": _toml_literal(str(instructions_file)),
+        "model_instructions_file": _toml_string(str(instructions_file)),
     }
     argv = [
         *command,

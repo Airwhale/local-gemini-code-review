@@ -194,9 +194,20 @@ class TestModelValidation:
         with pytest.raises(ConfigError, match="floating"):
             cc.validate_claude_model(name)
 
-    @pytest.mark.parametrize("name", ["anthropic/claude-sonnet-4.5", "gpt-5", ""])
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "anthropic/claude-sonnet-4.5",
+            "gpt-5",
+            "",
+            "claude-fable",
+            "claude-default",
+            "claude-opusplan",
+            "claude-sonnet",
+        ],
+    )
     def test_non_native_ids_rejected(self, name: str):
-        with pytest.raises(ConfigError, match="native Claude model ID"):
+        with pytest.raises(ConfigError, match="pinned native Claude model ID"):
             cc.validate_claude_model(name)
 
     @pytest.mark.parametrize(

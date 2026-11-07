@@ -194,11 +194,13 @@ def validate_claude_model(model: str) -> str:
             "claude-code needs a full model ID so the reviewer is pinned, "
             "e.g. --model claude-opus-5-5."
         )
-    if not _MODEL_ID_RE.fullmatch(model):
+    # Pinned Claude IDs always carry a version number; a digit-free name
+    # such as ``claude-fable`` is an alias-shaped guess, not a snapshot.
+    if not _MODEL_ID_RE.fullmatch(model) or not any(c.isdigit() for c in model):
         raise ConfigError(
-            f"Model {model!r} is not a native Claude model ID. --provider "
-            "claude-code takes IDs like claude-opus-5-5 (not OpenRouter "
-            "slugs such as anthropic/claude-sonnet-4.5)."
+            f"Model {model!r} is not a pinned native Claude model ID. "
+            "--provider claude-code takes versioned IDs like claude-opus-5-5 "
+            "(not OpenRouter slugs such as anthropic/claude-sonnet-4.5)."
         )
     return model
 

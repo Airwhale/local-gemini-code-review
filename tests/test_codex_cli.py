@@ -124,14 +124,33 @@ class TestArgv:
         )
         cx._check_batch_shim(argv)  # must not raise
 
-    def test_quote_in_path_rejected(self, tmp_path: Path):
-        with pytest.raises(ConfigError, match="TOML literal"):
-            cx.build_codex_argv(
-                ("codex",),
-                model=MODEL,
-                workdir=tmp_path,
-                instructions_file=tmp_path / "o'brien" / "i.md",
-            )
+    @pytest.mark.parametrize(
+        "name", ["plain", "o'brien", "with space", "dollar$sign", "smile😀"]
+    )
+    def test_instructions_path_round_trips_as_toml(self, tmp_path: Path, name: str):
+        import tomllib
+
+        path = tmp_path / name / "i.md"
+        argv = cx.build_codex_argv(
+            ("codex",), model=MODEL, workdir=tmp_path, instructions_file=path
+        )
+        (override,) = [
+            argv[i + 1]
+            for i, a in enumerate(argv)
+            if a == "-c" and argv[i + 1].startswith("model_instructions_file=")
+        ]
+        parsed = tomllib.loads(override)
+        assert parsed["model_instructions_file"] == str(path)
+
+    def test_quoted_path_needs_native_executable(self, tmp_path: Path):
+        argv = cx.build_codex_argv(
+            ("C:/npm/codex.cmd",),
+            model=MODEL,
+            workdir=tmp_path,
+            instructions_file=tmp_path / "o'brien" / "i.md",
+        )
+        with pytest.raises(ConfigError, match="batch script"):
+            cx._check_batch_shim(argv)
 
     def test_prompt_on_stdin_instructions_in_file(
         self, fake: tuple[str, ...], temp_parent: Path, tmp_path: Path
