@@ -83,6 +83,12 @@ def main() -> int:
         emit({"type": "item.completed", "item": {"id": "r", "type": "reasoning", "text": "x"}})
         emit(message(REVIEW))
         emit(completed())
+    elif scenario == "malformed_final":
+        # Progress commentary, then a final message that fails validation
+        # (no item "type"), then a valid turn.completed.
+        emit(message("Looking at the diff now.", "item_0"))
+        emit({"type": "item.completed", "item": {"id": "item_1", "text": REVIEW}})
+        emit(completed())
     elif scenario == "diagnostics":
         # Shapes observed from Codex CLI 0.167: diagnostics arrive as items
         # of type "error" before the turn and are not tool calls.

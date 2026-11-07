@@ -298,6 +298,9 @@ class TestProcess:
             ("no_turn_completed", ProviderHiccup, "turn.completed"),
             ("malformed", ProviderHiccup, "turn.completed"),
             ("empty_message", ProviderHiccup, "without a final message"),
+            # Found by the real gpt-6.1-sol review of this PR: a malformed
+            # final message must not let earlier commentary pass as the review.
+            ("malformed_final", ProviderHiccup, "malformed event"),
         ],
     )
     def test_failures_are_typed(

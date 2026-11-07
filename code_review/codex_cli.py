@@ -304,7 +304,12 @@ def _tool_event(line: bytes) -> bool:
     if not isinstance(data, dict) or not str(data.get("type", "")).startswith("item."):
         return False
     item = data.get("item")
-    return isinstance(item, dict) and item.get("type") not in _ALLOWED_ITEM_TYPES
+    if not isinstance(item, dict):
+        return False
+    kind = item.get("type")
+    # An item without a string type is malformed, not a tool; it fails the
+    # run later as a malformed event (see _parse_events).
+    return isinstance(kind, str) and kind not in _ALLOWED_ITEM_TYPES
 
 
 # ---------------------------------------------------------------------------
@@ -372,16 +377,30 @@ def classify_failure(
     return ReviewError(f"Codex reported an error{suffix}", **kwargs)
 
 
-def _parse_events(stdout_text: str) -> list[CodexEvent]:
+def _parse_events(stdout_text: str) -> tuple[list[CodexEvent], int]:
+    """Validated events, plus the number of malformed JSON event objects.
+
+    Non-JSON lines (banners, notices) are ignored. A line that IS a JSON
+    object but does not validate as an event is counted, not dropped:
+    silently skipping a malformed final message would promote an earlier
+    progress message to "the review".
+    """
     events: list[CodexEvent] = []
+    malformed = 0
     for line in stdout_text.splitlines():
         if not line.strip():
             continue
         try:
-            events.append(CodexEvent.model_validate(json.loads(line)))
-        except (ValueError, ValidationError):
-            continue  # stray non-event lines are ignored
-    return events
+            data = json.loads(line)
+        except ValueError:
+            continue  # stray non-JSON line
+        if not isinstance(data, dict):
+            continue  # a bare JSON scalar is not an event either
+        try:
+            events.append(CodexEvent.model_validate(data))
+        except ValidationError:
+            malformed += 1
+    return events, malformed
 
 
 def _event_error_text(event: CodexEvent) -> str:
@@ -401,7 +420,7 @@ def interpret_outcome(
     """Turn a finished ``codex exec --json`` run into a CallResult or error."""
     stderr_text = redact(outcome.stderr.decode("utf-8", "replace"), secret_values)
     stdout_text = outcome.stdout.decode("utf-8", "replace")
-    events = _parse_events(stdout_text)
+    events, malformed = _parse_events(stdout_text)
     tools = sorted(
         {
             e.item.type
@@ -451,6 +470,14 @@ def interpret_outcome(
             stderr_text or fallback or f"exit status {outcome.returncode}",
             model=model,
             detail=(stderr_text or fallback)[:1000] or None,
+        )
+    if malformed:
+        raise ProviderHiccup(
+            f"Codex emitted {malformed} malformed event(s); the output cannot be "
+            "trusted to contain the final review, so it was discarded.",
+            detail=redact(stdout_text, secret_values)[:1000] or None,
+            model=model,
+            provider=PROVIDER,
         )
     if not completed:
         raise ProviderHiccup(
