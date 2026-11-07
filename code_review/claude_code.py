@@ -409,22 +409,45 @@ def _check_batch_shim(argv: Sequence[str]) -> None:
             )
 
 
+def _system_taskkill() -> str | None:
+    """Absolute path of the OS ``taskkill.exe``, or ``None``.
+
+    Never launched by bare name: Windows process creation searches the
+    current directory (usually the reviewed repository) before System32,
+    so a planted ``taskkill.exe`` would run. The directory comes from
+    ``GetSystemDirectoryW``, not from environment variables.
+    """
+    if sys.platform != "win32":
+        return None
+    import ctypes
+
+    buffer = ctypes.create_unicode_buffer(512)
+    length = ctypes.windll.kernel32.GetSystemDirectoryW(buffer, len(buffer))
+    if not 0 < length < len(buffer):
+        return None
+    candidate = Path(buffer.value) / "taskkill.exe"
+    return str(candidate) if candidate.is_absolute() and candidate.is_file() else None
+
+
 def _kill_tree(proc: subprocess.Popen[bytes]) -> None:
     """Stop ``proc`` and anything it started. Never raises."""
     if proc.poll() is not None:
         return
     if sys.platform == "win32":
-        try:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                timeout=_KILL_GRACE_SECONDS * 2,
-            )
-        except (OSError, subprocess.SubprocessError):
-            pass
+        taskkill = _system_taskkill()
+        if taskkill is not None:
+            try:
+                subprocess.run(
+                    [taskkill, "/F", "/T", "/PID", str(proc.pid)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    cwd=str(Path(taskkill).parent),
+                    check=False,
+                    timeout=_KILL_GRACE_SECONDS * 2,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
     else:
         try:
             os.killpg(proc.pid, signal.SIGTERM)

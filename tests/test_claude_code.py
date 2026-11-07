@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -253,6 +254,51 @@ class TestResolveCommandSafety:
                     else "claude"
                 }
             )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="taskkill is Windows-only")
+class TestTaskkillResolution:
+    def test_system_taskkill_is_absolute_in_system_directory(self):
+        found = cc._system_taskkill()
+        assert found is not None
+        path = Path(found)
+        assert path.is_absolute() and path.name.lower() == "taskkill.exe"
+        assert path.parent.name.lower() == "system32"
+
+    def test_cleanup_ignores_taskkill_planted_in_cwd(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        repo = tmp_path / "reviewed repo"
+        repo.mkdir()
+        (repo / "taskkill.exe").write_bytes(b"planted")
+        monkeypatch.chdir(repo)
+        launched: list[list[str]] = []
+        real_run = subprocess.run
+
+        def spy(argv: list[str], **kwargs: Any) -> Any:
+            launched.append(list(argv))
+            return real_run(argv, **kwargs)
+
+        monkeypatch.setattr(cc.subprocess, "run", spy)
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            cc._kill_tree(proc)
+            assert proc.wait(timeout=15) is not None
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        assert launched, "taskkill was not invoked"
+        exe = Path(launched[0][0])
+        assert exe.is_absolute()
+        assert exe.parent != repo
+        assert os.path.normcase(str(exe)) == os.path.normcase(
+            str(cc._system_taskkill())
+        )
 
 
 class TestResolveCommand:
