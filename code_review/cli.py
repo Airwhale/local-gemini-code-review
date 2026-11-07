@@ -1184,23 +1184,31 @@ def _run_panel(
         return model, result
 
     outcomes: dict[str, CallResult | ReviewError] = {}
+    # Every panel starts uncancelled, whatever an earlier run in this
+    # process left behind.
+    reset_cancellation()
     if workers == 1:
         for panel_model in settings.models:
             _model, outcome = _one(panel_model)
             outcomes[panel_model] = outcome
     else:
-        reset_cancellation()
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            try:
-                for model, outcome in pool.map(_one, settings.models):
-                    outcomes[model] = outcome
-            except BaseException:
-                # Ctrl+C reaches only this thread; the pool's exit would
-                # otherwise wait for every worker's call to finish. Stop any
-                # in-flight Claude Code processes (HTTP calls end on their
-                # own timeouts as before).
-                cancel_running_calls()
-                raise
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                try:
+                    for model, outcome in pool.map(_one, settings.models):
+                        outcomes[model] = outcome
+                except BaseException:
+                    # Ctrl+C reaches only this thread; the pool's exit would
+                    # otherwise wait for every worker's call to finish. Stop
+                    # any in-flight Claude Code processes (HTTP calls end on
+                    # their own timeouts as before).
+                    cancel_running_calls()
+                    raise
+        finally:
+            # The pool has drained by now, so the signal has done its job;
+            # clearing it keeps a later call in this process from being
+            # cancelled by a panel that already ended.
+            reset_cancellation()
 
     results_by_model: dict[str, CallResult] = {}
     failures: list[tuple[str, ReviewError]] = []

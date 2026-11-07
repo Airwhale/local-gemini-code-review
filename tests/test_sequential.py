@@ -445,15 +445,47 @@ def test_interrupted_concurrent_panel_cancels_running_calls(
 ) -> None:
     import code_review.claude_code as cc
 
+    signalled: list[bool] = []
+    real_cancel = cli.cancel_running_calls
+
+    def spy_cancel() -> None:
+        signalled.append(True)
+        real_cancel()
+
     def fake(settings: Settings, system: str, user: str, model: str) -> CallResult:
         if model == MODELS[0]:
             raise KeyboardInterrupt
         return CallResult(CURRENT)
 
     monkeypatch.setattr(cli, "_execute_call", fake)
+    monkeypatch.setattr(cli, "cancel_running_calls", spy_cancel)
     try:
         with pytest.raises(KeyboardInterrupt):
             cli._run_panel(_settings(), REQUEST)
-        assert cc._CANCEL.is_set()
+        # In-flight calls were told to stop...
+        assert signalled == [True]
+        # ...and the signal does not outlive the panel that raised it.
+        assert not cc._CANCEL.is_set()
     finally:
         cc.reset_cancellation()
+
+
+@pytest.mark.parametrize("sequential", [False, True])
+def test_stale_cancellation_does_not_leak_into_the_next_panel(
+    monkeypatch: pytest.MonkeyPatch, sequential: bool
+) -> None:
+    import code_review.claude_code as cc
+
+    cc.cancel_running_calls()  # e.g. left behind by an earlier caller
+    seen: list[bool] = []
+
+    def fake(settings: Settings, system: str, user: str, model: str) -> CallResult:
+        seen.append(cc._CANCEL.is_set())
+        return CallResult(CURRENT)
+
+    monkeypatch.setattr(cli, "_execute_call", fake)
+    try:
+        cli._run_panel(_settings(sequential=sequential), REQUEST)
+    finally:
+        cc.reset_cancellation()
+    assert seen == [False, False]
