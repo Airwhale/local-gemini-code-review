@@ -116,6 +116,7 @@ _ALLOWED_ITEM_TYPES = frozenset({"agent_message", "reasoning", "error"})
 # Diagnostics this configuration causes on purpose; not worth a WARN line.
 _EXPECTED_DIAGNOSTICS = ("Code Mode is unavailable because code-mode host is disabled",)
 _MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+_STATUS_RE = re.compile(r"(?<!\d)(401|429|500|502|503|504)(?!\d)")
 
 
 class CodexItem(BaseModel):
@@ -352,11 +353,13 @@ def classify_failure(
             f"(needs 0.167 or later){suffix}",
             **kwargs,
         )
+    # Whole-number status codes only: "1429012 tokens" must not read as 429.
+    statuses = set(_STATUS_RE.findall(text))
     if _has(text, _BILLING_PHRASES):
         return ConfigError(f"{_BILLING_HINT}{suffix}", **kwargs)
-    if _has(text, _QUOTA_PHRASES) or "429" in text:
+    if _has(text, _QUOTA_PHRASES) or "429" in statuses:
         return RateLimit(f"{_QUOTA_HINT}{suffix}", **kwargs)
-    if _has(text, _AUTH_PHRASES) or "401" in text or "login" in text:
+    if _has(text, _AUTH_PHRASES) or "401" in statuses or "codex login" in text:
         return ConfigError(f"{_AUTH_HINT}{suffix}", **kwargs)
     if _has(text, _MODEL_PHRASES) or (
         "model" in text and ("not supported" in text or "does not exist" in text)
@@ -372,7 +375,11 @@ def classify_failure(
             "(--include / --exclude / smaller --base).",
             **kwargs,
         )
-    if any(p in text for p in ("stream disconnected", "server error", "503", "502")):
+    if (
+        "stream disconnected" in text
+        or "server error" in text
+        or statuses & {"500", "502", "503", "504"}
+    ):
         return TransportError(f"Codex request failed{suffix}", **kwargs)
     return ReviewError(f"Codex reported an error{suffix}", **kwargs)
 
@@ -438,7 +445,9 @@ def interpret_outcome(
             provider=PROVIDER,
         )
     if outcome.cancelled:
-        raise TransportError(
+        # Deliberately not a retryable category: --retries must not back off
+        # and relaunch a call the user just interrupted.
+        raise ReviewError(
             "Codex call cancelled; the process was stopped.",
             model=model,
             provider=PROVIDER,
@@ -459,10 +468,25 @@ def interpret_outcome(
             model=model,
             provider=PROVIDER,
         )
-    failures = [e for e in events if e.type in ("turn.failed", "error")]
+    # turn.failed is always fatal. A top-level error event is fatal only when
+    # no turn.completed follows it; an earlier one (e.g. a transient
+    # reconnect notice) is reported and the completed turn is used.
+    last_completed = max(
+        (i for i, e in enumerate(events) if e.type == "turn.completed"), default=-1
+    )
+    failures = [
+        e
+        for i, e in enumerate(events)
+        if e.type == "turn.failed" or (e.type == "error" and i > last_completed)
+    ]
     if failures:
         message = redact(_event_error_text(failures[-1]), secret_values)
         raise classify_failure(message, model=model, detail=message[:1000])
+    for e in events:
+        if e.type == "error":
+            notice = redact(_event_error_text(e), secret_values).strip()
+            first = notice.splitlines()[0][:300] if notice else "error event"
+            sys.stderr.write(f"WARN: codex reported (recovered): {first}\n")
     completed = [e for e in events if e.type == "turn.completed"]
     if outcome.returncode != 0:
         fallback = redact(stdout_text.strip(), secret_values)
@@ -567,7 +591,9 @@ def call_codex(
         argv = build_codex_argv(
             command, model=model, workdir=workdir, instructions_file=instructions
         )
-        _check_batch_shim(argv)
+        _check_batch_shim(
+            argv, label="Codex", env_var="CODE_REVIEW_CODEX_BIN", native="codex.exe"
+        )
         try:
             outcome = run_bounded(
                 argv,

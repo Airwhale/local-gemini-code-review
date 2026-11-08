@@ -498,11 +498,13 @@ class TestEndToEndProcess:
         timer.start()
         started = time.monotonic()
         try:
-            with pytest.raises(TransportError, match="cancelled"):
+            with pytest.raises(ReviewError, match="cancelled") as exc_info:
                 _call(fake, temp_parent, "sleep", timeout=60.0)
         finally:
             timer.cancel()
             cc.reset_cancellation()
+        # Not a retryable category, so --retries never relaunches it.
+        assert type(exc_info.value) is ReviewError
         assert time.monotonic() - started < 30
 
     def test_ctrl_c_interrupts_the_wait(self, fake: tuple[str, ...], temp_parent: Path):

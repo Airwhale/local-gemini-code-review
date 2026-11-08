@@ -399,18 +399,27 @@ def redact(text: str, secret_values: Sequence[str] = ()) -> str:
     return _KEYED_SECRET.sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", text)
 
 
-def _check_batch_shim(argv: Sequence[str]) -> None:
-    """Refuse cmd.exe re-parsing hazards for .cmd/.bat launchers."""
+def _check_batch_shim(
+    argv: Sequence[str],
+    *,
+    label: str = "Claude Code",
+    env_var: str = "CODE_REVIEW_CLAUDE_BIN",
+    native: str = "claude.exe",
+) -> None:
+    """Refuse cmd.exe re-parsing hazards for .cmd/.bat launchers.
+
+    ``label`` / ``env_var`` / ``native`` name the provider in the error, so
+    each local CLI provider points users at its own setting and executable.
+    """
     if Path(argv[0]).suffix.lower() not in (".cmd", ".bat"):
         return
     for arg in argv[1:]:
         if any(ch in _BATCH_UNSAFE for ch in arg):
             raise ConfigError(
-                f"The Claude Code launcher {argv[0]!r} is a batch script, and "
-                "an argument contains characters cmd.exe would reinterpret. "
-                "Set $CODE_REVIEW_CLAUDE_BIN to the native claude executable "
-                "(claude.exe), or use a temp directory path without "
-                '%^&|<>"! characters.'
+                f"The {label} launcher {argv[0]!r} is a batch script, and an "
+                "argument contains characters cmd.exe would reinterpret. Set "
+                f"${env_var} to the native executable ({native}), or use a "
+                "temp directory path without %^&|<>\"'! characters."
             )
 
 
@@ -828,7 +837,9 @@ def interpret_outcome(
     stderr_text = redact(outcome.stderr.decode("utf-8", "replace"), secret_values)
     stdout_text = outcome.stdout.decode("utf-8", "replace").strip()
     if outcome.cancelled:
-        raise TransportError(
+        # Deliberately not a retryable category: --retries must not back off
+        # and relaunch a call the user just interrupted.
+        raise ReviewError(
             "Claude Code call cancelled; the process was stopped.",
             model=model,
             provider=PROVIDER,

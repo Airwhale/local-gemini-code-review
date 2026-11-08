@@ -133,6 +133,15 @@ def main() -> int:
     elif scenario == "error_quota":
         emit({"type": "error", "message": "You've hit your usage limit. Try later."})
         return 1
+    elif scenario == "transient_error":
+        # A recovered stream notice before a turn that completes normally.
+        emit({"type": "error", "message": "Reconnecting... 1/5 (stream disconnected)"})
+        emit(message(REVIEW))
+        emit(completed())
+    elif scenario == "error_after_turn":
+        emit(message(REVIEW))
+        emit(completed())
+        emit({"type": "error", "message": "You've hit your usage limit."})
     elif scenario == "turn_failed_context":
         emit(
             {

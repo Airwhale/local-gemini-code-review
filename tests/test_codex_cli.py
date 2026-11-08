@@ -152,6 +152,27 @@ class TestArgv:
         with pytest.raises(ConfigError, match="batch script"):
             cx._check_batch_shim(argv)
 
+    def test_launcher_error_names_codex(
+        self, temp_parent: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # A temp parent with a quote forces the escaped TOML form, which the
+        # .cmd check refuses; the message must point at Codex, not Claude.
+        quoted = tmp_path / "o'brien"
+        quoted.mkdir()
+        with pytest.raises(ConfigError) as exc_info:
+            cx.call_codex(
+                system_prompt="s",
+                user_prompt="u",
+                model=MODEL,
+                command=(str(tmp_path / "codex.cmd"),),
+                timeout=5,
+                temp_parent=quoted,
+            )
+        message = str(exc_info.value)
+        assert "Codex launcher" in message
+        assert "$CODE_REVIEW_CODEX_BIN" in message and "codex.exe" in message
+        assert "CLAUDE" not in message
+
     def test_prompt_on_stdin_instructions_in_file(
         self, fake: tuple[str, ...], temp_parent: Path, tmp_path: Path
     ):
@@ -351,8 +372,65 @@ class TestProcess:
         outcome = ProcessOutcome(
             returncode=None, stdout=b"", stderr=b"", cancelled=True
         )
-        with pytest.raises(TransportError, match="cancelled"):
+        with pytest.raises(ReviewError, match="cancelled") as exc_info:
             cx.interpret_outcome(outcome, model=MODEL, timeout=1)
+        assert type(exc_info.value) is ReviewError
+
+    def test_cancelled_call_is_not_retried(self, monkeypatch: pytest.MonkeyPatch):
+        from code_review.providers import _call_with_retries
+
+        calls = 0
+        outcome = ProcessOutcome(
+            returncode=None, stdout=b"", stderr=b"", cancelled=True
+        )
+
+        def call() -> CallResult:
+            nonlocal calls
+            calls += 1
+            return cx.interpret_outcome(outcome, model=MODEL, timeout=1)
+
+        monkeypatch.setattr("code_review.providers.time.sleep", lambda s: None)
+        with pytest.raises(ReviewError, match="cancelled"):
+            _call_with_retries(call, label="codex", retries=3, auto_retry=False)
+        assert calls == 1
+
+    @pytest.mark.parametrize(
+        ("message", "error_type"),
+        [
+            # Whole status codes only; digits inside other numbers don't count.
+            ("context_length_exceeded: input is 1429012 tokens", ContextOverflow),
+            ("request 4015029 failed: unknown failure", ReviewError),
+            ("forced_login_method is set to chatgpt", ReviewError),
+            ("upstream returned 5034 bytes of junk", ReviewError),
+            ("HTTP 429 Too Many Requests", RateLimit),
+            ("401 Unauthorized", ConfigError),
+            ("please run `codex login`", ConfigError),
+            ("HTTP 503 from upstream", TransportError),
+        ],
+    )
+    def test_status_codes_match_whole_numbers(
+        self, message: str, error_type: type[ReviewError]
+    ):
+        err = cx.classify_failure(message, model=MODEL)
+        assert type(err) is error_type
+
+    def test_recovered_error_event_does_not_fail_the_turn(
+        self,
+        fake: tuple[str, ...],
+        temp_parent: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        result = _call(fake, temp_parent, "transient_error")
+        assert "Empty input" in result.content
+        assert (
+            "WARN: codex reported (recovered): Reconnecting" in capsys.readouterr().err
+        )
+
+    def test_error_after_last_completed_turn_still_fails(
+        self, fake: tuple[str, ...], temp_parent: Path
+    ):
+        with pytest.raises(RateLimit):
+            _call(fake, temp_parent, "error_after_turn")
 
 
 def _args(**overrides: Any) -> argparse.Namespace:
