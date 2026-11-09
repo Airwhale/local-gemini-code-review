@@ -71,13 +71,15 @@ uv run --project /path/to/local-gemini-code-review /path/to/local-gemini-code-re
 
 ## Providers
 
-Three transport paths — two cloud, one local:
+Five transport paths — two cloud APIs, one local server, and two opt-in local agent CLIs:
 
 | Provider | Endpoint | Required env var | Default model | Notes |
 |---|---|---|---|---|
 | `openrouter` (default) | `openrouter.ai/api/v1/chat/completions` | `OPENROUTER_API_KEY` | `google/gemini-2.5-pro` | OpenAI-compatible wire format. One bill for many vendors — this is what makes cross-model panels cheap. Optional `OPENROUTER_HTTP_REFERER` / `OPENROUTER_X_TITLE` set the attribution headers shown in OpenRouter's dashboard. |
 | `gemini` | `generativelanguage.googleapis.com/v1beta/…` | `GEMINI_API_KEY` | `gemini-3.8-flash` | Google AI Studio's `generateContent`, one less hop. |
 | `ollama` | `{OLLAMA_HOST}/api/chat` (default `http://localhost:11434`) | none — local server | `qwen3-coder:30b` | Native endpoint (per-request `num_ctx`, `prompt_eval_count` truncation detection). No API key, no token costs, code never leaves the machine. CPU inference is slower (1–5 min/review typical). |
+| `claude-code` (opt-in) | the installed `claude` CLI (`claude --print`) | none — uses Claude Code's existing sign-in | `claude-opus-5-5` | Read-only single call with tools, MCP, hooks, plugins and `CLAUDE.md` disabled. Never logs in; strips API-key billing selectors from its environment. See [Claude Code provider](#claude-code-provider---provider-claude-code). |
+| `codex` (opt-in) | the installed OpenAI `codex` CLI (`codex exec`) | none — uses Codex's existing ChatGPT sign-in | `gpt-6.1-sol` | Read-only sandbox, approvals denied, user config ignored; any tool call stops the run and fails the review. Forces ChatGPT sign-in, never API-key billing. See [Codex provider](#codex-provider---provider-codex). |
 
 Set a per-environment default with `CODE_REVIEW_PROVIDER=<name>` so you don't pass `--provider` every call.
 
@@ -119,6 +121,43 @@ Unlike the cloud providers, which return an error when a prompt exceeds the mode
 | Unknown (first call, model cold) | `num_ctx` **omitted** — the server keeps its VRAM-tier default ([docs](https://docs.ollama.com/context-length): 4K < 24 GiB, 32K for 24–48 GiB, 256K above) | Warn-only pre-flight, then a **hard post-call verify**: if the response's `prompt_eval_count` sits at the window (re-probed once the model is loaded), the output is *discarded* with exit 12 rather than returned as a bogus review. |
 
 Requesting the conservative 4K estimate in the unknown case would *shrink* a bigger window and cause the very truncation being guarded against — hence omit-and-verify. On a warning or `CONTEXT_OVERFLOW`, narrow the scope or pin the window: `OLLAMA_NUM_CTX=32768` in `.env`.
+
+### Claude Code provider (`--provider claude-code`)
+
+Runs the review through the locally installed [Claude Code](https://code.claude.com/docs/en/setup) CLI in print mode, on whatever sign-in that CLI already has (for example a Claude subscription). It is meant for a separate final pass; see [Review workflow](#review-workflow-regular-panel-fixes-then-a-final-claude-review).
+
+```bash
+code-review --base origin/main --provider claude-code --model claude-opus-5-5
+```
+
+- **Pinned model.** The default is `claude-opus-5-5`, the native Claude model ID for Opus 5.5 (dateless Claude IDs are pinned snapshots). Use `--model claude-sonnet-5-5` for a faster pass that uses less of your plan's quota. Claude Code's floating aliases (`sonnet`, `opus`, `fable`, …) and OpenRouter slugs are rejected as `CONFIG` errors. Override with `--model` or `$CODE_REVIEW_CLAUDE_MODEL`.
+- **Read-only by construction.** One `claude --print --output-format json` process with `--tools ""`, `--disallowedTools "mcp__*"`, `--strict-mcp-config`, `--safe-mode` (no `CLAUDE.md`, skills, plugins, hooks, MCP servers or auto memory), `--disable-slash-commands`, `--permission-mode dontAsk`, `--permission-prompts none` and `--no-session-persistence`. The review system prompt replaces Claude Code's default agent prompt via `--system-prompt-file`. The process runs in a fresh, empty temporary directory, so the reviewed repository's `.claude/` settings, `.mcp.json` and `CLAUDE.md` are not in its working tree. `--dangerously-skip-permissions` is never used.
+- **Payload over stdin.** The review prompt is piped to stdin (Claude Code's 10 MB stdin cap is checked first). Arguments are an argv list with no shell, so Windows paths with spaces work.
+- **Existing sign-in only.** The runner never logs in, switches accounts, reads credential stores, buys credits or enables extra usage. `--bare` is deliberately not used: it skips subscription/OAuth sign-in and would require an API key. To keep a review from silently billing pay-per-token, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `AWS_BEARER_TOKEN_BEDROCK`, `ANTHROPIC_FOUNDRY_API_KEY` and the `CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` / `_FOUNDRY` selectors are removed from the child environment. A `NOTE:` names any that were set; values are never printed. Claude Code's *user* settings file can still configure an `apiKeyHelper` or an API key in its `env` block; the runner cannot override that, so it prints a `WARN:` naming the setting (never its value). This tool's own keys (`OPENROUTER_API_KEY`, `GEMINI_API_KEY`, forge tokens) are removed too.
+- **Success needs more than exit 0.** The JSON result envelope is validated with Pydantic v2. The review is used only when the process exited 0 *and* the envelope reports success (`is_error: false`, `subtype: "success"`) with non-empty `result` text, which then goes through the same markdown parser as every other provider. A signed-out CLI prints `"subtype": "success"` with `"is_error": true`, so the subtype alone is not trusted.
+- **Typed failures.** Signed out, expired or rejected sign-in, billing or credit blockers, an unknown model, or a CLI too old for a required option → `CONFIG` (exit 2), with instructions to fix it yourself. Usage or rate limits → `RATE_LIMIT` (11). Prompt too large, or the 8 MB output cap exceeded → `CONTEXT_OVERFLOW` (12). Empty, malformed, truncated or missing JSON → `PROVIDER_HICCUP` (13). Timeout or API overload → `TRANSPORT` (14). Refusal → `SAFETY_REFUSAL` (10). Credential-shaped strings are scrubbed from error text before it reaches stderr or JSON. A `max_tokens` stop with partial text is returned with `truncated: true` and a `WARN:` line.
+- **Bounded.** `$CODE_REVIEW_CLAUDE_TIMEOUT` (default 900 s, at most 86,400 s) caps each call. Waits are sliced, so Ctrl-C is honored promptly, including on Windows and in concurrent panels. On timeout, output overflow or Ctrl-C the process tree is stopped and the temporary directory removed. There is no automatic retry, because each attempt spends subscription quota and can take minutes; `--retries N` opts in.
+- **Not applicable:** `--temperature` and `--max-tokens` are not sent (the CLI has no sampling flag and manages its own output limit). There is no cost estimate; usage is reported from the envelope when present.
+- **Executable lookup:** `claude` in an *absolute* `PATH` entry, or `$CODE_REVIEW_CLAUDE_BIN` with an absolute path. The current directory and relative `PATH` entries are never searched, so a reviewed repo cannot plant its own `claude.exe` (Windows' default lookup would otherwise find it first). A `.cmd`/`.bat` shim is refused if an argument contains characters `cmd.exe` would reinterpret; point the variable at `claude.exe` instead.
+- **Operator's choice only:** `--provider claude-code` or `$CODE_REVIEW_PROVIDER`. A reviewed repo's `.code-review.toml` cannot select it, and with this provider its `model`, `models` and `retries` keys are ignored (with a `NOTE:`), since they decide how many subscription-billed calls run and which model is billed.
+- **Known limits:** `--safe-mode` still applies admin-managed policy settings, and Claude Code user-level settings outside the customizations listed above still load. On Windows, a helper process that outlives Claude Code is not killed, but it cannot block the review: output collection stops after a short grace period. Claude Code's own client-side cost estimate is not surfaced.
+
+### Codex provider (`--provider codex`)
+
+The OpenAI counterpart of the Claude Code provider: runs the review through the locally installed [Codex CLI](https://github.com/openai/codex) (`npm install -g @openai/codex`, 0.167 or later) in non-interactive `codex exec` mode, on its existing ChatGPT sign-in.
+
+```bash
+code-review --base origin/main --provider codex --model gpt-6.1-sol
+```
+
+- **Model.** The default is `gpt-6.1-sol`, the top-priority coding model in the catalog a ChatGPT sign-in offers (`codex debug models` lists yours). Override with `--model` or `$CODE_REVIEW_CODEX_MODEL`. Slugs ending in `-latest` and OpenRouter-style `vendor/model` slugs are rejected.
+- **ChatGPT sign-in only.** `forced_login_method='chatgpt'` is set, and `OPENAI_API_KEY`, `CODEX_API_KEY` and `AZURE_OPENAI_API_KEY` are removed from the child environment, so a review never bills an API key. The runner never logs in or reads credential stores; if Codex is signed out the run fails as `CONFIG` (exit 2): sign in yourself with `codex login`.
+- **Weaker isolation than Claude Code, handled explicitly.** Codex CLI 0.167 has no switch that removes every tool. The call uses `--sandbox read-only` and `approval_policy='never'` (no file writes or network from tools; anything needing approval is denied), `--ignore-user-config` and `--ignore-rules` (no user `config.toml`, MCP servers, profiles or exec-policy rules), `--ephemeral`, an empty temporary working directory, and disables every tool feature 0.167 exposes a switch for (shell, unified exec, code-mode host, browser, computer use, apps, plugins, multi-agent, image tools, hooks, goals, memories and others). `model_instructions_file` replaces Codex's built-in agent instructions with the review system prompt.
+- **Any tool call fails the review.** The model can still see a few tools (`apply_patch`, sub-agent and MCP-resource tools; the JavaScript `exec` tool fails closed). The runner reads the `--json` event stream as it arrives and stops the process the moment an item other than a message, reasoning or Codex diagnostic starts. The review is then discarded with exit 1. Output from a run that used tools is never reported as a review.
+- **Still loaded:** your global `~/.codex/AGENTS.md` and the skills list. They cannot be turned off without replacing `CODEX_HOME`, which would mean copying credentials.
+- **Success** needs exit 0, a `turn.completed` event and a non-empty final `agent_message`; event lines are validated with Pydantic v2. `turn.failed` / `error` events and nonzero exits map to the same exit codes as Claude Code (sign-in or billing → 2, usage limit → 11, context → 12, malformed or truncated stream → 13, timeout or stream failure → 14). Codex's own diagnostics (for example ignored settings) are shown as `WARN: codex reported: …`.
+- **Bounded and operator-controlled** exactly like Claude Code: `$CODE_REVIEW_CODEX_TIMEOUT` (default 900 s, at most 86,400 s), an 8 MB output cap, interruptible waits and process-tree cleanup; no automatic retry; executable from an absolute `PATH` entry or an absolute `$CODE_REVIEW_CODEX_BIN`, never the current directory. A reviewed repo's `.code-review.toml` cannot select it, and its `model`, `models` and `retries` keys are ignored under it. npm's `codex.cmd` launcher works on Windows: every `-c` override is a single-quoted TOML string, so no argument needs `cmd.exe` quoting.
+- **Not applicable:** `--temperature` and `--max-tokens` are not sent, there is no cost estimate, and Codex reports no output-limit stop, so `truncated` stays `false`.
 
 ## Model aliases
 
@@ -174,6 +213,13 @@ the current profile still produces no review, narrow or chunk the input and
 record the model as incomplete instead of repeatedly raising the ceiling.
 Reasoning-only output is never accepted as a clean review, and no automatic
 fallback or budget escalation adds another paid call.
+
+`qwen/qwen3.8-flash` gets the same `reasoning.enabled=false` request (its
+reasoning is optional but on by default). In this repository's own reviews it
+spent the entire 16,000- and 32,768-token allowance on reasoning and returned
+nothing. Its output ceiling is **not** raised; the normal default applies.
+Other Qwen models are unchanged. `z-ai/glm-5.3` cannot disable reasoning (it is
+mandatory there), so it keeps its default settings.
 
 ## Review modes
 
@@ -401,14 +447,43 @@ code-review --codebase --chunk --provider ollama   # audit a repo through a smal
 code-review --base main --models pro,claude,deepseek --format json
 ```
 
-Runs the same review through several models (concurrently on cloud, capped at 4; sequentially on ollama — local models can't share RAM) and merges the findings into one consensus-annotated report. The motivation is empirical: dogfooding this tool on its own PR, one model returned clean, one returned only hallucinations, and one had a single real bug among 28 findings — **cross-model agreement is the strongest cheap filter for plausible-but-wrong findings**. Expect `found_by` of 1 as the norm; consensus (`found_by > 1`) is a rare, *high-precision* signal.
+Runs the same review through several models (concurrently on cloud, capped at 4; sequentially on ollama — local models can't share RAM; sequentially on any provider with `--sequential`) and merges the findings into one consensus-annotated report. The motivation is empirical: dogfooding this tool on its own PR, one model returned clean, one returned only hallucinations, and one had a single real bug among 28 findings — **cross-model agreement is the strongest cheap filter for plausible-but-wrong findings**. Expect `found_by` of 1 as the norm; consensus (`found_by > 1`) is a rare, *high-precision* signal.
 
 - **Markdown**: `# Panel review (k/n models)` header, per-model one-line results, merged findings ordered by (consensus, severity, location) with `Found by:` lines, then every model's raw output verbatim in an appendix.
 - **JSON**: `models[]`, per-finding `found_by`, a `per_model[]` array (parse status, usage, truncation, or the typed error for failures), summed usage.
 - **Merging is deliberately conservative**: matching file, severity, and normalized title, with line numbers within 10 lines when both are present. Nearby findings with different titles remain separate, even at the same severity. Reworded descriptions of the same issue may therefore remain separate too; location alone cannot establish agreement.
 - **Exit contract**: ≥1 model succeeded → **exit 0** (failures as `WARN: [panel] <model> failed: …` stderr lines, machine-readable in `per_model`). All failed → one `ERROR:` block chosen by precedence `CONFIG > SAFETY_REFUSAL > CONTEXT_OVERFLOW > RATE_LIMIT > PROVIDER_HICCUP > TRANSPORT > UNKNOWN` (CLI-order ties).
 - **`--min-found-by N`** turns that signal into a filter: drop merged findings fewer than N models reported. `--min-found-by 2` keeps only what two models found *independently* — the highest-precision, lowest-effort noise filter available here. Applied after merging, to **both** formats (panel markdown is runner-synthesized too), with a `[panel] --min-found-by 2: dropped 7 finding(s)…` line on stderr; the per-model raw appendix still shows everything. Needs `--models` (a consensus count is meaningless for one model — asking for it alone is a typed `CONFIG` error). Env: `CODE_REVIEW_MIN_FOUND_BY`; also settable in `.code-review.toml`.
+- **`--sequential`** runs the panel models one at a time, in the order given, instead of concurrently. Each model still gets the identical prompt independently; no model sees another's findings. Merging, `found_by`, per-model usage, failure handling and the exit contract are the same as the concurrent default. Use it to keep provider load and rate-limit pressure low, or to make long runs easier to follow. `--dry-run` shows the mode on its `execution:` line. It needs a panel (`--models`, or a `models` list from `.code-review.toml`); without one it is a typed `CONFIG` error.
 - Mutually exclusive with `--model`; `--baseline` isn't supported with panels yet; per-model temperatures and streaming are out of scope.
+
+## Review workflow: regular panel, fixes, then a final Claude review
+
+A two-stage loop for agent-driven work. The tool stays read-only throughout: it never edits the reviewed repository and never approves, comments on, or merges a PR or MR.
+
+1. **Regular reviews** with two independent models over OpenRouter (needs `OPENROUTER_API_KEY`). Concurrent, the unchanged default:
+
+   ```bash
+   code-review --base origin/main --provider openrouter --models qwen/qwen3.8-flash,z-ai/glm-5.3 --format json --output review-round1.json
+   ```
+
+   Or one model at a time, in that order:
+
+   ```bash
+   code-review --base origin/main --provider openrouter --models qwen/qwen3.8-flash,z-ai/glm-5.3 --sequential --format json --output review-round1.json
+   ```
+
+2. **The coding agent** verifies each finding against the code, fixes confirmed bugs, and reruns the affected checks. Repeat step 1 as needed; `--min-found-by 2` keeps only findings both models raised.
+
+3. **A separate final review** of the *current* code with Claude Opus 5.5 through Claude Code. This is a new invocation after the fixes, not a third panel member (swap in `--model claude-sonnet-5-5` for a faster, lighter pass):
+
+   ```bash
+   code-review --base origin/main --provider claude-code --model claude-opus-5-5 --format json --output review-final-opus.json
+   ```
+
+For an OpenAI final pass instead, use `--provider codex --model gpt-6.1-sol` in step 3.
+
+The same commands work with `--pr 123 --repo OWNER/REPO` or `--mr 45 --repo https://gitlab.example.com/group/project` in place of `--base origin/main`. Add `--dry-run` to any of them to check the resolved provider, models, execution mode and payload size without calling a model.
 
 ## Per-project configuration (`.code-review.toml`)
 
@@ -429,6 +504,7 @@ exclude = ["generated/**", "**/*_pb2.py"]
 - Loading one is always announced on stderr (`[config] loaded <path>`).
 - **API keys are never read from it** — credentials come from the environment only.
 - **`context` is never read from it.** The safety context is injected as trusted operator framing *ahead* of the prompt-injection guard; accepting it from the repo under review would let that repo instruct its own reviewer. Set per-project context via `$CODE_REVIEW_CONTEXT` or `--context` instead.
+- **`provider = "claude-code"` and `provider = "codex"` are refused from it**; under those providers its `model`, `models` and `retries` keys are ignored, and their executables and timeouts are environment-only. The reviewed repo must not be able to make the tool launch a local agent CLI on your subscription.
 - **`ollama_host` / `ollama_num_ctx` / `ollama_timeout` are never read from it.** The full diff is POSTed to `ollama_host` — a hostile value would exfiltrate the code under review — and the rest are machine-local hardware facts. Configure them via env or CLI.
 - `--no-project-config` skips the file entirely — recommended when auditing untrusted checkouts, since even `exclude` can hide a file from a `--codebase` review.
 
@@ -582,7 +658,7 @@ If you're calling this tool in a loop, here's the contract.
 | Exit | Category | Cause | Suggested LLM action |
 |---|---|---|---|
 | **0** | OK | Review succeeded (markdown or JSON on stdout) — or nothing to review (empty stdout + `No diff found…` / `No files matched…` on stderr) | Parse and use the output; treat empty-scope as a no-op |
-| **2** | CONFIG | Missing or rejected API key (HTTP 401/403), invalid CLI / env / config value, or `--full-files --pr` with a checkout that isn't at the PR head | **Do not retry without fixing.** Read stderr, correct config, re-run. |
+| **2** | CONFIG | Missing or rejected API key (HTTP 401/403), invalid CLI / env / config value, `--full-files --pr` with a checkout that isn't at the PR head, or (`claude-code`) the CLI is missing, signed out, or blocked on billing | **Do not retry without fixing.** Read stderr, correct config, re-run. |
 | **10** | SAFETY_REFUSAL | Model refused (content filter or provider moderation fired) | Retry with `--model claude` (least refusal-prone on security/policy code). If refused across models, escalate to a human. |
 | **11** | RATE_LIMIT | HTTP 429 from the provider | Wait 30–60s (or the `Retry-After` echoed in the message), then retry — or pass `--retries N` and let the runner do it. Per-key daily limits: switch `--provider` or `--model`. |
 | **12** | CONTEXT_OVERFLOW | Payload exceeded the model's budget, the 700K-char bundle cap, or the Ollama window guard/post-verify | Narrow scope (`--include`/`--exclude`, smaller `--base`) or use `--chunk`. **Do not retry unchanged.** For reasoning-only output, check supported thinking controls and the configured output ceiling before retrying; do not repeatedly raise the budget. Ollama guard: raise `$OLLAMA_NUM_CTX` (requested per call, RAM permitting). |
@@ -641,6 +717,8 @@ Non-error stderr lines use a fixed prefix vocabulary — **no informational line
 ### Auto-retry behavior
 
 By default the runner auto-retries **once** (after 2s) on `PROVIDER_HICCUP` and `TRANSPORT`. `--retries N` grants N additional attempts with exponential backoff (4s, 8s, … capped at 60s per wait), and — only when N > 0 — also retries `RATE_LIMIT`, sleeping the provider's `Retry-After` (delta-seconds and HTTP-date forms both parsed; clamped to 300s with a WARN) or 60s otherwise.
+
+`--provider claude-code` has no automatic retry: each attempt spends subscription quota and can run for minutes, so only an explicit `--retries N` re-runs a failed call.
 
 Never retried, regardless of `--retries`: `SAFETY_REFUSAL` (same prompt reproduces it — switch model), `CONTEXT_OVERFLOW` (the scope is wrong, not the call), `CONFIG` (fix the configuration first).
 

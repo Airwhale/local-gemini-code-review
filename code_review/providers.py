@@ -85,7 +85,18 @@ MAX_RETRY_SLEEP = 300.0
 
 # Severity ladder used by --min-severity (and, in M2+, finding sorting).
 # Order matters: index position defines rank.
-PROVIDERS = ("openrouter", "gemini", "ollama")
+PROVIDERS = ("openrouter", "gemini", "ollama", "claude-code", "codex")
+# Providers that run a locally installed agent CLI on the user's own
+# sign-in (subscription quota), rather than an HTTP API with a key.
+LOCAL_CLI_PROVIDERS = ("claude-code", "codex")
+# Native Claude API ID for Claude Opus 5.5. Dateless Claude IDs from the
+# 4.6 generation on are pinned snapshots (platform.claude.com model
+# overview), unlike the Claude Code CLI's floating aliases (``sonnet``,
+# ``opus``) which move to newer models silently.
+CLAUDE_CODE_DEFAULT_MODEL = "claude-opus-5-5"
+# Codex model slug offered to ChatGPT sign-ins: the catalog's top-priority
+# "latest workhorse model for coding" (`codex debug models`).
+CODEX_DEFAULT_MODEL = "gpt-6.1-sol"
 DEFAULT_MODEL_BY_PROVIDER: dict[str, str] = {
     "openrouter": "google/gemini-2.5-pro",
     "gemini": "gemini-3.8-flash",
@@ -95,6 +106,12 @@ DEFAULT_MODEL_BY_PROVIDER: dict[str, str] = {
     # pointing them to ``ollama pull qwen3-coder:30b``. Override per env
     # with $OLLAMA_MODEL or per call with --model.
     "ollama": "qwen3-coder:30b",
+    # Opt-in only: runs the locally installed Claude Code CLI on the
+    # user's existing sign-in (see code_review/claude_code.py).
+    "claude-code": CLAUDE_CODE_DEFAULT_MODEL,
+    # Opt-in only: runs the locally installed Codex CLI on its existing
+    # ChatGPT sign-in (see code_review/codex_cli.py).
+    "codex": CODEX_DEFAULT_MODEL,
 }
 DEFAULT_PROVIDER = "openrouter"
 
@@ -1386,12 +1403,21 @@ def call_ollama(
     )
 
 
-def _call_with_retries(call: Callable[[], T], *, label: str, retries: int = 0) -> T:
+def _call_with_retries(
+    call: Callable[[], T],
+    *,
+    label: str,
+    retries: int = 0,
+    auto_retry: bool = True,
+) -> T:
     """Run ``call`` with the runner's retry policy.
 
     ``retries=0`` (the default) reproduces the historical behavior
     exactly: one automatic 2s retry on ``ProviderHiccup`` /
-    ``TransportError``, nothing else. ``--retries N`` grants N
+    ``TransportError``, nothing else. ``auto_retry=False`` drops that
+    built-in retry so only an explicit ``--retries N`` re-runs a call
+    (used by the Claude Code provider, where each attempt spends
+    subscription quota and may run for many minutes). ``--retries N`` grants N
     *additional* attempts on top of that: hiccup/transport back off at
     ``min(2**attempt, 60)`` seconds (2, 4, 8, ...); ``RateLimit`` is
     retried only when N > 0, sleeping the provider's parsed
@@ -1406,7 +1432,7 @@ def _call_with_retries(call: Callable[[], T], *, label: str, retries: int = 0) -
     ``label`` shows up in the retry-notice stderr lines so a viewer
     scrolling the log can tell which call retried.
     """
-    transient_budget = 1 + retries
+    transient_budget = (1 if auto_retry else 0) + retries
     ratelimit_budget = retries
     transient_used = 0
     ratelimit_used = 0
