@@ -4,6 +4,8 @@ Notable user-facing changes, newest first. Format loosely follows [Keep a Change
 
 ## [Unreleased]
 
+**Docs: free reviewers before paid ones.** The README's review workflow and the runbook now loop the subscription CLIs (`--provider codex`, `--provider claude-code`) until both are clean, then spend one paid OpenRouter panel on the converged code. Previously the paid panel came first and Claude Code was a final pass. A paid reviewer that fails (for example HTTP 402, out of credits) is recorded as not run, never as clean.
+
 Precision pass, aimed at the tool's dominant failure mode — a model asserting things about code it cannot see. In diff mode it sees hunks plus ~3 lines of context and fills the rest in from imagination: "`X` is undefined" when `X` is defined 100 lines up, "add the missing docstring" when one exists off-hunk, a suggested fix byte-identical to the code it claims to repair. Observed across ~20 real review runs.
 
 The changes fall into three groups: **remove the blind spot** (auto full-file context, and an evidence-discipline rule for when the files don't fit), **make findings actionable** (`in_hunk`, `needs_verification`, `--min-found-by`, a pre-call cost ceiling), and **remove known traps** (base-drift warning, diff-timestamp parsing, panel discoverability, `--list-models`, a call heartbeat).

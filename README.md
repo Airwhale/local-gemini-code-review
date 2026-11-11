@@ -124,7 +124,7 @@ Requesting the conservative 4K estimate in the unknown case would *shrink* a big
 
 ### Claude Code provider (`--provider claude-code`)
 
-Runs the review through the locally installed [Claude Code](https://code.claude.com/docs/en/setup) CLI in print mode, on whatever sign-in that CLI already has (for example a Claude subscription). It is meant for a separate final pass; see [Review workflow](#review-workflow-regular-panel-fixes-then-a-final-claude-review).
+Runs the review through the locally installed [Claude Code](https://code.claude.com/docs/en/setup) CLI in print mode, on whatever sign-in that CLI already has (for example a Claude subscription). With `--provider codex` it makes up the free first stage of a review, before any paid panel; see [Review workflow](#review-workflow-free-reviewers-until-clean-then-the-paid-panel).
 
 ```bash
 code-review --base origin/main --provider claude-code --model claude-opus-5-5
@@ -457,31 +457,32 @@ Runs the same review through several models (concurrently on cloud, capped at 4;
 - **`--sequential`** runs the panel models one at a time, in the order given, instead of concurrently. Each model still gets the identical prompt independently; no model sees another's findings. Merging, `found_by`, per-model usage, failure handling and the exit contract are the same as the concurrent default. Use it to keep provider load and rate-limit pressure low, or to make long runs easier to follow. `--dry-run` shows the mode on its `execution:` line. It needs a panel (`--models`, or a `models` list from `.code-review.toml`); without one it is a typed `CONFIG` error.
 - Mutually exclusive with `--model`; `--baseline` isn't supported with panels yet; per-model temperatures and streaming are out of scope.
 
-## Review workflow: regular panel, fixes, then a final Claude review
+## Review workflow: free reviewers until clean, then the paid panel
 
-A two-stage loop for agent-driven work. The tool stays read-only throughout: it never edits the reviewed repository and never approves, comments on, or merges a PR or MR.
+**Free before paid.** `--provider codex` and `--provider claude-code` run on sign-ins you already pay for (a ChatGPT or Claude subscription), so another round costs nothing extra beyond plan quota. OpenRouter and the Gemini API bill every call. Spend the free rounds first, and the paid panel once, on code that has already stopped producing findings. A paid panel spent on code that still has easy bugs pays to find what a free round would have found.
 
-1. **Regular reviews** with two independent models over OpenRouter (needs `OPENROUTER_API_KEY`). Concurrent, the unchanged default:
+The tool stays read-only throughout: it never edits the reviewed repository and never approves, comments on, or merges a PR or MR.
 
-   ```bash
-   code-review --base origin/main --provider openrouter --models qwen/qwen3.8-flash,z-ai/glm-5.3 --format json --output review-round1.json
-   ```
-
-   Or one model at a time, in that order:
+1. **Free rounds, looped until both are clean.** Run Codex and Claude Code on the same code. They run independently and can run at the same time:
 
    ```bash
-   code-review --base origin/main --provider openrouter --models qwen/qwen3.8-flash,z-ai/glm-5.3 --sequential --format json --output review-round1.json
+   code-review --base origin/main --provider codex --model gpt-6.1-sol --format json --output r1-codex.json
+   code-review --base origin/main --provider claude-code --model claude-sonnet-5-5 --format json --output r1-claude.json
    ```
 
-2. **The coding agent** verifies each finding against the code, fixes confirmed bugs, and reruns the affected checks. Repeat step 1 as needed; `--min-found-by 2` keeps only findings both models raised.
+   The coding agent verifies each finding against the code, fixes confirmed bugs, reruns the affected checks, and runs both again. Stop when both report no issues on the same code. Use `claude-opus-5-5` for a deeper Claude pass.
 
-3. **A separate final review** of the *current* code with Claude Opus 5.5 through Claude Code. This is a new invocation after the fixes, not a third panel member (swap in `--model claude-sonnet-5-5` for a faster, lighter pass):
+2. **One paid panel** on that converged code, for the vendors with no subscription CLI (needs `OPENROUTER_API_KEY`):
 
    ```bash
-   code-review --base origin/main --provider claude-code --model claude-opus-5-5 --format json --output review-final-opus.json
+   code-review --base origin/main --provider openrouter --models google/gemini-4-argon,deepseek/deepseek-v4.1-flash --format json --output panel.json
    ```
 
-For an OpenAI final pass instead, use `--provider codex --model gpt-6.1-sol` in step 3.
+   Add `--sequential` to call them one at a time, and `--min-found-by 2` to keep only findings both raised. The `[cost]` line shows the ceiling before any call.
+
+3. **If the panel finds a real bug,** fix it and go back to step 1 for the free re-check. Run the paid panel again only if the fix was substantial.
+
+A failed run is not a clean run. An OpenRouter `HTTP 402` (out of credits), a `RATE_LIMIT`, or a truncated result means that reviewer did not review the code: record it as not run, and add credits or wait before counting the review as done.
 
 The same commands work with `--pr 123 --repo OWNER/REPO` or `--mr 45 --repo https://gitlab.example.com/group/project` in place of `--base origin/main`. Add `--dry-run` to any of them to check the resolved provider, models, execution mode and payload size without calling a model.
 
